@@ -1,0 +1,55 @@
+# DISH Network - Denver Market Configuration
+
+operator: DISH
+region: Denver
+
+data:
+  grid: "${DATA_ROOT}/data/input-data/dish/grid/denver/bins_enrichment_dn.csv"
+  gis: "${DATA_ROOT}/data/input-data/dish/gis/gis.csv"
+  output_base: "${DATA_ROOT}/data/output-data/dish/denver"
+
+features:
+  # Overshooting Detection (Production-Ready)
+  overshooters:
+    enabled: true
+    edge_traffic_percent: 0.1        # Analyze furthest 10% of traffic
+    min_cell_distance: 5000          # 5 km minimum range
+    percent_max_distance: 0.7        # 70% of max TA threshold
+    min_cell_count_in_grid: 3        # Require 3+ competing cells
+    max_percentage_grid_events: 0.25 # Cell provides ≤25% of grid traffic
+    rsrp_offset: 0.8                 # Allow 20% RSRP degradation
+    min_overshooting_grids: 50       # Absolute threshold
+    percentage_overshooting_grids: 0.05  # 5% relative threshold
+
+  # Undershooting Detection (Needs Validation)
+  undershooters:
+    enabled: false  # Disabled until validated
+    min_cell_max_distance: 3000
+    min_grid_count: 100
+    uptilt_scenarios: [1, 2]
+    min_predicted_rsrp: -110.0
+
+  # Crossed Feeder Detection (Production-Ready)
+  crossed_feeders:
+    enabled: true
+    min_perc_grid_events: 0.1        # 10% traffic share in grid
+    min_angular_deviation: 90        # 90° misalignment threshold
+    top_percent_threshold: 0.05      # Flag top 5% of cells
+
+  # Interference Detection (Needs Optimization)
+  interference:
+    enabled: false  # Disabled until optimized (slow performance)
+    min_filtered_cells_per_grid: 4
+    min_cell_event_count: 25
+    perc_grid_events: 0.05
+    dominant_perc_grid_events: 0.3
+    dominance_diff: 10.0
+    max_rsrp_diff: 5.0
+    k_ring: 3
+    perc_interference: 0.33
+
+processing:
+  chunk_size: 100000     # Process 100k rows at a time
+  n_workers: 4           # Parallel workers
+  timeout_minutes: 60    # 1 hour timeout
+  cache_intermediate: true
