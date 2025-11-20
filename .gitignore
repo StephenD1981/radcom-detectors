@@ -27,12 +27,18 @@ env/
 ENV/
 .venv
 
-# Data files (do NOT commit large CSVs)
-data/input-data/**/*.csv
-data/output-data/**/*.csv
+# Data files (do NOT commit large data files)
+data/input-data/
+data/output-data/
+data/intermediate-data/
+*.csv
 *.parquet
 *.h5
 *.hdf5
+*.json
+*.zip
+*.txt
+*.xlsx
 
 # Jupyter
 .ipynb_checkpoints/
