@@ -1,0 +1,55 @@
+# Vodafone Ireland - Cork Region Configuration
+
+operator: Vodafone_Ireland
+region: Cork
+
+data:
+  grid: "${DATA_ROOT}/data/input-data/vf-ie/grid/grid-cell-data-150m.csv"
+  gis: "${DATA_ROOT}/data/input-data/vf-ie/gis/cork-gis.csv"
+  output_base: "${DATA_ROOT}/data/output-data/vf-ie/cork"
+
+features:
+  # Overshooting Detection (Tuned for Urban Environment)
+  overshooters:
+    enabled: true
+    edge_traffic_percent: 0.15       # More conservative (urban)
+    min_cell_distance: 4000          # 4 km (smaller cells)
+    percent_max_distance: 0.7
+    min_cell_count_in_grid: 3
+    max_percentage_grid_events: 0.25
+    rsrp_offset: 0.8
+    min_overshooting_grids: 30       # Lower threshold (smaller dataset)
+    percentage_overshooting_grids: 0.05
+
+  # Undershooting Detection
+  undershooters:
+    enabled: false
+    min_cell_max_distance: 2500      # Urban - shorter range
+    min_grid_count: 50               # Lower threshold
+    uptilt_scenarios: [1, 2]
+    min_predicted_rsrp: -110.0
+
+  # Crossed Feeder Detection
+  crossed_feeders:
+    enabled: true
+    min_perc_grid_events: 0.1
+    min_angular_deviation: 90
+    top_percent_threshold: 0.05
+
+  # Interference Detection
+  interference:
+    enabled: false  # Disabled until optimized
+    min_filtered_cells_per_grid: 4
+    min_cell_event_count: 20         # Lower threshold (urban)
+    perc_grid_events: 0.05
+    dominant_perc_grid_events: 0.3
+    dominance_diff: 10.0
+    max_rsrp_diff: 5.0
+    k_ring: 3
+    perc_interference: 0.33
+
+processing:
+  chunk_size: 50000      # Smaller chunks (smaller dataset)
+  n_workers: 2           # Fewer workers
+  timeout_minutes: 30    # Shorter timeout
+  cache_intermediate: true
