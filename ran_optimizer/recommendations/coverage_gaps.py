@@ -732,9 +732,26 @@ class CoverageGapDetector(GapDetectorBase):
         Returns:
             GeoDataFrame with 'cell_cluster' column added
         """
-        # Get centroids
+        # Get centroids using projected CRS for accuracy
         hulls = hulls.copy()
-        centroids = hulls.geometry.centroid
+
+        # Project to UTM for accurate centroid calculation, then transform back
+        if hulls.crs and not hulls.crs.is_projected:
+            # Estimate UTM zone from data centroid
+            bounds = hulls.total_bounds  # [minx, miny, maxx, maxy]
+            center_lon = (bounds[0] + bounds[2]) / 2
+            center_lat = (bounds[1] + bounds[3]) / 2
+            utm_zone = int((center_lon + 180) / 6) + 1
+            epsg_code = 32600 + utm_zone if center_lat >= 0 else 32700 + utm_zone
+
+            # Project, calculate centroid, transform back to WGS84
+            hulls_projected = hulls.to_crs(f'EPSG:{epsg_code}')
+            centroids_projected = hulls_projected.geometry.centroid
+            centroids_gdf = gpd.GeoDataFrame(geometry=centroids_projected, crs=f'EPSG:{epsg_code}')
+            centroids = centroids_gdf.to_crs('EPSG:4326').geometry
+        else:
+            centroids = hulls.geometry.centroid
+
         hulls['centroid_lat'] = centroids.y
         hulls['centroid_lon'] = centroids.x
 
