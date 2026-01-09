@@ -11,16 +11,147 @@ Creates a comprehensive interactive dashboard with:
 import folium
 from folium import plugins
 import pandas as pd
+import numpy as np
 import geopandas as gpd
 from pathlib import Path
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple
 import json
 from datetime import datetime
 
 from ran_optimizer.utils.logging_config import get_logger
-from ran_optimizer.visualization.map_overshooters import calculate_sector_points, save_grid_data_files
+from ran_optimizer.utils.geohash import get_box_bounds
 
 logger = get_logger(__name__)
+
+
+def calculate_sector_points(
+    lat: float,
+    lon: float,
+    bearing: float,
+    radius_m: float,
+    sector_width: float = 40.0
+) -> List[Tuple[float, float]]:
+    """
+    Calculate points for a triangular sector (cell antenna pattern).
+
+    Args:
+        lat: Cell latitude
+        lon: Cell longitude
+        bearing: Antenna azimuth in degrees (0=North, 90=East)
+        radius_m: Sector radius in meters
+        sector_width: Total sector width in degrees (default 40 = bearing ±20°)
+
+    Returns:
+        List of (lat, lon) tuples forming the triangle
+    """
+    earth_radius = 6371000
+
+    lat_rad = np.radians(lat)
+    lon_rad = np.radians(lon)
+
+    half_width = sector_width / 2.0
+
+    angles = [
+        bearing,
+        bearing - half_width,
+        bearing + half_width,
+    ]
+
+    points = [(lat, lon)]
+
+    for angle in angles[1:]:
+        angle_rad = np.radians(angle)
+
+        lat2 = np.arcsin(
+            np.sin(lat_rad) * np.cos(radius_m / earth_radius) +
+            np.cos(lat_rad) * np.sin(radius_m / earth_radius) * np.cos(angle_rad)
+        )
+
+        lon2 = lon_rad + np.arctan2(
+            np.sin(angle_rad) * np.sin(radius_m / earth_radius) * np.cos(lat_rad),
+            np.cos(radius_m / earth_radius) - np.sin(lat_rad) * np.sin(lat2)
+        )
+
+        points.append((np.degrees(lat2), np.degrees(lon2)))
+
+    return points
+
+
+def save_grid_data_files(
+    grid_df: pd.DataFrame,
+    output_dir: Path,
+) -> dict:
+    """
+    Save grid data as separate JSON files per cell for lazy loading.
+
+    Args:
+        grid_df: DataFrame with grid bins
+        output_dir: Directory to save JSON files
+
+    Returns:
+        Dict mapping cell_name to relative JSON file path
+    """
+    grid_dir = output_dir / "grids"
+    grid_dir.mkdir(parents=True, exist_ok=True)
+
+    grid_paths = {}
+
+    unique_geohashes = grid_df['geohash7'].unique()
+    geohash_bounds = {}
+    for gh in unique_geohashes:
+        min_lat, max_lat, min_lon, max_lon = get_box_bounds(gh)
+        geohash_bounds[gh] = [[min_lat, min_lon], [max_lat, max_lon]]
+
+    has_is_overshooting = 'is_overshooting' in grid_df.columns
+    has_is_interfering = 'is_interfering' in grid_df.columns
+    has_band = 'Band' in grid_df.columns
+
+    for cell_name, cell_grids in grid_df.groupby('cell_name'):
+        grids_list = []
+
+        geohashes = cell_grids['geohash7'].values
+        latitudes = cell_grids['latitude'].values
+        longitudes = cell_grids['longitude'].values
+
+        if has_is_overshooting:
+            highlighted = cell_grids['is_overshooting'].values
+        elif has_is_interfering:
+            highlighted = cell_grids['is_interfering'].values
+        else:
+            highlighted = [False] * len(cell_grids)
+        bands = cell_grids['Band'].values if has_band else [0] * len(cell_grids)
+
+        for i in range(len(cell_grids)):
+            geohash = geohashes[i]
+            band_val = bands[i]
+
+            grids_list.append({
+                'lat': float(latitudes[i]),
+                'lon': float(longitudes[i]),
+                'hash': geohash,
+                'overshoot': bool(highlighted[i]),
+                'band': int(band_val) if pd.notna(band_val) else 0,
+                'bounds': geohash_bounds[geohash]
+            })
+
+        grid_data = {
+            'cell_name': int(cell_name) if isinstance(cell_name, (int, np.integer)) else str(cell_name),
+            'grids': grids_list
+        }
+
+        json_file = grid_dir / f"cell_{cell_name}_grids.json"
+        with open(json_file, 'w') as f:
+            json.dump(grid_data, f, separators=(',', ':'))
+
+        grid_paths[cell_name] = f"grids/cell_{cell_name}_grids.json"
+
+    logger.info(
+        "Saved grid data files",
+        num_cells=len(grid_paths),
+        output_dir=str(grid_dir),
+    )
+
+    return grid_paths
 
 
 # Color schemes

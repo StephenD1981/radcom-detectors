@@ -11,6 +11,7 @@ Tests the correct notebook-based approach:
 7. Create alpha shape polygons
 8. Visualize on map
 """
+import pytest
 from pathlib import Path
 import sys
 
@@ -58,10 +59,13 @@ def test_coverage_gaps_detection_and_visualization():
     gis_file = input_path / "cork-gis.csv"
     hulls_file = input_path / "cell_hulls.csv"
 
-    # Check files exist
-    assert grid_file.exists(), f"Grid file not found: {grid_file}"
-    assert gis_file.exists(), f"GIS file not found: {gis_file}"
-    assert hulls_file.exists(), f"Hulls file not found: {hulls_file}"
+    # Skip if files don't exist
+    if not grid_file.exists():
+        pytest.skip(f"Grid file not found: {grid_file}")
+    if not gis_file.exists():
+        pytest.skip(f"GIS file not found: {gis_file}")
+    if not hulls_file.exists():
+        pytest.skip(f"Hulls file not found: {hulls_file}")
 
     logger.info("loading_data_files")
 
