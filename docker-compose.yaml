@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  ran-optimizer:
+    build: .
+    volumes:
+      - ./data/vf-ie/input-data:/app/data/input:ro
+      - ./data/vf-ie/output-data:/app/data/output
+      - ./config:/app/config:ro
+    environment:
+      - LOG_LEVEL=INFO
+
+  # Optional: serve the dashboard
+  dashboard:
+    image: nginx:alpine
+    ports:
+      - "8080:80"
+    volumes:
+      - ./data/vf-ie/output-data/maps:/usr/share/nginx/html:ro
+    depends_on:
+      - ran-optimizer

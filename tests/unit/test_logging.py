@@ -4,7 +4,7 @@ Tests for logging configuration.
 import pytest
 from pathlib import Path
 import tempfile
-from ran_optimizer.utils.logging_config import configure_logging, get_logger
+from ran_optimizer.utils.logging_config import configure_logging, get_logger, flush_logs
 
 
 def test_get_logger():
@@ -45,6 +45,9 @@ def test_configure_logging_with_file():
 
         logger = get_logger(__name__)
         logger.info("test_file_logging", message="hello")
+
+        # Flush to ensure content is written to disk
+        flush_logs()
 
         # Verify file was created
         assert log_file.exists()

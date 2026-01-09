@@ -124,9 +124,11 @@ def test_validation_thresholds():
     print("TEST 3: VALIDATION THRESHOLD CHECK")
     print("="*80)
 
-    # Test with larger sample
-    grid_file = Path("data/input-data/vf-ie/grid/grid-cell-data-150m.csv")
-    df_raw = pd.read_csv(grid_file, nrows=10000)
+    # Test with larger sample - use current path structure
+    grid_file = Path("data/vf-ie/input-data/cell_coverage.csv")
+    if not grid_file.exists():
+        pytest.skip(f"Grid file not found: {grid_file}")
+    df_raw = pd.read_csv(grid_file, nrows=10000, low_memory=False)
     df_adapted = VodafoneIrelandAdapter.adapt_grid_data(df_raw)
     validated_df, validation_errors = _validate_dataframe(df_adapted, GridMeasurement)
 

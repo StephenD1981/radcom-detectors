@@ -4,6 +4,7 @@ Tests for configuration management.
 import pytest
 from pathlib import Path
 from pydantic import ValidationError
+from unittest.mock import patch, MagicMock
 from ran_optimizer.utils.config import (
     load_config,
     OperatorConfig,
@@ -11,6 +12,13 @@ from ran_optimizer.utils.config import (
     CrossedFeederParams,
     get_default_config
 )
+
+
+@pytest.fixture(autouse=True)
+def mock_mkdir():
+    """Mock Path.mkdir to avoid filesystem issues in tests."""
+    with patch.object(Path, 'mkdir', MagicMock(return_value=None)):
+        yield
 
 
 def test_load_dish_denver_config():

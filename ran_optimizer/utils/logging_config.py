@@ -30,27 +30,70 @@ def configure_logging(
         >>> logger = get_logger(__name__)
         >>> logger.info("processing_started", operator="DISH", region="Denver")
     """
+    # Clear existing handlers to allow reconfiguration (important for tests)
+    root_logger = logging.getLogger()
+    root_logger.handlers.clear()
+
     # Configure standard library logging
     logging.basicConfig(
         format="%(message)s",
         stream=sys.stdout,
         level=getattr(logging, log_level.upper()),
+        force=True  # Force reconfiguration even if already configured
     )
 
-    # Processors for structlog
-    processors = [
-        structlog.stdlib.add_log_level,
-        structlog.stdlib.add_logger_name,
-        structlog.processors.TimeStamper(fmt="iso"),
-        structlog.processors.StackInfoRenderer(),
-        structlog.processors.format_exc_info,
-    ]
+    # When using file logging, we need to route through stdlib logging
+    # to ensure file handlers receive the messages
+    if log_file:
+        # Processors that work with stdlib logging
+        processors = [
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.add_logger_name,
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.format_exc_info,
+            # ProcessorFormatter will handle rendering
+            structlog.stdlib.ProcessorFormatter.wrap_for_formatter,
+        ]
 
-    # Add JSON or console renderer
-    if json_output:
-        processors.append(structlog.processors.JSONRenderer())
+        # Setup file handler
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        file_handler = logging.FileHandler(log_file)
+        file_handler.setLevel(getattr(logging, log_level.upper()))
+
+        # Use ProcessorFormatter for the file handler
+        if json_output:
+            formatter = structlog.stdlib.ProcessorFormatter(
+                processor=structlog.processors.JSONRenderer(),
+            )
+        else:
+            formatter = structlog.stdlib.ProcessorFormatter(
+                processor=structlog.dev.ConsoleRenderer(),
+            )
+        file_handler.setFormatter(formatter)
+        logging.getLogger().addHandler(file_handler)
+
+        # Also keep console handler
+        console_handler = logging.StreamHandler(sys.stdout)
+        console_handler.setLevel(getattr(logging, log_level.upper()))
+        console_handler.setFormatter(formatter)
+        logging.getLogger().addHandler(console_handler)
+
     else:
-        processors.append(structlog.dev.ConsoleRenderer())
+        # No file logging - use direct rendering
+        processors = [
+            structlog.stdlib.add_log_level,
+            structlog.stdlib.add_logger_name,
+            structlog.processors.TimeStamper(fmt="iso"),
+            structlog.processors.StackInfoRenderer(),
+            structlog.processors.format_exc_info,
+        ]
+
+        # Add JSON or console renderer
+        if json_output:
+            processors.append(structlog.processors.JSONRenderer())
+        else:
+            processors.append(structlog.dev.ConsoleRenderer())
 
     # Configure structlog
     structlog.configure(
@@ -60,18 +103,6 @@ def configure_logging(
         logger_factory=structlog.stdlib.LoggerFactory(),
         cache_logger_on_first_use=True,
     )
-
-    # Setup file handler if specified
-    if log_file:
-        log_file.parent.mkdir(parents=True, exist_ok=True)
-        file_handler = logging.FileHandler(log_file)
-        file_handler.setLevel(getattr(logging, log_level.upper()))
-
-        # JSON format for file logs (easier to parse)
-        file_formatter = logging.Formatter('%(message)s')
-        file_handler.setFormatter(file_formatter)
-
-        logging.getLogger().addHandler(file_handler)
 
 
 def get_logger(name: str):
@@ -90,3 +121,14 @@ def get_logger(name: str):
         >>> logger.error("validation_failed", error_count=150, exc_info=True)
     """
     return structlog.get_logger(name)
+
+
+def flush_logs():
+    """
+    Flush all log handlers to ensure buffered content is written.
+
+    Useful in tests or before application shutdown to ensure
+    all log messages are persisted to disk.
+    """
+    for handler in logging.getLogger().handlers:
+        handler.flush()

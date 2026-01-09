@@ -6,18 +6,21 @@ for the RAN Optimizer system.
 """
 from pathlib import Path
 from typing import Optional, Dict, Any
-from pydantic import BaseModel, Field, validator
+from pydantic import BaseModel, Field, field_validator, ConfigDict
 import yaml
 import os
 
 
 class DataPaths(BaseModel):
     """Data input/output paths."""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     grid: Path
     gis: Path
     output_base: Path
 
-    @validator('grid', 'gis', pre=True)
+    @field_validator('grid', 'gis', mode='before')
+    @classmethod
     def expand_env_vars(cls, v):
         """Expand environment variables in paths."""
         if isinstance(v, str):
@@ -28,7 +31,8 @@ class DataPaths(BaseModel):
             return Path(v)
         return v
 
-    @validator('output_base', pre=True)
+    @field_validator('output_base', mode='before')
+    @classmethod
     def create_output_dir(cls, v):
         """Create output directory if it doesn't exist."""
         if isinstance(v, str):
@@ -95,6 +99,8 @@ class ProcessingParams(BaseModel):
 
 class OperatorConfig(BaseModel):
     """Complete configuration for an operator region."""
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     operator: str = Field(..., description="Operator name (e.g., DISH, Vodafone_Ireland)")
     region: str = Field(..., description="Region name (e.g., Denver, Cork)")
     data: DataPaths
@@ -121,10 +127,6 @@ class OperatorConfig(BaseModel):
         if 'crossed_feeders' in self.features:
             if isinstance(self.features['crossed_feeders'], dict):
                 self.features['crossed_feeders'] = CrossedFeederParams(**self.features['crossed_feeders'])
-
-    class Config:
-        """Pydantic config."""
-        arbitrary_types_allowed = True
 
 
 def load_config(config_path: Path) -> OperatorConfig:

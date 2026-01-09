@@ -1,0 +1,292 @@
+
+<!DOCTYPE html>
+<html>
+<head>
+    <meta http-equiv="content-type" content="text/html; charset=UTF-8" />
+    <title>RAN Optimization - Unified View</title>
+    <style>
+        body {
+            margin: 0;
+            padding: 0;
+            font-family: Arial, sans-serif;
+            overflow: hidden;
+        }
+        #control-panel {
+            position: fixed;
+            top: 20px;
+            left: 20px;
+            background: white;
+            padding: 20px;
+            border-radius: 8px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.3);
+            z-index: 10000;
+            width: 280px;
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+        #control-panel h3 {
+            margin: 0 0 15px 0;
+            font-size: 18px;
+            color: #333;
+            border-bottom: 2px solid #2196F3;
+            padding-bottom: 10px;
+        }
+        .control-section {
+            margin-bottom: 20px;
+            padding-bottom: 20px;
+            border-bottom: 1px solid #e0e0e0;
+        }
+        .control-section:last-child {
+            border-bottom: none;
+            margin-bottom: 0;
+            padding-bottom: 0;
+        }
+        .section-title {
+            font-size: 14px;
+            font-weight: bold;
+            color: #555;
+            margin-bottom: 10px;
+        }
+        .radio-group {
+            display: flex;
+            flex-direction: column;
+            gap: 10px;
+        }
+        .radio-option {
+            display: flex;
+            align-items: center;
+            padding: 10px;
+            border: 2px solid #e0e0e0;
+            border-radius: 6px;
+            cursor: pointer;
+            transition: all 0.2s;
+            background: white;
+        }
+        .radio-option:hover {
+            background: #f5f5f5;
+            border-color: #2196F3;
+        }
+        .radio-option input[type="radio"] {
+            margin-right: 10px;
+            width: 18px;
+            height: 18px;
+            cursor: pointer;
+            flex-shrink: 0;
+        }
+        .radio-option.selected {
+            background: #E3F2FD;
+            border-color: #2196F3;
+            font-weight: bold;
+            box-shadow: 0 2px 8px rgba(33, 150, 243, 0.3);
+        }
+        .radio-label {
+            flex: 1;
+            font-size: 14px;
+            line-height: 1.3;
+        }
+        .radio-count {
+            color: #666;
+            font-size: 12px;
+            display: block;
+            margin-top: 2px;
+            font-weight: normal;
+        }
+        .info-box {
+            padding: 12px;
+            background: #f0f8ff;
+            border-left: 4px solid #2196F3;
+            border-radius: 4px;
+            font-size: 12px;
+            line-height: 1.6;
+        }
+        .notice-box {
+            padding: 12px;
+            background: #fff9e6;
+            border-left: 4px solid #ffc107;
+            border-radius: 4px;
+            font-size: 11px;
+            line-height: 1.4;
+            color: #856404;
+        }
+        .iframe-container {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+        }
+        .iframe-container iframe {
+            width: 100%;
+            height: 100%;
+            border: none;
+        }
+        .iframe-container.hidden {
+            display: none;
+        }
+        .radio-option.hidden {
+            display: none;
+        }
+        .loading {
+            position: fixed;
+            top: 50%;
+            left: 50%;
+            transform: translate(-50%, -50%);
+            background: white;
+            padding: 30px 50px;
+            border-radius: 8px;
+            box-shadow: 0 4px 20px rgba(0,0,0,0.4);
+            z-index: 20000;
+            display: none;
+            text-align: center;
+        }
+        .loading.show {
+            display: block;
+        }
+        .loading-spinner {
+            font-size: 32px;
+            margin-bottom: 10px;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+    </style>
+</head>
+<body>
+    <!-- Overshooting map iframe -->
+    <div id="overshooting-container" class="iframe-container">
+        <iframe src="overshooting_full_map.html"></iframe>
+    </div>
+
+    <!-- Undershooting map iframe -->
+    <div id="undershooting-container" class="iframe-container hidden">
+        <iframe src="undershooting_full_map.html"></iframe>
+    </div>
+
+    <!-- Control panel -->
+    <div id="control-panel">
+        <h3>🗺️  RAN Optimization</h3>
+
+        <!-- View Mode Selection -->
+        <div class="control-section">
+            <div class="section-title">View Mode</div>
+            <div class="radio-group">
+                <label class="radio-option selected" for="radio-overshooting">
+                    <input type="radio" id="radio-overshooting" name="view-mode" value="overshooting" checked>
+                    <span class="radio-label">
+                        Overshooting Cells
+                        <span class="radio-count">46 cells detected</span>
+                    </span>
+                </label>
+                <label class="radio-option" for="radio-undershooting">
+                    <input type="radio" id="radio-undershooting" name="view-mode" value="undershooting">
+                    <span class="radio-label">
+                        Undershooting Cells
+                        <span class="radio-count">71 cells detected</span>
+                    </span>
+                </label>
+            </div>
+        </div>
+
+        <!-- Current View Info -->
+        <div class="control-section">
+            <div class="info-box" id="info-box">
+                <strong>Overshooting Cells</strong><br>
+                Cells serving too far beyond intended coverage.<br>
+                <strong>Recommendation:</strong> Downtilt to reduce interference.<br>
+                <em style="font-size: 11px;">Features: Sector shapes, lazy-loaded grids, severity coloring</em>
+            </div>
+        </div>
+
+        <!-- Filter Instructions Notice -->
+        <div class="control-section">
+            <div class="notice-box">
+                🗺️ <strong>Filter & Layer Controls:</strong><br>
+                Use the <strong>Layers</strong> control in each map (top-right corner) to:
+                <ul style="margin: 5px 0 0 0; padding-left: 18px;">
+                    <li>Filter by <strong>Band</strong> (800, 1800, 2100, etc.)</li>
+                    <li>Filter by <strong>Severity/Uptilt</strong></li>
+                    <li>Toggle <strong>Cell Sectors</strong> (triangles)</li>
+                    <li>Toggle <strong>Cell Markers</strong></li>
+                </ul>
+                Click on cell markers to <strong>show/hide grid bins</strong>.
+            </div>
+        </div>
+    </div>
+
+    <!-- Loading indicator -->
+    <div class="loading" id="loading">
+        <div class="loading-spinner">⏳</div>
+        <div>Switching view...</div>
+    </div>
+
+    <script>
+        const overshootingContainer = document.getElementById('overshooting-container');
+        const undershootingContainer = document.getElementById('undershooting-container');
+        const infoBox = document.getElementById('info-box');
+        const loading = document.getElementById('loading');
+
+        function switchToOvershooting() {
+            loading.classList.add('show');
+
+            setTimeout(() => {
+                overshootingContainer.classList.remove('hidden');
+                undershootingContainer.classList.add('hidden');
+
+                infoBox.innerHTML = `
+                    <strong>Overshooting Cells</strong><br>
+                    Cells serving too far beyond intended coverage.<br>
+                    <strong>Recommendation:</strong> Downtilt to reduce interference.<br>
+                    <em style="font-size: 11px;">Features: Sector shapes, lazy-loaded grids, severity coloring</em>
+                `;
+
+                loading.classList.remove('show');
+            }, 300);
+        }
+
+        function switchToUndershooting() {
+            loading.classList.add('show');
+
+            setTimeout(() => {
+                undershootingContainer.classList.remove('hidden');
+                overshootingContainer.classList.add('hidden');
+
+                infoBox.innerHTML = `
+                    <strong>Undershooting Cells</strong><br>
+                    Cells with insufficient coverage in low-interference areas.<br>
+                    <strong>Recommendation:</strong> Uptilt to extend reach.<br>
+                    <em style="font-size: 11px;">Features: Sector shapes, lazy-loaded grids, uptilt coloring</em>
+                `;
+
+                loading.classList.remove('show');
+            }, 300);
+        }
+
+        function updateRadioStyles(groupName) {
+            document.querySelectorAll('input[name="' + groupName + '"]').forEach(radio => {
+                const option = radio.closest('.radio-option');
+                if (option) {
+                    if (radio.checked) {
+                        option.classList.add('selected');
+                    } else {
+                        option.classList.remove('selected');
+                    }
+                }
+            });
+        }
+
+        // View mode radio handlers
+        document.querySelectorAll('input[name="view-mode"]').forEach(radio => {
+            radio.addEventListener('change', function() {
+                updateRadioStyles('view-mode');
+                if (this.value === 'overshooting') {
+                    switchToOvershooting();
+                } else {
+                    switchToUndershooting();
+                }
+            });
+        });
+    </script>
+</body>
+</html>
