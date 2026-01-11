@@ -177,7 +177,7 @@ class LowCoverageParams:
     # Data quality parameters
     rsrp_min_dbm: float = -140
     rsrp_max_dbm: float = -30
-    min_sample_count: int = 3  # Minimum samples per geohash (3 = 75th percentile in typical data)
+    min_sample_count: int = 5  # Minimum samples per geohash to reduce single-measurement noise
 
     # Severity scoring weights
     severity_weight_area: float = 0.30
@@ -442,13 +442,15 @@ class GapDetectorBase:
             DataFrame with 'cluster_id' column added (noise points removed)
         """
         coords = dense_gaps[['latitude', 'longitude']].values
+        # Convert to radians for haversine metric (proper geographic distance)
+        coords_radians = np.radians(coords)
 
         clusterer = hdbscan.HDBSCAN(
             min_cluster_size=min_cluster_size,
-            metric='euclidean'
+            metric='haversine'
         )
 
-        labels = clusterer.fit_predict(coords)
+        labels = clusterer.fit_predict(coords_radians)
 
         dense_gaps = dense_gaps.copy()
         dense_gaps['cluster_id'] = labels

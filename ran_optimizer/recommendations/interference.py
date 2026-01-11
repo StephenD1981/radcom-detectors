@@ -27,6 +27,9 @@ logger = get_logger(__name__)
 # Geographic constant for approximate area calculation fallback
 KM_PER_DEGREE_LAT = 111.32
 
+# Memory safeguard: maximum records per band to prevent OOM
+MAX_RECORDS_PER_BAND = 5_000_000
+
 
 # -----------------------------
 # Configuration
@@ -46,6 +49,9 @@ class InterferenceParams:
 
     # RSRP similarity threshold
     max_rsrp_diff: float = 5.0  # dB
+
+    # SINR threshold for validation (only flag if SINR is degraded)
+    sinr_threshold_db: float = 0.0  # Filter clusters with avg SINR above this
 
     # Spatial clustering parameters
     k: int = 3  # k-ring neighborhood size
@@ -67,6 +73,9 @@ class InterferenceParams:
     hdbscan_min_cluster_size: int = 5
     alpha_shape_alpha: Optional[float] = None  # None = auto
     max_alphashape_points: int = 2000
+
+    # Environment-specific threshold overrides
+    environment_overrides: Optional[dict] = None
 
     @classmethod
     def from_config(cls, config_path: Optional[str] = None) -> 'InterferenceParams':
@@ -100,6 +109,7 @@ class InterferenceParams:
                 dominant_perc_grid_events=params.get('dominant_perc_grid_events', 0.30),
                 dominance_diff=params.get('dominance_diff_db', 5.0),
                 max_rsrp_diff=params.get('max_rsrp_diff_db', 5.0),
+                sinr_threshold_db=params.get('sinr_threshold_db', 0.0),
                 k=params.get('k_ring_steps', 3),
                 perc_interference=params.get('perc_interference', 0.33),
                 clustering_algo=clustering.get('algo', 'fixed'),
@@ -111,6 +121,7 @@ class InterferenceParams:
                 hdbscan_min_cluster_size=polygon_params.get('hdbscan_min_cluster_size', 5),
                 alpha_shape_alpha=polygon_params.get('alpha_shape_alpha'),
                 max_alphashape_points=polygon_params.get('max_alphashape_points', 2000),
+                environment_overrides=config.get('environment_overrides'),
             )
         except Exception as e:
             logger.warning(f"Failed to load config: {e}. Using defaults.")
@@ -240,10 +251,23 @@ class InterferenceDetector:
             k=self.params.k,
         )
 
+    def _apply_environment_overrides(self, environment: Optional[str]) -> None:
+        """Apply environment-specific parameter overrides."""
+        if environment is None or self.params.environment_overrides is None:
+            return
+
+        overrides = self.params.environment_overrides.get(environment)
+        if overrides:
+            logger.info(f"Applying {environment} environment overrides: {overrides}")
+            for key, value in overrides.items():
+                if hasattr(self.params, key):
+                    setattr(self.params, key, value)
+
     def detect(
         self,
         df: pd.DataFrame,
-        data_type: str = 'measured'
+        data_type: str = 'measured',
+        environment: Optional[str] = None
     ) -> gpd.GeoDataFrame:
         """
         Find interference clusters using geohash-based spatial analysis.
@@ -255,6 +279,8 @@ class InterferenceDetector:
         Args:
             df: Input DataFrame with required columns (cell_name, avg_rsrp, grid, band)
             data_type: 'perceived' or 'measured'
+            environment: Optional environment type ('urban', 'suburban', 'rural')
+                        for environment-specific thresholds
 
         Returns:
             GeoDataFrame with interference cluster polygons containing:
@@ -266,6 +292,7 @@ class InterferenceDetector:
                 - centroid_lat, centroid_lon: Cluster centroid
                 - area_km2: Cluster area in square kilometers
                 - avg_rsrp: Average RSRP in cluster
+                - avg_sinr: Average SINR in cluster (if available)
                 - geometry: Alpha shape polygon
         """
         execution_start = time.time()
@@ -273,10 +300,19 @@ class InterferenceDetector:
             "Interference detector started",
             data_type=data_type,
             input_records=len(df),
+            environment=environment,
         )
+
+        # Apply environment-specific overrides if provided
+        self._apply_environment_overrides(environment)
 
         # Validate input (expects canonical column names: grid, avg_rsrp, cell_name, band)
         df = self._validate_input(df, data_type)
+
+        # Check if SINR data is available for validation
+        has_sinr = 'avg_sinr' in df.columns
+        if has_sinr:
+            logger.info("SINR data available - will apply SINR validation filter")
 
         # Log validated input details
         logger.info(
@@ -285,11 +321,33 @@ class InterferenceDetector:
 
         # Process each band and collect interference grids
         all_grids = []
+        total_records = 0
 
         for band in df['band'].unique():
+            band_data_size = len(df[df['band'] == band])
+            if band_data_size > MAX_RECORDS_PER_BAND:
+                logger.error(
+                    "band_exceeds_max_records",
+                    band=band,
+                    records=band_data_size,
+                    max_allowed=MAX_RECORDS_PER_BAND
+                )
+                raise ValueError(
+                    f"Band {band} has {band_data_size:,} records, exceeding limit of {MAX_RECORDS_PER_BAND:,}"
+                )
+
             grids = self._process_band(df, band, data_type)
             if not grids.empty:
                 all_grids.append(grids)
+                total_records += len(grids)
+
+                # Check accumulated size
+                if total_records > MAX_RECORDS_PER_BAND:
+                    logger.warning(
+                        "accumulated_grids_exceeds_limit",
+                        total_records=total_records,
+                        max_allowed=MAX_RECORDS_PER_BAND
+                    )
 
         # Handle empty result
         if not all_grids:
@@ -304,7 +362,21 @@ class InterferenceDetector:
         combined_grids = pd.concat(all_grids, ignore_index=True)
 
         # Create polygon clusters from interference grids
-        cluster_gdf = self._create_interference_polygons(combined_grids)
+        cluster_gdf = self._create_interference_polygons(combined_grids, has_sinr=has_sinr)
+
+        # Apply SINR filter if data is available
+        if has_sinr and len(cluster_gdf) > 0 and 'avg_sinr' in cluster_gdf.columns:
+            before_filter = len(cluster_gdf)
+            sinr_threshold = self.params.sinr_threshold_db
+            cluster_gdf = cluster_gdf[cluster_gdf['avg_sinr'] <= sinr_threshold]
+            filtered_count = before_filter - len(cluster_gdf)
+            if filtered_count > 0:
+                logger.info(
+                    "sinr_filter_applied",
+                    threshold_db=sinr_threshold,
+                    clusters_removed=filtered_count,
+                    clusters_remaining=len(cluster_gdf)
+                )
 
         # Log final summary
         execution_elapsed = time.time() - execution_start
@@ -550,7 +622,11 @@ class InterferenceDetector:
 
         return grid_geo_data_geo_filtered
 
-    def _create_interference_polygons(self, grids_df: pd.DataFrame) -> gpd.GeoDataFrame:
+    def _create_interference_polygons(
+        self,
+        grids_df: pd.DataFrame,
+        has_sinr: bool = False
+    ) -> gpd.GeoDataFrame:
         """
         Create clustered polygon regions from interference grids.
 
@@ -559,6 +635,7 @@ class InterferenceDetector:
 
         Args:
             grids_df: DataFrame with interference grids (must have 'grid', 'band', 'cell_name', 'avg_rsrp')
+            has_sinr: Whether avg_sinr column is available for SINR-based filtering
 
         Returns:
             GeoDataFrame with cluster polygons and metadata
@@ -646,7 +723,7 @@ class InterferenceDetector:
                 cells_involved = cluster_data['cell_name'].unique().tolist()
                 n_unique_grids = cluster_data['grid'].nunique()
 
-                all_clusters.append({
+                cluster_meta = {
                     'cluster_id': f"{band}_{cluster_id}",
                     'band': band,
                     'n_grids': n_unique_grids,
@@ -654,22 +731,31 @@ class InterferenceDetector:
                     'cells': cells_involved,
                     'centroid_lat': cluster_data['latitude'].mean(),
                     'centroid_lon': cluster_data['longitude'].mean(),
-                    'area_km2': self._calculate_area_km2(polygon),
                     'avg_rsrp': cluster_data['avg_rsrp'].mean(),
                     'geometry': polygon
-                })
+                }
+
+                # Add SINR if available
+                if has_sinr and 'avg_sinr' in cluster_data.columns:
+                    cluster_meta['avg_sinr'] = cluster_data['avg_sinr'].mean()
+
+                all_clusters.append(cluster_meta)
 
             n_clusters = clustered['cluster_id'].nunique()
             logger.info(f"Band {band}: {n_clusters} interference clusters created")
 
         if not all_clusters:
-            return gpd.GeoDataFrame(
-                columns=['cluster_id', 'band', 'n_grids', 'n_cells', 'cells',
-                        'centroid_lat', 'centroid_lon', 'area_km2', 'avg_rsrp', 'geometry'],
-                crs="EPSG:4326"
-            )
+            columns = ['cluster_id', 'band', 'n_grids', 'n_cells', 'cells',
+                       'centroid_lat', 'centroid_lon', 'area_km2', 'avg_rsrp', 'geometry']
+            if has_sinr:
+                columns.insert(-1, 'avg_sinr')
+            return gpd.GeoDataFrame(columns=columns, crs="EPSG:4326")
 
         gdf = gpd.GeoDataFrame(all_clusters, crs="EPSG:4326")
+
+        # Batch calculate areas using single UTM projection for efficiency
+        gdf['area_km2'] = self._calculate_areas_batch(gdf)
+
         gdf = gdf.sort_values(['band', 'n_grids'], ascending=[True, False]).reset_index(drop=True)
 
         logger.info(f"Total interference clusters: {len(gdf)}")
@@ -687,9 +773,10 @@ class InterferenceDetector:
         """
         cfg = self.params
 
-        # Subsample if too many points
+        # Subsample if too many points (use seeded RNG for reproducibility)
         if len(coords) > cfg.max_alphashape_points:
-            indices = np.random.choice(len(coords), cfg.max_alphashape_points, replace=False)
+            rng = np.random.default_rng(seed=42)
+            indices = rng.choice(len(coords), cfg.max_alphashape_points, replace=False)
             coords = coords[indices]
 
         try:
@@ -715,12 +802,53 @@ class InterferenceDetector:
                 if hull.geom_type in ('Point', 'MultiPoint', 'LineString'):
                     return hull.buffer(0.001)  # Small buffer to create polygon
                 return hull
-            except Exception:
+            except Exception as fallback_err:
+                logger.error(
+                    "convex_hull_fallback_failed",
+                    error=str(fallback_err),
+                    n_coords=len(coords)
+                )
                 return None
+
+    def _calculate_areas_batch(self, gdf: gpd.GeoDataFrame) -> List[float]:
+        """
+        Calculate areas in km² for all geometries using batch UTM projection.
+
+        This is more efficient than per-polygon projection as it projects
+        all geometries at once using a common UTM zone.
+
+        Args:
+            gdf: GeoDataFrame with geometry column in EPSG:4326
+
+        Returns:
+            List of areas in square kilometers
+        """
+        if len(gdf) == 0:
+            return []
+
+        try:
+            # Use centroid of all geometries to determine UTM zone
+            all_centroids = gdf.geometry.centroid
+            mean_lon = all_centroids.x.mean()
+            mean_lat = all_centroids.y.mean()
+
+            utm_zone = int((mean_lon + 180) / 6) + 1
+            hemisphere = 'north' if mean_lat >= 0 else 'south'
+            epsg_code = 32600 + utm_zone if hemisphere == 'north' else 32700 + utm_zone
+
+            # Project all geometries at once
+            gdf_projected = gdf.to_crs(epsg=epsg_code)
+            areas_m2 = gdf_projected.geometry.area
+
+            return [round(a / 1_000_000, 3) for a in areas_m2]
+
+        except Exception as e:
+            logger.warning(f"Batch area calculation failed: {e}. Using per-geometry fallback.")
+            return [self._calculate_area_km2(geom) for geom in gdf.geometry]
 
     def _calculate_area_km2(self, geometry) -> float:
         """
-        Calculate area in km² for a geometry using UTM projection.
+        Calculate area in km² for a single geometry using UTM projection.
 
         Args:
             geometry: Shapely geometry in EPSG:4326
@@ -752,10 +880,406 @@ class InterferenceDetector:
             )
 
 
+# -----------------------------
+# Root Cause Analysis
+# -----------------------------
+
+@dataclass
+class RootCauseParams:
+    """Parameters for interference root cause analysis."""
+    # Tilt analysis thresholds
+    low_tilt_threshold_deg: float = 4.0  # Tilts below this are "low"
+    high_tilt_threshold_deg: float = 10.0  # Tilts above this are "high"
+    tilt_spread_threshold_deg: float = 3.0  # Spread indicating inconsistent tilts
+
+    # Azimuth analysis
+    azimuth_convergence_threshold_deg: float = 60.0  # Azimuths within this are "converging"
+
+    # Distance analysis
+    close_proximity_km: float = 0.5  # Cells closer than this are "very close"
+    normal_proximity_km: float = 1.5  # Cells closer than this are "close"
+
+    # Power analysis (relative)
+    high_power_percentile: float = 0.75  # Cells above this percentile are "high power"
+
+    # Recommendation thresholds
+    min_tilt_increase_deg: float = 1.0  # Minimum recommended tilt increase
+    max_tilt_increase_deg: float = 4.0  # Maximum recommended tilt increase
+
+
+class InterferenceRootCauseAnalyzer:
+    """
+    Analyzes interference clusters to determine root causes and generate recommendations.
+
+    This analyzer examines cell configuration data (tilt, azimuth, power, height) for
+    cells involved in interference clusters and identifies likely causes:
+    - Low tilt causing overshoot
+    - High power causing extended coverage
+    - Azimuth convergence (multiple cells pointing at same area)
+    - Close proximity (cells too close together)
+
+    Example:
+        >>> analyzer = InterferenceRootCauseAnalyzer()
+        >>> enriched_gdf = analyzer.analyze(interference_gdf, gis_df)
+        >>> print(enriched_gdf[['cluster_id', 'root_cause', 'recommendations']])
+    """
+
+    def __init__(self, params: Optional[RootCauseParams] = None):
+        """Initialize the root cause analyzer."""
+        self.params = params or RootCauseParams()
+        logger.info("InterferenceRootCauseAnalyzer initialized")
+
+    def analyze(
+        self,
+        interference_gdf: gpd.GeoDataFrame,
+        gis_df: pd.DataFrame
+    ) -> gpd.GeoDataFrame:
+        """
+        Analyze interference clusters and add root cause analysis.
+
+        Args:
+            interference_gdf: GeoDataFrame from InterferenceDetector.detect()
+                Must have 'cells' column with list of cell names per cluster
+            gis_df: Cell configuration DataFrame with columns:
+                - cell_name: Cell identifier
+                - latitude, longitude: Cell location
+                - bearing: Antenna azimuth (degrees)
+                - tilt_elc: Electrical tilt (degrees)
+                - tilt_mech: Mechanical tilt (degrees)
+                - Optional: tx_power, antenna_height
+
+        Returns:
+            GeoDataFrame with additional columns:
+                - root_cause: Primary identified cause
+                - root_cause_details: Dict with analysis metrics
+                - recommendations: List of recommended actions
+                - priority: Recommendation priority (high/medium/low)
+        """
+        if interference_gdf.empty:
+            logger.info("No interference clusters to analyze")
+            return interference_gdf
+
+        # Validate GIS data
+        required_cols = ['cell_name', 'latitude', 'longitude']
+        missing = [c for c in required_cols if c not in gis_df.columns]
+        if missing:
+            raise ValueError(f"GIS data missing required columns: {missing}")
+
+        # Check for optional but important columns
+        has_tilt = 'tilt_elc' in gis_df.columns or 'tilt_mech' in gis_df.columns
+        has_azimuth = 'bearing' in gis_df.columns
+        has_power = 'tx_power' in gis_df.columns
+
+        if not has_tilt:
+            logger.warning("GIS data missing tilt columns - tilt analysis will be limited")
+        if not has_azimuth:
+            logger.warning("GIS data missing bearing column - azimuth analysis disabled")
+
+        # Index GIS data for fast lookup
+        gis_indexed = gis_df.set_index('cell_name')
+
+        # Analyze each cluster
+        analyses = []
+        for idx, cluster in interference_gdf.iterrows():
+            analysis = self._analyze_cluster(cluster, gis_indexed, has_tilt, has_azimuth, has_power)
+            analyses.append(analysis)
+
+        # Add analysis columns to GeoDataFrame
+        result = interference_gdf.copy()
+        result['root_cause'] = [a['root_cause'] for a in analyses]
+        result['root_cause_details'] = [a['details'] for a in analyses]
+        result['recommendations'] = [a['recommendations'] for a in analyses]
+        result['priority'] = [a['priority'] for a in analyses]
+
+        logger.info(
+            "root_cause_analysis_complete",
+            clusters_analyzed=len(result),
+            high_priority=sum(1 for a in analyses if a['priority'] == 'high'),
+            medium_priority=sum(1 for a in analyses if a['priority'] == 'medium'),
+        )
+
+        return result
+
+    def _analyze_cluster(
+        self,
+        cluster: pd.Series,
+        gis_indexed: pd.DataFrame,
+        has_tilt: bool,
+        has_azimuth: bool,
+        has_power: bool
+    ) -> dict:
+        """Analyze a single interference cluster."""
+        cfg = self.params
+        cells = cluster.get('cells', [])
+
+        if not cells:
+            return {
+                'root_cause': 'unknown',
+                'details': {},
+                'recommendations': [],
+                'priority': 'low'
+            }
+
+        # Gather cell configurations
+        cell_configs = []
+        for cell_name in cells:
+            if cell_name in gis_indexed.index:
+                cell_data = gis_indexed.loc[cell_name]
+                config = {
+                    'cell_name': cell_name,
+                    'lat': cell_data.get('latitude', 0),
+                    'lon': cell_data.get('longitude', 0),
+                }
+                if has_tilt:
+                    tilt_elc = cell_data.get('tilt_elc', 0) or 0
+                    tilt_mech = cell_data.get('tilt_mech', 0) or 0
+                    config['total_tilt'] = tilt_elc + tilt_mech
+                    config['tilt_elc'] = tilt_elc
+                    config['tilt_mech'] = tilt_mech
+                if has_azimuth:
+                    config['azimuth'] = cell_data.get('bearing', 0) or 0
+                if has_power:
+                    config['tx_power'] = cell_data.get('tx_power', 0) or 0
+                cell_configs.append(config)
+
+        if not cell_configs:
+            return {
+                'root_cause': 'unknown',
+                'details': {'error': 'No cell configurations found in GIS data'},
+                'recommendations': ['Verify cell names match between data sources'],
+                'priority': 'low'
+            }
+
+        # Perform analysis
+        details = {}
+        causes = []
+        recommendations = []
+
+        # 1. Tilt Analysis
+        if has_tilt:
+            tilts = [c['total_tilt'] for c in cell_configs if 'total_tilt' in c]
+            if tilts:
+                avg_tilt = np.mean(tilts)
+                min_tilt = np.min(tilts)
+                max_tilt = np.max(tilts)
+                tilt_spread = max_tilt - min_tilt
+
+                details['avg_tilt_deg'] = round(avg_tilt, 1)
+                details['min_tilt_deg'] = round(min_tilt, 1)
+                details['max_tilt_deg'] = round(max_tilt, 1)
+                details['tilt_spread_deg'] = round(tilt_spread, 1)
+
+                # Check for low tilt (causing overshoot)
+                low_tilt_cells = [c for c in cell_configs if c.get('total_tilt', 99) < cfg.low_tilt_threshold_deg]
+                if low_tilt_cells:
+                    causes.append('low_tilt')
+                    details['low_tilt_cells'] = [c['cell_name'] for c in low_tilt_cells]
+                    for cell in low_tilt_cells:
+                        current = cell.get('total_tilt', 0)
+                        suggested = min(current + 2, cfg.high_tilt_threshold_deg)
+                        recommendations.append({
+                            'action': 'increase_tilt',
+                            'cell': cell['cell_name'],
+                            'current_tilt': round(current, 1),
+                            'suggested_tilt': round(suggested, 1),
+                            'reason': 'Low tilt causing coverage overshoot'
+                        })
+
+                # Check for inconsistent tilts
+                if tilt_spread > cfg.tilt_spread_threshold_deg:
+                    causes.append('inconsistent_tilt')
+                    details['tilt_inconsistency'] = True
+
+        # 2. Azimuth Analysis
+        if has_azimuth:
+            azimuths = [c['azimuth'] for c in cell_configs if 'azimuth' in c]
+            if len(azimuths) >= 2:
+                # Check for azimuth convergence (cells pointing at similar direction)
+                azimuth_pairs = []
+                for i, az1 in enumerate(azimuths):
+                    for az2 in azimuths[i+1:]:
+                        # Calculate angular difference (handle wraparound)
+                        diff = abs(az1 - az2)
+                        diff = min(diff, 360 - diff)
+                        azimuth_pairs.append(diff)
+
+                if azimuth_pairs:
+                    min_az_diff = min(azimuth_pairs)
+                    details['min_azimuth_diff_deg'] = round(min_az_diff, 1)
+
+                    if min_az_diff < cfg.azimuth_convergence_threshold_deg:
+                        causes.append('azimuth_convergence')
+                        # Find converging cells
+                        converging = self._find_converging_cells(cell_configs, cfg.azimuth_convergence_threshold_deg)
+                        if converging:
+                            details['converging_cells'] = converging
+                            recommendations.append({
+                                'action': 'adjust_azimuth',
+                                'cells': converging,
+                                'reason': 'Multiple cells with similar azimuth causing overlap'
+                            })
+
+        # 3. Proximity Analysis
+        if len(cell_configs) >= 2:
+            distances = self._calculate_cell_distances(cell_configs)
+            if distances:
+                min_dist = min(distances)
+                avg_dist = np.mean(distances)
+                details['min_cell_distance_km'] = round(min_dist, 2)
+                details['avg_cell_distance_km'] = round(avg_dist, 2)
+
+                if min_dist < cfg.close_proximity_km:
+                    causes.append('very_close_proximity')
+                    recommendations.append({
+                        'action': 'review_site_design',
+                        'reason': f'Cells only {min_dist:.2f} km apart - consider site consolidation or sector reorientation'
+                    })
+                elif min_dist < cfg.normal_proximity_km:
+                    causes.append('close_proximity')
+
+        # 4. Determine primary root cause and priority
+        root_cause = self._determine_primary_cause(causes)
+        priority = self._determine_priority(causes, details, cluster)
+
+        # Format recommendations as list of strings for easier consumption
+        formatted_recs = self._format_recommendations(recommendations)
+
+        return {
+            'root_cause': root_cause,
+            'details': details,
+            'recommendations': formatted_recs,
+            'priority': priority
+        }
+
+    def _find_converging_cells(self, cell_configs: List[dict], threshold: float) -> List[str]:
+        """Find cells with converging azimuths."""
+        converging = set()
+        for i, c1 in enumerate(cell_configs):
+            if 'azimuth' not in c1:
+                continue
+            for c2 in cell_configs[i+1:]:
+                if 'azimuth' not in c2:
+                    continue
+                diff = abs(c1['azimuth'] - c2['azimuth'])
+                diff = min(diff, 360 - diff)
+                if diff < threshold:
+                    converging.add(c1['cell_name'])
+                    converging.add(c2['cell_name'])
+        return list(converging)
+
+    def _calculate_cell_distances(self, cell_configs: List[dict]) -> List[float]:
+        """Calculate pairwise distances between cells in km."""
+        distances = []
+        for i, c1 in enumerate(cell_configs):
+            for c2 in cell_configs[i+1:]:
+                dist = self._haversine_km(c1['lat'], c1['lon'], c2['lat'], c2['lon'])
+                distances.append(dist)
+        return distances
+
+    @staticmethod
+    def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+        """Calculate haversine distance in kilometers."""
+        R = 6371  # Earth radius in km
+        lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
+        dlat = lat2 - lat1
+        dlon = lon2 - lon1
+        a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
+        c = 2 * np.arcsin(np.sqrt(a))
+        return R * c
+
+    def _determine_primary_cause(self, causes: List[str]) -> str:
+        """Determine the primary root cause from a list of causes."""
+        # Priority order for root causes
+        cause_priority = [
+            'low_tilt',
+            'very_close_proximity',
+            'azimuth_convergence',
+            'close_proximity',
+            'inconsistent_tilt',
+        ]
+
+        for cause in cause_priority:
+            if cause in causes:
+                return cause
+
+        if causes:
+            return causes[0]
+        return 'undetermined'
+
+    def _determine_priority(self, causes: List[str], details: dict, cluster: pd.Series) -> str:
+        """Determine recommendation priority based on analysis."""
+        # High priority indicators
+        high_priority_causes = ['low_tilt', 'very_close_proximity']
+        if any(c in causes for c in high_priority_causes):
+            return 'high'
+
+        # Consider cluster size (n_grids, n_cells)
+        n_grids = cluster.get('n_grids', 0)
+        n_cells = cluster.get('n_cells', 0)
+
+        if n_grids > 50 or n_cells > 6:
+            return 'high'
+        elif n_grids > 20 or n_cells > 4:
+            return 'medium'
+
+        # Medium priority for other actionable causes
+        if 'azimuth_convergence' in causes or 'close_proximity' in causes:
+            return 'medium'
+
+        return 'low'
+
+    def _format_recommendations(self, recommendations: List[dict]) -> List[str]:
+        """Format recommendations as human-readable strings."""
+        formatted = []
+        for rec in recommendations:
+            action = rec.get('action', '')
+            reason = rec.get('reason', '')
+
+            if action == 'increase_tilt':
+                cell = rec.get('cell', '')
+                current = rec.get('current_tilt', 0)
+                suggested = rec.get('suggested_tilt', 0)
+                formatted.append(
+                    f"Increase tilt on {cell} from {current}° to {suggested}° ({reason})"
+                )
+            elif action == 'adjust_azimuth':
+                cells = rec.get('cells', [])
+                formatted.append(
+                    f"Review azimuth settings for {', '.join(cells)} ({reason})"
+                )
+            elif action == 'review_site_design':
+                formatted.append(f"Site design review needed: {reason}")
+            else:
+                formatted.append(reason)
+
+        return formatted
+
+
+def analyze_interference_root_causes(
+    interference_gdf: gpd.GeoDataFrame,
+    gis_df: pd.DataFrame,
+    params: Optional[RootCauseParams] = None
+) -> gpd.GeoDataFrame:
+    """
+    Convenience function to analyze root causes of interference clusters.
+
+    Args:
+        interference_gdf: GeoDataFrame from detect_interference()
+        gis_df: Cell configuration DataFrame
+        params: Optional analysis parameters
+
+    Returns:
+        GeoDataFrame with root cause analysis and recommendations
+    """
+    analyzer = InterferenceRootCauseAnalyzer(params)
+    return analyzer.analyze(interference_gdf, gis_df)
+
+
 def detect_interference(
     df: pd.DataFrame,
     data_type: str = 'measured',
     params: Optional[InterferenceParams] = None,
+    environment: Optional[str] = None,
 ) -> gpd.GeoDataFrame:
     """
     Convenience function to detect interference clusters.
@@ -764,9 +1288,10 @@ def detect_interference(
         df: Input DataFrame with cell coverage data
         data_type: 'perceived' or 'measured'
         params: Optional detection parameters
+        environment: Optional environment type ('urban', 'suburban', 'rural')
 
     Returns:
         GeoDataFrame with interference cluster polygons
     """
     detector = InterferenceDetector(params)
-    return detector.detect(df, data_type)
+    return detector.detect(df, data_type, environment=environment)
