@@ -1,23 +1,22 @@
 """
 Crossed Feeder Detection.
 
-Detects likely crossed feeders (sector/feeder swaps) using:
-  1) Directed neighbour relations with strength (e.g., weekly handovers)
-  2) Cell GIS / inventory with azimuth (bearing), beamwidth (hbw), and lat/lon
+Detects likely crossed feeders (sector/feeder swaps) by identifying:
+  1) Reciprocal swap patterns between cells at the same site+band (HIGH confidence)
+  2) Multiple cells at same site+band with out-of-beam traffic (MEDIUM confidence)
+  3) Single cells with out-of-beam traffic - likely azimuth issues (LOW confidence)
 
-Primary signal:
-  A cell shows strong neighbour relations to cells located OUTSIDE its expected main lobe.
-
-Secondary signal (optional):
-  Co-sectored cross-band anomaly: within the same site, the expected co-sectored
-  cross-band relation is weak compared to a non-co-sectored cross-band relation.
+A true crossed feeder shows a SWAP PATTERN:
+  - Cell A's traffic goes toward Cell B's azimuth direction
+  - Cell B's traffic goes toward Cell A's azimuth direction
+  - Both cells are at the same site on the same band
 """
 
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -86,12 +85,33 @@ def is_in_beam(azimuth: float, target_angle: float, half_width: float) -> bool:
     return circ_diff_deg(azimuth, target_angle) <= half_width
 
 
+def weighted_circular_mean(angles: np.ndarray, weights: np.ndarray) -> float:
+    """
+    Calculate weighted circular mean of angles in degrees.
+    Returns angle in [0, 360).
+    """
+    if len(angles) == 0 or weights.sum() == 0:
+        return np.nan
+
+    # Convert to radians
+    rad = np.radians(angles)
+
+    # Weighted sum of unit vectors
+    x = np.sum(weights * np.cos(rad))
+    y = np.sum(weights * np.sin(rad))
+
+    # Convert back to degrees
+    mean_rad = np.arctan2(y, x)
+    mean_deg = (np.degrees(mean_rad) + 360.0) % 360.0
+
+    return mean_deg
+
+
 # -----------------------------
 # Configuration
 # -----------------------------
 
 # Band-specific maximum radius thresholds (meters)
-# Different bands have different propagation characteristics
 BAND_MAX_RADIUS_M = {
     'L700': 32000,
     'L800': 30000,
@@ -102,14 +122,14 @@ BAND_MAX_RADIUS_M = {
     'N78': 10000,
     'N258': 2000,
 }
-DEFAULT_MAX_RADIUS_M = 32000  # Default for unknown bands
+DEFAULT_MAX_RADIUS_M = 32000
 
 # Technology prefixes for same-tech filtering
 TECH_PREFIXES = {
-    'L': 'LTE',    # L700, L800, L900, L1800, L2100, L2600
-    'N': 'NR',     # N78, N258 (5G NR)
-    'U': 'UMTS',   # U900, U2100
-    'G': 'GSM',    # G900, G1800
+    'L': 'LTE',
+    'N': 'NR',
+    'U': 'UMTS',
+    'G': 'GSM',
 }
 
 
@@ -127,38 +147,31 @@ def _get_tech_from_band(band: str) -> str:
 @dataclass
 class CrossedFeederParams:
     """Parameters for crossed feeder detection."""
-    max_radius_m: float = 32000.0  # Default, overridden by band-specific values
+    # Distance filters
+    max_radius_m: float = 32000.0
     min_distance_m: float = 500.0
-    hbw_cap_deg: float = 60.0  # cap the "half-width" used for in-beam test
-    percentile: float = 0.95
-    min_hbw_deg: float = 1.0
-    max_hbw_deg: float = 179.0  # exclude broken/omni-like hbw >= 180
-    top_k_relations_per_cell: int = 5
+    band_max_radius_m: Optional[Dict[str, float]] = None
 
-    # In-beam expansion factor (1.5x 3dB beamwidth for softer boundary)
+    # Beamwidth parameters
+    hbw_cap_deg: float = 60.0
+    min_hbw_deg: float = 1.0
+    max_hbw_deg: float = 179.0
     beamwidth_expansion_factor: float = 1.5
 
     # Scoring
-    use_strength_col: str = "cell_perc_weight"  # fallback to weight if missing
-    distance_weighting: bool = True
-    angle_weighting: bool = True
+    use_strength_col: str = "cell_perc_weight"
 
-    # Co-sectored cross-band anomaly (secondary output)
-    enable_cosectored_check: bool = False
-    cosectored_strength_col: str = "weight"
-    cosectored_min_strength: float = 10.0
-    cosectored_diff_thresh: float = -10.0
-
-    # Classification thresholds (ratio-based for multi-sector sites)
-    high_ratio_threshold: float = 0.8  # >=80% of sectors flagged = high potential
-    medium_ratio_threshold: float = 0.5  # >=50% of sectors flagged = medium potential
+    # Swap detection thresholds
+    swap_angle_tolerance_deg: float = 30.0  # How close traffic direction must be to another cell's azimuth
+    min_out_of_beam_ratio: float = 0.3  # Minimum ratio of out-of-beam traffic to be considered anomalous
+    min_out_of_beam_weight: float = 5.0  # Minimum total out-of-beam weight to be considered
 
     # Data quality thresholds
-    max_data_drop_ratio: float = 0.5  # Warn if >50% of data dropped
-    max_detection_rate: float = 0.20  # Warn if >20% of cells flagged
+    max_data_drop_ratio: float = 0.5
+    max_detection_rate: float = 0.20
 
-    # Band-specific radius overrides (loaded from config)
-    band_max_radius_m: Optional[Dict[str, float]] = None
+    # Output options
+    top_k_relations_per_cell: int = 5
 
     @classmethod
     def from_config(cls, config_path: Optional[str] = None) -> 'CrossedFeederParams':
@@ -183,24 +196,18 @@ class CrossedFeederParams:
             return cls(
                 max_radius_m=params.get('max_radius_m', 32000.0),
                 min_distance_m=params.get('min_distance_m', 500.0),
+                band_max_radius_m=params.get('band_max_radius_m', None),
                 hbw_cap_deg=params.get('hbw_cap_deg', 60.0),
-                percentile=params.get('percentile', 0.95),
                 min_hbw_deg=params.get('min_hbw_deg', 1.0),
                 max_hbw_deg=params.get('max_hbw_deg', 179.0),
-                top_k_relations_per_cell=params.get('top_k_relations_per_cell', 5),
                 beamwidth_expansion_factor=params.get('beamwidth_expansion_factor', 1.5),
                 use_strength_col=params.get('use_strength_col', 'cell_perc_weight'),
-                distance_weighting=params.get('distance_weighting', True),
-                angle_weighting=params.get('angle_weighting', True),
-                enable_cosectored_check=params.get('enable_cosectored_check', False),
-                cosectored_strength_col=params.get('cosectored_strength_col', 'weight'),
-                cosectored_min_strength=params.get('cosectored_min_strength', 10.0),
-                cosectored_diff_thresh=params.get('cosectored_diff_thresh', -10.0),
-                high_ratio_threshold=params.get('high_ratio_threshold', 0.8),
-                medium_ratio_threshold=params.get('medium_ratio_threshold', 0.5),
+                swap_angle_tolerance_deg=params.get('swap_angle_tolerance_deg', 30.0),
+                min_out_of_beam_ratio=params.get('min_out_of_beam_ratio', 0.3),
+                min_out_of_beam_weight=params.get('min_out_of_beam_weight', 5.0),
                 max_data_drop_ratio=params.get('max_data_drop_ratio', 0.5),
                 max_detection_rate=params.get('max_detection_rate', 0.20),
-                band_max_radius_m=params.get('band_max_radius_m', None),
+                top_k_relations_per_cell=params.get('top_k_relations_per_cell', 5),
             )
         except Exception as e:
             logger.warning(f"Failed to load config: {e}. Using defaults.")
@@ -214,16 +221,8 @@ REQUIRED_REL_COLS = {
 REQUIRED_GIS_COLS = {"cell_name", "site", "band", "bearing", "hbw", "latitude", "longitude"}
 
 
-def _norm_yn(x) -> str:
-    """Normalize y/n values."""
-    if pd.isna(x):
-        return "n"
-    s = str(x).strip().lower()
-    return "y" if s in ("y", "yes", "true", "1") else "n"
-
-
 def _norm_yn_vec(series: pd.Series) -> pd.Series:
-    """Vectorized version of _norm_yn."""
+    """Vectorized normalization of y/n values."""
     s = series.fillna("n").astype(str).str.strip().str.lower()
     return s.isin(["y", "yes", "true", "1"]).map({True: "y", False: "n"})
 
@@ -236,10 +235,7 @@ def _validate_columns(df: pd.DataFrame, required: set, name: str) -> None:
 
 
 def _pick_strength_series(rel: pd.DataFrame, col: str) -> pd.Series:
-    """
-    Returns a non-negative strength series.
-    Prefers rel[col] if exists, otherwise fallback to rel['weight'].
-    """
+    """Returns a non-negative strength series."""
     if col in rel.columns:
         s = pd.to_numeric(rel[col], errors="coerce").fillna(0.0)
     else:
@@ -248,31 +244,21 @@ def _pick_strength_series(rel: pd.DataFrame, col: str) -> pd.Series:
 
 
 class CrossedFeederDetector:
-    """Detects crossed feeders using neighbour relation geometry analysis.
+    """
+    Detects crossed feeders using swap pattern analysis.
 
-    Required relation columns (canonical names):
-        cell_name, to_cell_name, distance, band, to_band, intra_site, intra_cell, weight
-    Optional relation columns:
-        cell_perc_weight
-
-    Required GIS columns (canonical names):
-        cell_name, site, band, bearing, hbw, latitude, longitude
+    Confidence levels:
+    - HIGH: Reciprocal swap pattern detected between 2+ cells at same site+band
+    - MEDIUM: Multiple cells at same site+band have out-of-beam anomalies (no clean swap)
+    - LOW: Single cell has out-of-beam anomaly - likely azimuth misconfiguration
     """
 
     def __init__(self, params: Optional[CrossedFeederParams] = None):
-        """
-        Initialize the Crossed Feeder Detector.
-
-        Args:
-            params: Detection parameters (uses defaults if None)
-        """
         self.params = params or CrossedFeederParams()
-
         logger.info(
             "Crossed Feeder detector initialized",
-            max_radius_m=self.params.max_radius_m,
-            min_distance_m=self.params.min_distance_m,
-            percentile=self.params.percentile,
+            swap_tolerance_deg=self.params.swap_angle_tolerance_deg,
+            min_out_of_beam_ratio=self.params.min_out_of_beam_ratio,
         )
 
     def detect(
@@ -282,164 +268,133 @@ class CrossedFeederDetector:
         band_filter: Optional[str] = None,
     ) -> Dict[str, pd.DataFrame]:
         """
-        Detect crossed feeders using neighbour relations and GIS data.
-
-        Args:
-            relations_df: DataFrame with neighbour relations (canonical column names)
-            gis_df: DataFrame with cell GIS data (canonical column names)
-            band_filter: Optional filter on serving band (e.g., 'L800')
+        Detect crossed feeders using swap pattern analysis.
 
         Returns:
             Dictionary with keys:
-            - 'relation_scores': Per-relation geometry and scores
-            - 'cell_scores': Per-cell aggregated scores
-            - 'site_summary': Per-site summary with classification
-            - 'cosectored_anomalies': Co-sectored cross-band anomalies (if enabled)
+            - 'cells': Per-cell results with swap detection
+            - 'sites': Per-site summary
+            - 'swap_pairs': Detected swap pairs (HIGH confidence)
+            - 'relation_details': Detailed relation-level data
         """
         logger.info("Starting crossed feeder detection")
 
-        # Validate columns
         _validate_columns(relations_df, REQUIRED_REL_COLS, "relations")
         _validate_columns(gis_df, REQUIRED_GIS_COLS, "gis")
 
-        # Make copies and normalize using vectorized operations
         rel = relations_df.copy()
         gis = gis_df.copy()
 
         rel["intra_site"] = _norm_yn_vec(rel["intra_site"])
         rel["intra_cell"] = _norm_yn_vec(rel["intra_cell"])
 
-        # Optional band filter
         if band_filter is not None:
             rel = rel[rel["band"].astype(str) == str(band_filter)].copy()
             gis = gis[gis["band"].astype(str) == str(band_filter)].copy()
             logger.info(f"Filtered to band={band_filter}: relations={len(rel)}, gis={len(gis)}")
 
-        # Build relation scores
-        logger.info("Building relation-level scores")
-        rel_scores = self._build_relation_scores(rel, gis)
+        # Build relation-level geometry
+        rel_scores = self._build_relation_geometry(rel, gis)
 
-        # Build cell and site outputs
-        logger.info("Aggregating to cell and site outputs")
-        cell_scores, site_summary = self._build_cell_and_site_outputs(rel_scores)
+        if len(rel_scores) == 0:
+            logger.warning("No valid relations after filtering")
+            return {
+                'cells': pd.DataFrame(),
+                'sites': pd.DataFrame(),
+                'swap_pairs': pd.DataFrame(),
+                'relation_details': pd.DataFrame(),
+            }
 
-        results = {
-            'relation_scores': rel_scores,
-            'cell_scores': cell_scores,
-            'site_summary': site_summary,
-        }
+        # Calculate per-cell traffic direction and anomaly metrics
+        cell_metrics = self._calculate_cell_metrics(rel_scores, gis)
 
-        # Optional co-sectored check
-        if self.params.enable_cosectored_check:
-            logger.info("Running co-sectored cross-band anomaly check")
-            cosec = self._cosectored_cross_band_anomalies(relations_df, gis_df)
-            results['cosectored_anomalies'] = cosec
+        # Detect swap patterns at each site+band
+        cell_results, swap_pairs = self._detect_swap_patterns(cell_metrics, gis)
 
-        # Log summary and detection rate sanity check
-        flagged_cells = int(cell_scores["flagged"].sum()) if "flagged" in cell_scores.columns else 0
-        total_cells = len(cell_scores)
-        detection_rate = flagged_cells / total_cells if total_cells > 0 else 0
+        # Build site summary
+        site_summary = self._build_site_summary(cell_results)
 
-        # Sanity check: warn if detection rate is unusually high
-        if detection_rate > self.params.max_detection_rate:
-            logger.warning(
-                "high_detection_rate_warning",
-                flagged_cells=flagged_cells,
-                total_cells=total_cells,
-                detection_rate=round(detection_rate, 3),
-                threshold=self.params.max_detection_rate,
-                message=f"Unusually high detection rate ({detection_rate:.1%}) - review thresholds or data quality"
-            )
+        # Log results
+        high_conf = len(cell_results[cell_results['confidence_level'] == 'HIGH'])
+        medium_conf = len(cell_results[cell_results['confidence_level'] == 'MEDIUM'])
+        low_conf = len(cell_results[cell_results['confidence_level'] == 'LOW'])
 
         logger.info(
             "Crossed feeder detection complete",
-            relations_scored=len(rel_scores),
-            flagged_cells=flagged_cells,
-            total_cells=total_cells,
-            detection_rate=round(detection_rate, 3),
+            high_confidence=high_conf,
+            medium_confidence=medium_conf,
+            low_confidence=low_conf,
+            swap_pairs=len(swap_pairs),
         )
 
-        return results
+        return {
+            'cells': cell_results,
+            'sites': site_summary,
+            'swap_pairs': swap_pairs,
+            'relation_details': rel_scores,
+        }
 
-    def _build_relation_scores(
+    def _build_relation_geometry(
         self,
         rel: pd.DataFrame,
         gis: pd.DataFrame,
     ) -> pd.DataFrame:
-        """Build per-relation geometry and suspiciousness score."""
+        """Build per-relation geometry with in-beam/out-of-beam classification."""
         cfg = self.params
 
-        # Filter to same-technology relations before GIS merge
-        # This ensures data quality metrics only consider valid same-tech relations
+        # Filter to same-technology relations
         rel["_src_tech"] = rel["band"].apply(_get_tech_from_band)
         rel["_tgt_tech"] = rel["to_band"].apply(_get_tech_from_band)
 
-        total_before_tech_filter = len(rel)
+        total_before = len(rel)
         rel = rel[rel["_src_tech"] == rel["_tgt_tech"]].copy()
-        cross_tech_dropped = total_before_tech_filter - len(rel)
+        cross_tech_dropped = total_before - len(rel)
 
         if cross_tech_dropped > 0:
             logger.info(
                 "Filtered to same-technology relations",
-                same_tech_relations=len(rel),
+                same_tech=len(rel),
                 cross_tech_dropped=cross_tech_dropped,
-                total_before=total_before_tech_filter,
             )
 
-        # Clean up temp columns
         rel = rel.drop(columns=["_src_tech", "_tgt_tech"])
 
         # Join GIS for serving cell
-        gis_s = gis.rename(
-            columns={
-                "cell_name": "cell_name",
-                "site": "site",
-                "band": "band_gis",
-                "bearing": "bearing",
-                "hbw": "hbw",
-                "latitude": "lat",
-                "longitude": "lon",
-            }
-        )[["cell_name", "site", "band_gis", "bearing", "hbw", "lat", "lon"]].copy()
+        gis_s = gis.rename(columns={
+            "site": "site",
+            "bearing": "bearing",
+            "hbw": "hbw",
+            "latitude": "lat",
+            "longitude": "lon",
+        })[["cell_name", "site", "bearing", "hbw", "lat", "lon"]].copy()
 
         # Join GIS for neighbour cell
-        gis_n = gis.rename(
-            columns={
-                "cell_name": "to_cell_name",
-                "site": "to_site",
-                "band": "to_band_gis",
-                "latitude": "to_lat",
-                "longitude": "to_lon",
-            }
-        )[["to_cell_name", "to_site", "to_band_gis", "to_lat", "to_lon"]].copy()
+        gis_n = gis.rename(columns={
+            "cell_name": "to_cell_name",
+            "latitude": "to_lat",
+            "longitude": "to_lon",
+        })[["to_cell_name", "to_lat", "to_lon"]].copy()
 
-        # Drop any conflicting columns from rel before merge
-        rel_cols_to_drop = [c for c in ['site', 'band_gis', 'bearing', 'hbw', 'lat', 'lon'] if c in rel.columns]
-        if rel_cols_to_drop:
-            rel = rel.drop(columns=rel_cols_to_drop)
+        # Drop conflicting columns
+        drop_cols = [c for c in ['site', 'bearing', 'hbw', 'lat', 'lon'] if c in rel.columns]
+        if drop_cols:
+            rel = rel.drop(columns=drop_cols)
 
         df = rel.merge(gis_s, on="cell_name", how="left").merge(gis_n, on="to_cell_name", how="left")
 
-        # Basic sanitation / filters (vectorized)
-        df["intra_site"] = _norm_yn_vec(df["intra_site"])
-        df["intra_cell"] = _norm_yn_vec(df["intra_cell"])
+        # Convert to numeric
+        for col in ["distance", "bearing", "hbw", "lat", "lon", "to_lat", "to_lon"]:
+            df[col] = pd.to_numeric(df[col], errors="coerce")
 
-        df["distance"] = pd.to_numeric(df["distance"], errors="coerce").fillna(0.0)
-        df["bearing"] = pd.to_numeric(df["bearing"], errors="coerce")
-        df["hbw"] = pd.to_numeric(df["hbw"], errors="coerce")
-        df["lat"] = pd.to_numeric(df["lat"], errors="coerce")
-        df["lon"] = pd.to_numeric(df["lon"], errors="coerce")
-        df["to_lat"] = pd.to_numeric(df["to_lat"], errors="coerce")
-        df["to_lon"] = pd.to_numeric(df["to_lon"], errors="coerce")
+        df["distance"] = df["distance"].fillna(0.0)
 
         # Drop rows missing essential geometry
         before = len(df)
         df = df.dropna(subset=["bearing", "hbw", "lat", "lon", "to_lat", "to_lon"]).copy()
         dropped = before - len(df)
+
         if dropped > 0:
             logger.warning(f"Dropped {dropped} same-tech relations due to missing GIS geometry")
-
-            # Data quality check: warn if too much same-tech data dropped
             drop_ratio = dropped / before if before > 0 else 0
             if drop_ratio > cfg.max_data_drop_ratio:
                 logger.error(
@@ -447,282 +402,295 @@ class CrossedFeederDetector:
                     dropped=dropped,
                     total=before,
                     drop_ratio=round(drop_ratio, 2),
-                    threshold=cfg.max_data_drop_ratio,
-                    message=f"High same-tech data drop rate ({drop_ratio:.1%}) - check GIS data quality"
+                    message=f"High same-tech data drop rate ({drop_ratio:.1%})"
                 )
 
         # Beam sanity filter
         df = df[(df["hbw"] >= cfg.min_hbw_deg) & (df["hbw"] <= cfg.max_hbw_deg)].copy()
 
-        # Apply band-specific distance filter
-        # Get band-specific max radius from config or use defaults
-        band_radii = cfg.band_max_radius_m if cfg.band_max_radius_m else BAND_MAX_RADIUS_M
+        # Band-specific distance filter
+        band_radii = cfg.band_max_radius_m or BAND_MAX_RADIUS_M
 
-        def get_max_radius_for_band(band: str) -> float:
-            """Get max radius for a specific band."""
+        def get_max_radius(band: str) -> float:
             band_upper = str(band).upper()
             if band_upper in band_radii:
                 return band_radii[band_upper]
-            # Try partial match (e.g., 'L800' matches '800')
             for key, val in band_radii.items():
                 if key in band_upper or band_upper in key:
                     return val
             return DEFAULT_MAX_RADIUS_M
 
-        # Apply band-specific max radius
-        df["band_max_radius"] = df["band"].apply(get_max_radius_for_band)
+        df["band_max_radius"] = df["band"].apply(get_max_radius)
         df = df[
             (df["distance"] <= df["band_max_radius"]) &
             (df["distance"] >= cfg.min_distance_m)
         ].copy()
 
-        # Primary detection uses INTER-SITE relations
+        # Inter-site relations only (feeders connect to external neighbors)
         df = df[df["intra_site"] == "n"].copy()
 
-        # Strength
-        df["strength"] = _pick_strength_series(df, cfg.use_strength_col)
+        if len(df) == 0:
+            return df
 
-        # Compute angle to neighbour (vectorized)
+        # Strength
+        df["weight"] = _pick_strength_series(df, cfg.use_strength_col)
+
+        # Angle to neighbor
         df["angle_to_neighbor"] = bearing_deg_vec(
             df["lat"].values, df["lon"].values,
             df["to_lat"].values, df["to_lon"].values
         )
 
-        # In-beam test (vectorized) with expansion factor for softer boundary
-        # Use 1.5x the 3dB beamwidth to account for RF energy beyond main lobe
-        df["half_width_deg"] = (df["hbw"] * cfg.beamwidth_expansion_factor).clip(upper=cfg.hbw_cap_deg)
-        df["angle_diff_deg"] = circ_diff_deg_vec(df["bearing"].values, df["angle_to_neighbor"].values)
-        df["in_beam"] = df["angle_diff_deg"] <= df["half_width_deg"]
+        # In-beam test with expansion factor
+        df["half_width"] = (df["hbw"] * cfg.beamwidth_expansion_factor).clip(upper=cfg.hbw_cap_deg)
+        df["angle_diff"] = circ_diff_deg_vec(df["bearing"].values, df["angle_to_neighbor"].values)
+        df["in_beam"] = df["angle_diff"] <= df["half_width"]
 
-        # Distance normalization per serving cell
-        max_dist = df.groupby("cell_name")["distance"].max().rename("max_neigh_distance_m")
-        df = df.merge(max_dist, on="cell_name", how="left")
-        df["dist_factor"] = (df["distance"] / (df["max_neigh_distance_m"].replace(0, pd.NA))).fillna(0.0)
-        df["dist_factor"] = df["dist_factor"].clip(lower=0.0, upper=1.0)
-
-        # Angle factor
-        df["angle_factor"] = (df["angle_diff_deg"] / 180.0).clip(lower=0.0, upper=1.0)
-
-        # Suspicious score: only out-of-beam relations contribute
-        df["score"] = 0.0
-        out_mask = ~df["in_beam"]
-        score = df.loc[out_mask, "strength"].copy()
-
-        if cfg.distance_weighting:
-            score = score * df.loc[out_mask, "dist_factor"]
-        if cfg.angle_weighting:
-            score = score * df.loc[out_mask, "angle_factor"]
-
-        df.loc[out_mask, "score"] = score
-
-        # Keep relevant columns
-        keep_cols = [
-            "cell_name", "band", "site",
-            "to_cell_name", "to_band", "to_site",
-            "distance",
-            "strength",
-            "bearing", "hbw", "half_width_deg",
-            "angle_to_neighbor", "angle_diff_deg", "in_beam",
-            "dist_factor", "angle_factor",
-            "score",
-        ]
-        # Include metadata if present
-        for extra in ["pci", "to_pci", "cell_perc_weight", "weight"]:
-            if extra in df.columns and extra not in keep_cols:
-                keep_cols.append(extra)
-
-        df = df[keep_cols].copy()
-        df = df.sort_values(["score", "strength", "distance"], ascending=[False, False, False])
         return df
 
-    def _build_cell_and_site_outputs(
-        self,
-        rel_scores: pd.DataFrame,
-    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
-        """Aggregate relation scores into per-cell and per-site summaries."""
-        cfg = self.params
-
-        # Per-cell score with additional metrics for confidence calculation
-        cell = (
-            rel_scores.groupby(["cell_name", "site", "band"], as_index=False)
-            .agg(
-                cell_score=("score", "sum"),
-                out_of_beam_relations=("score", lambda s: int((s > 0).sum())),
-                total_relations=("score", "size"),
-                max_angle_diff=("angle_diff_deg", "max"),
-                avg_angle_diff=("angle_diff_deg", "mean"),
-                max_out_of_beam_score=("score", "max"),
-            )
-        )
-
-        # Calculate out-of-beam ratio
-        cell["out_of_beam_ratio"] = cell["out_of_beam_relations"] / cell["total_relations"].replace(0, 1)
-
-        # Percentile threshold per band
-        cell["flagged"] = False
-        cell["threshold"] = 0.0
-        cell["percentile"] = cfg.percentile
-
-        for b, sub in cell.groupby("band"):
-            if len(sub) == 0:
-                continue
-            thr = float(sub["cell_score"].quantile(cfg.percentile))
-            idx = cell["band"] == b
-            cell.loc[idx, "threshold"] = thr
-            cell.loc[idx, "flagged"] = cell.loc[idx, "cell_score"] >= thr
-
-        # Calculate confidence score (0-100%)
-        # Based on: score strength, number of out-of-beam relations, angle deviation consistency
-        cell["confidence"] = 0.0
-        flagged_mask = cell["flagged"]
-
-        if flagged_mask.any():
-            # Normalize cell_score to 0-1 within flagged cells
-            max_score = cell.loc[flagged_mask, "cell_score"].max()
-            if max_score > 0:
-                score_factor = (cell.loc[flagged_mask, "cell_score"] / max_score).clip(0, 1)
-            else:
-                score_factor = 0.0
-
-            # Out-of-beam ratio factor (more out-of-beam = higher confidence)
-            oob_factor = cell.loc[flagged_mask, "out_of_beam_ratio"].clip(0, 1)
-
-            # Angle deviation factor (larger deviations = higher confidence)
-            # Normalize by 180 degrees (max possible deviation)
-            angle_factor = (cell.loc[flagged_mask, "avg_angle_diff"] / 180.0).clip(0, 1)
-
-            # Weighted confidence: 40% score, 30% out-of-beam ratio, 30% angle deviation
-            cell.loc[flagged_mask, "confidence"] = (
-                0.40 * score_factor +
-                0.30 * oob_factor +
-                0.30 * angle_factor
-            ) * 100
-
-            cell["confidence"] = cell["confidence"].round(1)
-
-        # Attach top-K suspicious relations per cell
-        topk = (
-            rel_scores[rel_scores["score"] > 0]
-            .groupby("cell_name")
-            .head(cfg.top_k_relations_per_cell)
-            .copy()
-        )
-        topk["rel_str"] = (
-            topk["to_cell_name"].astype(str)
-            + " (d="
-            + topk["distance"].round(0).astype(int).astype(str)
-            + "m, score="
-            + topk["score"].round(6).astype(str)
-            + ")"
-        )
-        topk_agg = topk.groupby("cell_name")["rel_str"].apply(lambda x: " | ".join(x)).rename("top_suspicious_relations")
-        cell = cell.merge(topk_agg, on="cell_name", how="left")
-        cell["top_suspicious_relations"] = cell["top_suspicious_relations"].fillna("")
-
-        # Site summary (per site+band)
-        site = (
-            cell.groupby(["site", "band"], as_index=False)
-            .agg(
-                flagged_cells=("flagged", "sum"),
-                total_sectors=("cell_name", "nunique"),
-                sum_cell_score=("cell_score", "sum"),
-                max_cell_score=("cell_score", "max"),
-                avg_out_of_beam_ratio=("out_of_beam_relations", lambda x: x.mean()),
-            )
-        )
-
-        # Ratio-based classification for multi-sector sites
-        site["flagged_ratio"] = site["flagged_cells"] / site["total_sectors"].replace(0, 1)
-
-        def classify(row) -> str:
-            flagged = int(row["flagged_cells"])
-            total = int(row["total_sectors"])
-            ratio = row["flagged_ratio"]
-
-            if flagged == 0:
-                return "No evidence"
-            if ratio >= cfg.high_ratio_threshold:
-                return f"High potential: {flagged}/{total} sectors flagged ({ratio:.0%})"
-            if ratio >= cfg.medium_ratio_threshold:
-                return f"Medium potential: {flagged}/{total} sectors flagged ({ratio:.0%})"
-            if flagged >= 2:
-                return f"Medium potential: {flagged} sectors flagged"
-            return f"Low potential: {flagged} sector flagged"
-
-        # Handle empty site DataFrame
-        if len(site) > 0:
-            site["classification"] = site.apply(classify, axis=1)
-            site = site.sort_values(["flagged_ratio", "flagged_cells", "max_cell_score"], ascending=[False, False, False])
-        else:
-            site["classification"] = ""
-
-        cell = cell.sort_values(["flagged", "cell_score"], ascending=[False, False])
-        return cell, site
-
-    def _cosectored_cross_band_anomalies(
+    def _calculate_cell_metrics(
         self,
         rel: pd.DataFrame,
         gis: pd.DataFrame,
     ) -> pd.DataFrame:
-        """
-        Secondary detector: compare co-sectored vs non-co-sectored cross-band relations.
-
-        Returns a table of suspicious cases.
-        """
+        """Calculate per-cell traffic direction and anomaly metrics."""
         cfg = self.params
 
-        # Only intra-site, cross-band (vectorized normalization)
-        df = rel.copy()
-        df["intra_site"] = _norm_yn_vec(df["intra_site"])
-        df["intra_cell"] = _norm_yn_vec(df["intra_cell"])
-        df = df[(df["intra_site"] == "y") & (df["band"].astype(str) != df["to_band"].astype(str))].copy()
+        # Get cell info from GIS
+        cell_info = gis[["cell_name", "site", "band", "bearing", "hbw", "latitude", "longitude"]].copy()
+        cell_info = cell_info.rename(columns={"latitude": "lat", "longitude": "lon"})
 
-        if df.empty:
+        # Calculate per-cell metrics
+        metrics = []
+
+        for cell_name, cell_rel in rel.groupby("cell_name"):
+            total_weight = cell_rel["weight"].sum()
+            in_beam_weight = cell_rel[cell_rel["in_beam"]]["weight"].sum()
+            out_of_beam_weight = cell_rel[~cell_rel["in_beam"]]["weight"].sum()
+
+            total_relations = len(cell_rel)
+            out_of_beam_relations = len(cell_rel[~cell_rel["in_beam"]])
+
+            out_of_beam_ratio = out_of_beam_weight / total_weight if total_weight > 0 else 0
+
+            # Calculate dominant traffic direction (weighted mean of out-of-beam neighbors)
+            oob = cell_rel[~cell_rel["in_beam"]]
+            if len(oob) > 0 and oob["weight"].sum() > 0:
+                dominant_direction = weighted_circular_mean(
+                    oob["angle_to_neighbor"].values,
+                    oob["weight"].values
+                )
+            else:
+                dominant_direction = np.nan
+
+            # Get top suspicious relations
+            top_oob = cell_rel[~cell_rel["in_beam"]].nlargest(cfg.top_k_relations_per_cell, "weight")
+            top_relations = " | ".join([
+                f"{row['to_cell_name']} (d={int(row['distance'])}m, w={row['weight']:.1f}, angle={row['angle_to_neighbor']:.0f}°)"
+                for _, row in top_oob.iterrows()
+            ])
+
+            metrics.append({
+                "cell_name": cell_name,
+                "total_weight": total_weight,
+                "in_beam_weight": in_beam_weight,
+                "out_of_beam_weight": out_of_beam_weight,
+                "out_of_beam_ratio": out_of_beam_ratio,
+                "total_relations": total_relations,
+                "out_of_beam_relations": out_of_beam_relations,
+                "dominant_traffic_direction": dominant_direction,
+                "top_suspicious_relations": top_relations,
+            })
+
+        metrics_df = pd.DataFrame(metrics)
+
+        # Merge with cell info
+        metrics_df = metrics_df.merge(cell_info, on="cell_name", how="left")
+
+        return metrics_df
+
+    def _detect_swap_patterns(
+        self,
+        cell_metrics: pd.DataFrame,
+        gis: pd.DataFrame,
+    ) -> Tuple[pd.DataFrame, pd.DataFrame]:
+        """Detect swap patterns at each site+band combination."""
+        cfg = self.params
+
+        results = []
+        swap_pairs = []
+
+        # Process each site+band group
+        for (site, band), group in cell_metrics.groupby(["site", "band"]):
+            n_cells = len(group)
+
+            # Get cells with significant out-of-beam traffic
+            anomalous = group[
+                (group["out_of_beam_ratio"] >= cfg.min_out_of_beam_ratio) &
+                (group["out_of_beam_weight"] >= cfg.min_out_of_beam_weight)
+            ]
+
+            n_anomalous = len(anomalous)
+
+            if n_anomalous == 0:
+                # No anomalies - all cells are fine
+                for _, cell in group.iterrows():
+                    results.append(self._build_cell_result(cell, "NONE", None, "No out-of-beam anomaly detected"))
+                continue
+
+            # Check for swap patterns between anomalous cells
+            detected_swaps = set()
+            cell_swap_partners = {}
+
+            for i, cell_a in anomalous.iterrows():
+                if pd.isna(cell_a["dominant_traffic_direction"]):
+                    continue
+
+                for j, cell_b in anomalous.iterrows():
+                    if i >= j:  # Avoid duplicate pairs
+                        continue
+                    if pd.isna(cell_b["dominant_traffic_direction"]):
+                        continue
+
+                    # Check if Cell A's traffic points toward Cell B's azimuth
+                    a_to_b_diff = circ_diff_deg(cell_a["dominant_traffic_direction"], cell_b["bearing"])
+                    # Check if Cell B's traffic points toward Cell A's azimuth
+                    b_to_a_diff = circ_diff_deg(cell_b["dominant_traffic_direction"], cell_a["bearing"])
+
+                    # Both directions must match for a swap
+                    if (a_to_b_diff <= cfg.swap_angle_tolerance_deg and
+                        b_to_a_diff <= cfg.swap_angle_tolerance_deg):
+
+                        # Found a swap pair!
+                        detected_swaps.add((cell_a["cell_name"], cell_b["cell_name"]))
+                        cell_swap_partners[cell_a["cell_name"]] = cell_b["cell_name"]
+                        cell_swap_partners[cell_b["cell_name"]] = cell_a["cell_name"]
+
+                        swap_pairs.append({
+                            "site": site,
+                            "band": band,
+                            "cell_a": cell_a["cell_name"],
+                            "cell_b": cell_b["cell_name"],
+                            "cell_a_azimuth": cell_a["bearing"],
+                            "cell_b_azimuth": cell_b["bearing"],
+                            "cell_a_traffic_dir": cell_a["dominant_traffic_direction"],
+                            "cell_b_traffic_dir": cell_b["dominant_traffic_direction"],
+                            "a_to_b_angle_diff": a_to_b_diff,
+                            "b_to_a_angle_diff": b_to_a_diff,
+                        })
+
+            # Classify all cells at this site+band
+            for _, cell in group.iterrows():
+                cell_name = cell["cell_name"]
+
+                if cell_name in cell_swap_partners:
+                    # HIGH confidence: part of a detected swap pair
+                    partner = cell_swap_partners[cell_name]
+                    results.append(self._build_cell_result(
+                        cell, "HIGH", partner,
+                        f"Reciprocal swap pattern detected with {partner}. Check feeder connections."
+                    ))
+                elif cell_name in anomalous["cell_name"].values:
+                    if n_anomalous >= 2:
+                        # MEDIUM confidence: multiple anomalies but no clean swap
+                        results.append(self._build_cell_result(
+                            cell, "MEDIUM", None,
+                            f"Out-of-beam anomaly at site with {n_anomalous} anomalous cells. Investigate feeder routing."
+                        ))
+                    else:
+                        # LOW confidence: single cell anomaly
+                        results.append(self._build_cell_result(
+                            cell, "LOW", None,
+                            "Single cell out-of-beam anomaly. Review azimuth configuration or terrain effects."
+                        ))
+                else:
+                    # No anomaly for this cell
+                    results.append(self._build_cell_result(cell, "NONE", None, "No out-of-beam anomaly detected"))
+
+        results_df = pd.DataFrame(results)
+        swap_pairs_df = pd.DataFrame(swap_pairs)
+
+        # Sort results
+        confidence_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "NONE": 3}
+        if len(results_df) > 0:
+            results_df["_sort"] = results_df["confidence_level"].map(confidence_order)
+            results_df = results_df.sort_values(["_sort", "out_of_beam_ratio"], ascending=[True, False])
+            results_df = results_df.drop(columns=["_sort"])
+
+        return results_df, swap_pairs_df
+
+    def _build_cell_result(
+        self,
+        cell: pd.Series,
+        confidence_level: str,
+        swap_partner: Optional[str],
+        recommendation: str,
+    ) -> Dict:
+        """Build a cell result dictionary."""
+        return {
+            "cell_name": cell["cell_name"],
+            "site": cell["site"],
+            "band": cell["band"],
+            "bearing": cell["bearing"],
+            "hbw": cell["hbw"],
+            "total_weight": cell["total_weight"],
+            "in_beam_weight": cell["in_beam_weight"],
+            "out_of_beam_weight": cell["out_of_beam_weight"],
+            "out_of_beam_ratio": round(cell["out_of_beam_ratio"], 3),
+            "dominant_traffic_direction": cell["dominant_traffic_direction"],
+            "confidence_level": confidence_level,
+            "swap_partner": swap_partner,
+            "recommendation": recommendation,
+            "top_suspicious_relations": cell["top_suspicious_relations"],
+            "flagged": confidence_level in ("HIGH", "MEDIUM", "LOW"),
+        }
+
+    def _build_site_summary(self, cell_results: pd.DataFrame) -> pd.DataFrame:
+        """Build per-site summary."""
+        if len(cell_results) == 0:
             return pd.DataFrame()
 
-        # Attach serving site via gis
-        gis_s = gis[["cell_name", "site", "band"]].rename(columns={"band": "band_gis"})
-        df = df.merge(gis_s, on="cell_name", how="left")
+        summary = []
 
-        # Strength metric for comparison
-        strength = _pick_strength_series(df, cfg.cosectored_strength_col)
-        df["strength"] = strength
+        for (site, band), group in cell_results.groupby(["site", "band"]):
+            n_cells = len(group)
+            high_conf = len(group[group["confidence_level"] == "HIGH"])
+            medium_conf = len(group[group["confidence_level"] == "MEDIUM"])
+            low_conf = len(group[group["confidence_level"] == "LOW"])
 
-        # Aggregate per serving cell and target band
-        key = ["site", "cell_name", "band", "to_band"]
-        agg = (
-            df.groupby(key + ["intra_cell"], as_index=False)
-            .agg(max_strength=("strength", "max"), count=("strength", "size"))
-        )
+            # Determine site-level classification
+            if high_conf > 0:
+                classification = f"CROSSED FEEDER: {high_conf} swap pair(s) detected"
+                severity = "HIGH"
+            elif medium_conf > 0:
+                classification = f"POSSIBLE ISSUE: {medium_conf} cells with out-of-beam anomalies"
+                severity = "MEDIUM"
+            elif low_conf > 0:
+                classification = f"AZIMUTH REVIEW: {low_conf} cell(s) may need azimuth adjustment"
+                severity = "LOW"
+            else:
+                classification = "No issues detected"
+                severity = "NONE"
 
-        # Pivot intra_cell => columns
-        piv = agg.pivot_table(
-            index=key,
-            columns="intra_cell",
-            values="max_strength",
-            aggfunc="max",
-            fill_value=0.0
-        ).reset_index()
+            summary.append({
+                "site": site,
+                "band": band,
+                "total_cells": n_cells,
+                "high_confidence": high_conf,
+                "medium_confidence": medium_conf,
+                "low_confidence": low_conf,
+                "severity": severity,
+                "classification": classification,
+            })
 
-        # Ensure both columns exist
-        if "y" not in piv.columns:
-            piv["y"] = 0.0
-        if "n" not in piv.columns:
-            piv["n"] = 0.0
+        summary_df = pd.DataFrame(summary)
 
-        piv = piv.rename(columns={"y": "co_strength", "n": "non_strength"})
-        piv["diff"] = 0.0
-        denom = piv["co_strength"] + piv["non_strength"]
-        piv.loc[denom > 0, "diff"] = 100.0 * (piv.loc[denom > 0, "co_strength"] - piv.loc[denom > 0, "non_strength"]) / denom[denom > 0]
+        severity_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "NONE": 3}
+        summary_df["_sort"] = summary_df["severity"].map(severity_order)
+        summary_df = summary_df.sort_values(["_sort", "high_confidence", "medium_confidence"], ascending=[True, False, False])
+        summary_df = summary_df.drop(columns=["_sort"])
 
-        # Flagging rule
-        piv["flag"] = (
-            (piv[["co_strength", "non_strength"]].max(axis=1) >= cfg.cosectored_min_strength)
-            & (piv["diff"] < cfg.cosectored_diff_thresh)
-        )
-
-        piv = piv.sort_values(["flag", "diff"], ascending=[False, True])
-        return piv
+        return summary_df
 
 
 def detect_crossed_feeders(
@@ -734,14 +702,11 @@ def detect_crossed_feeders(
     """
     Convenience function to detect crossed feeders.
 
-    Args:
-        relations_df: DataFrame with neighbour relations
-        gis_df: DataFrame with cell GIS data
-        params: Optional detection parameters
-        band_filter: Optional filter on serving band
-
-    Returns:
-        Dictionary with detection results
+    Returns dictionary with:
+    - 'cells': Per-cell results with confidence level and swap partner
+    - 'sites': Per-site summary
+    - 'swap_pairs': Detected swap pairs
+    - 'relation_details': Relation-level data
     """
     detector = CrossedFeederDetector(params)
     return detector.detect(relations_df, gis_df, band_filter)
