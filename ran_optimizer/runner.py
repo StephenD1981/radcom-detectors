@@ -765,24 +765,45 @@ def run_crossed_feeder(
     detector = CrossedFeederDetector(params)
     results = detector.detect(relations_df, gis_df)
 
-    # Results is a dict: relation_scores, cell_scores, site_summary, cosectored_anomalies
-    cell_scores = results.get('cell_scores', pd.DataFrame())
-    site_summary = results.get('site_summary', pd.DataFrame())
+    # Results is a dict: cells, sites, swap_pairs, relation_details
+    cells_df = results.get('cells', pd.DataFrame())
+    sites_df = results.get('sites', pd.DataFrame())
+    swap_pairs_df = results.get('swap_pairs', pd.DataFrame())
 
-    if len(cell_scores) > 0:
+    # Save cell results
+    if len(cells_df) > 0:
         output_file = output_dir / 'crossed_feeder_cells.csv'
-        cell_scores.to_csv(output_file, index=False)
-        logger.info("Crossed feeder cell scores saved", path=str(output_file), count=len(cell_scores))
+        cells_df.to_csv(output_file, index=False)
+        logger.info("Crossed feeder cells saved", path=str(output_file), count=len(cells_df))
 
-    if len(site_summary) > 0:
+    # Save site summary
+    if len(sites_df) > 0:
         output_file = output_dir / 'crossed_feeder_sites.csv'
-        site_summary.to_csv(output_file, index=False)
-        logger.info("Crossed feeder site summary saved", path=str(output_file), count=len(site_summary))
+        sites_df.to_csv(output_file, index=False)
+        logger.info("Crossed feeder sites saved", path=str(output_file), count=len(sites_df))
+
+    # Save swap pairs (HIGH confidence detections)
+    if len(swap_pairs_df) > 0:
+        output_file = output_dir / 'crossed_feeder_swap_pairs.csv'
+        swap_pairs_df.to_csv(output_file, index=False)
+        logger.info("Crossed feeder swap pairs saved", path=str(output_file), count=len(swap_pairs_df))
+
+    # Log summary by confidence level
+    if len(cells_df) > 0 and 'confidence_level' in cells_df.columns:
+        high = len(cells_df[cells_df['confidence_level'] == 'HIGH'])
+        medium = len(cells_df[cells_df['confidence_level'] == 'MEDIUM'])
+        low = len(cells_df[cells_df['confidence_level'] == 'LOW'])
+        logger.info(
+            "Crossed feeder detection summary",
+            high_confidence=high,
+            medium_confidence=medium,
+            low_confidence=low,
+            swap_pairs=len(swap_pairs_df),
+        )
 
     # Return flagged cells for summary
-    if len(cell_scores) > 0 and 'flagged' in cell_scores.columns:
-        flagged = cell_scores[cell_scores['flagged'] == True]
-        logger.info("Crossed feeders flagged", count=len(flagged))
+    if len(cells_df) > 0 and 'flagged' in cells_df.columns:
+        flagged = cells_df[cells_df['flagged'] == True]
         return flagged
     else:
         logger.info("No crossed feeders detected")
