@@ -174,6 +174,24 @@ ISSUE_COLORS = {
     'undershooting': '#0d6efd',  # Blue
     'no_coverage': '#ffc107',    # Yellow
     'low_coverage': '#fd7e14',   # Orange
+    'pci_confusion': '#9b59b6',  # Purple
+    'pci_collision': '#9b59b6',  # Purple
+    'pci_blacklist': '#fd7e14',  # Orange
+    'ca_imbalance': '#17a2b8',   # Teal
+    'crossed_feeder': '#dc3545', # Red
+    'interference': '#dc3545',   # Red
+}
+
+# Line colors for relationship visualization
+LINE_COLORS = {
+    'pci': '#9b59b6',              # Purple - PCI relationships
+    'blacklist': '#fd7e14',        # Orange - Blacklist suggestions
+    'crossed_offender': '#dc3545', # Red - Suspicious crossed feeder relations
+    'crossed_normal': '#198754',   # Green - Normal crossed feeder relations
+    'low_coverage': '#fd7e14',     # Orange - Low coverage serving cells
+    'interference': '#dc3545',     # Red - Interference cluster cells
+    'ca_coverage': '#0d6efd',      # Blue - CA imbalance coverage hull
+    'ca_capacity': '#198754',      # Green - CA imbalance capacity hull
 }
 
 
@@ -182,10 +200,18 @@ def create_enhanced_map(
     undershooting_df: Optional[pd.DataFrame] = None,
     gis_df: Optional[pd.DataFrame] = None,
     no_coverage_gdf: Optional[gpd.GeoDataFrame] = None,
+    no_coverage_per_band_gdfs: Optional[Dict[str, gpd.GeoDataFrame]] = None,
     low_coverage_gdfs: Optional[Dict[str, gpd.GeoDataFrame]] = None,
     overshooting_grid_df: Optional[pd.DataFrame] = None,
     undershooting_grid_df: Optional[pd.DataFrame] = None,
     cell_hulls_gdf: Optional[gpd.GeoDataFrame] = None,
+    # New detector DataFrames
+    pci_confusions_df: Optional[pd.DataFrame] = None,
+    pci_collisions_df: Optional[pd.DataFrame] = None,
+    pci_blacklist_df: Optional[pd.DataFrame] = None,
+    ca_imbalance_df: Optional[pd.DataFrame] = None,
+    crossed_feeder_df: Optional[pd.DataFrame] = None,
+    interference_gdf: Optional[gpd.GeoDataFrame] = None,
     output_file: Optional[Path] = None,
     title: str = "RAN Optimizer - Network Issues Dashboard",
 ) -> folium.Map:
@@ -197,10 +223,17 @@ def create_enhanced_map(
         undershooting_df: DataFrame with undershooting cell results
         gis_df: DataFrame with cell GIS data (for coordinate lookup)
         no_coverage_gdf: GeoDataFrame with no coverage gap polygons
+        no_coverage_per_band_gdfs: Dict of band -> GeoDataFrame with no coverage per band
         low_coverage_gdfs: Dict of band -> GeoDataFrame with low coverage areas
         overshooting_grid_df: DataFrame with overshooting grid bins (for lazy loading)
         undershooting_grid_df: DataFrame with undershooting grid bins (for lazy loading)
         cell_hulls_gdf: GeoDataFrame with cell coverage hull polygons
+        pci_confusions_df: DataFrame with PCI confusion issues
+        pci_collisions_df: DataFrame with PCI collision issues
+        pci_blacklist_df: DataFrame with PCI blacklist suggestions
+        ca_imbalance_df: DataFrame with CA imbalance issues
+        crossed_feeder_df: DataFrame with crossed feeder issues
+        interference_gdf: GeoDataFrame with interference cluster polygons
         output_file: Path to save HTML output
         title: Map title
 
@@ -234,11 +267,34 @@ def create_enhanced_map(
 
     # Build statistics for summary panel
     stats = _calculate_statistics(
-        overshooting_df, undershooting_df, no_coverage_gdf, low_coverage_gdfs
+        overshooting_df, undershooting_df, no_coverage_gdf, low_coverage_gdfs,
+        no_coverage_per_band_gdfs=no_coverage_per_band_gdfs,
+        pci_confusions_df=pci_confusions_df,
+        pci_collisions_df=pci_collisions_df,
+        pci_blacklist_df=pci_blacklist_df,
+        ca_imbalance_df=ca_imbalance_df,
+        crossed_feeder_df=crossed_feeder_df,
+        interference_gdf=interference_gdf,
     )
 
     # Create feature groups for each layer
     layers = {}
+
+    # Build cell coordinates lookup for line drawing
+    cell_coords = _build_cell_coords_lookup(gis_df)
+
+    # Build cell geometries lookup for displaying cell sectors
+    cell_geometries = _build_cell_geometries_lookup(gis_df)
+
+    # Extract unique bands from GIS data for filter dropdown
+    all_bands = []
+    if gis_df is not None and 'band' in gis_df.columns:
+        all_bands = gis_df['band'].dropna().unique().tolist()
+    elif gis_df is not None and 'Band' in gis_df.columns:
+        all_bands = gis_df['Band'].dropna().unique().tolist()
+
+    # Collect all line data for JavaScript
+    all_line_data = {}
 
     # Get cell IDs that have grid data
     over_grid_cell_names = set(overshooting_grid_df['cell_name'].astype(str).unique()) if overshooting_grid_df is not None and len(overshooting_grid_df) > 0 else None
@@ -265,11 +321,71 @@ def create_enhanced_map(
     if no_coverage_gdf is not None and len(no_coverage_gdf) > 0:
         layers['no_coverage'] = _add_no_coverage_layer(m, no_coverage_gdf)
 
-    # Layer 4: Low coverage areas (per band)
+    # Layer 3b: No coverage per band
+    if no_coverage_per_band_gdfs:
+        combined_no_cov_pb = []
+        for band, gdf in no_coverage_per_band_gdfs.items():
+            if len(gdf) > 0:
+                gdf_copy = gdf.copy()
+                if 'band' not in gdf_copy.columns:
+                    gdf_copy['band'] = band
+                combined_no_cov_pb.append(gdf_copy)
+        if combined_no_cov_pb:
+            combined_gdf = gpd.GeoDataFrame(pd.concat(combined_no_cov_pb, ignore_index=True))
+            layers['no_coverage_per_band'] = _add_no_coverage_per_band_layer(m, combined_gdf)
+
+    # Layer 4: Low coverage areas (all bands combined) with serving cell lines
     if low_coverage_gdfs:
+        # Combine all bands into one GeoDataFrame
+        combined_low_cov = []
         for band, gdf in low_coverage_gdfs.items():
             if len(gdf) > 0:
-                layers[f'low_coverage_{band}'] = _add_low_coverage_layer(m, gdf, band)
+                gdf_copy = gdf.copy()
+                if 'band' not in gdf_copy.columns:
+                    gdf_copy['band'] = band
+                combined_low_cov.append(gdf_copy)
+        if combined_low_cov:
+            combined_gdf = gpd.GeoDataFrame(pd.concat(combined_low_cov, ignore_index=True))
+            layer, line_data = _add_low_coverage_layer(m, combined_gdf, 'all', cell_coords)
+            layers['low_coverage'] = layer
+            all_line_data.update(line_data)
+
+    # Layer 5: Interference clusters with offending cell lines
+    if interference_gdf is not None and len(interference_gdf) > 0:
+        layer, line_data = _add_interference_layer(m, interference_gdf, cell_coords)
+        layers['interference'] = layer
+        all_line_data.update(line_data)
+
+    # Layer 6: PCI Confusions
+    if pci_confusions_df is not None and len(pci_confusions_df) > 0:
+        layer, line_data = _add_pci_confusions_layer(m, pci_confusions_df, cell_coords)
+        layers['pci_confusions'] = layer
+        all_line_data.update(line_data)
+
+    # Layer 7: PCI Collisions
+    if pci_collisions_df is not None and len(pci_collisions_df) > 0:
+        layer, line_data = _add_pci_collisions_layer(m, pci_collisions_df, cell_coords)
+        layers['pci_collisions'] = layer
+        all_line_data.update(line_data)
+
+    # Layer 8: PCI Blacklist Suggestions
+    if pci_blacklist_df is not None and len(pci_blacklist_df) > 0:
+        layer, line_data = _add_pci_blacklist_layer(m, pci_blacklist_df, cell_coords)
+        layers['pci_blacklist'] = layer
+        all_line_data.update(line_data)
+
+    # Layer 9: CA Imbalance with hull toggle
+    all_hull_data = {}
+    if ca_imbalance_df is not None and len(ca_imbalance_df) > 0:
+        layer, hull_data = _add_ca_imbalance_layer(m, ca_imbalance_df, cell_coords, cell_hulls_gdf)
+        layers['ca_imbalance'] = layer
+        all_hull_data.update(hull_data)
+
+    # Layer 10: Crossed Feeders
+    if crossed_feeder_df is not None and len(crossed_feeder_df) > 0:
+        layer, line_data = _add_crossed_feeder_layer(m, crossed_feeder_df, cell_coords, cell_geometries)
+        layers['crossed_feeders'] = layer
+        all_line_data.update(line_data)
 
     # Save grid data for lazy loading and add JavaScript
     grid_paths = {}
@@ -296,6 +412,10 @@ def create_enhanced_map(
     if grid_paths:
         _add_grid_loading_javascript(m, grid_paths)
 
+    # Add line toggle JavaScript if we have any line data or hull data
+    if all_line_data or all_hull_data:
+        _add_line_toggle_javascript(m, all_line_data, cell_coords, all_hull_data)
+
     # Add layer control (topright to avoid overlap with summary/filter panels on left)
     folium.LayerControl(collapsed=False, position='topright').add_to(m)
 
@@ -318,7 +438,19 @@ def create_enhanced_map(
     _add_title_panel(m, title)
     _add_summary_panel(m, stats)
     _add_legend_panel(m, stats)
-    _add_filter_panel(m, stats)
+    _add_filter_panel(m, stats, all_bands=all_bands)
+
+    # Add recommendations table panel
+    _add_recommendations_table_panel(
+        m, cell_coords,
+        overshooting_df=overshooting_df,
+        undershooting_df=undershooting_df,
+        pci_confusions_df=pci_confusions_df,
+        pci_collisions_df=pci_collisions_df,
+        pci_blacklist_df=pci_blacklist_df,
+        ca_imbalance_df=ca_imbalance_df,
+        crossed_feeder_df=crossed_feeder_df,
+    )
 
     # Add filter JavaScript
     _add_filter_javascript(m)
@@ -369,6 +501,13 @@ def _calculate_statistics(
     undershooting_df: Optional[pd.DataFrame],
     no_coverage_gdf: Optional[gpd.GeoDataFrame],
     low_coverage_gdfs: Optional[Dict[str, gpd.GeoDataFrame]],
+    no_coverage_per_band_gdfs: Optional[Dict[str, gpd.GeoDataFrame]] = None,
+    pci_confusions_df: Optional[pd.DataFrame] = None,
+    pci_collisions_df: Optional[pd.DataFrame] = None,
+    pci_blacklist_df: Optional[pd.DataFrame] = None,
+    ca_imbalance_df: Optional[pd.DataFrame] = None,
+    crossed_feeder_df: Optional[pd.DataFrame] = None,
+    interference_gdf: Optional[gpd.GeoDataFrame] = None,
 ) -> dict:
     """Calculate summary statistics for the dashboard."""
     stats = {
@@ -390,11 +529,22 @@ def _calculate_statistics(
             'total': 0,
             'total_area_km2': 0,
         },
+        'no_coverage_per_band': {
+            'total': 0,
+            'by_band': {},
+            'total_area_km2': 0,
+        },
         'low_coverage': {
             'total': 0,
             'by_band': {},
             'total_area_km2': 0,
         },
+        'pci_confusions': {'total': 0},
+        'pci_collisions': {'total': 0},
+        'pci_blacklist': {'total': 0},
+        'ca_imbalance': {'total': 0},
+        'crossed_feeders': {'total': 0},
+        'interference': {'total': 0},
         'timestamp': datetime.now().isoformat(),
     }
 
@@ -428,6 +578,15 @@ def _calculate_statistics(
         if 'area_km2' in no_coverage_gdf.columns:
             stats['no_coverage']['total_area_km2'] = no_coverage_gdf['area_km2'].sum()
 
+    # No coverage per band stats
+    if no_coverage_per_band_gdfs:
+        for band, gdf in no_coverage_per_band_gdfs.items():
+            if len(gdf) > 0:
+                stats['no_coverage_per_band']['total'] += len(gdf)
+                stats['no_coverage_per_band']['by_band'][str(band)] = len(gdf)
+                if 'area_km2' in gdf.columns:
+                    stats['no_coverage_per_band']['total_area_km2'] += gdf['area_km2'].sum()
+
     # Low coverage stats
     if low_coverage_gdfs:
         for band, gdf in low_coverage_gdfs.items():
@@ -437,6 +596,27 @@ def _calculate_statistics(
                 if 'area_km2' in gdf.columns:
                     stats['low_coverage']['total_area_km2'] += gdf['area_km2'].sum()
 
+    # PCI stats
+    if pci_confusions_df is not None:
+        stats['pci_confusions']['total'] = len(pci_confusions_df)
+    if pci_collisions_df is not None:
+        stats['pci_collisions']['total'] = len(pci_collisions_df)
+    if pci_blacklist_df is not None:
+        stats['pci_blacklist']['total'] = len(pci_blacklist_df)
+
+    # CA Imbalance stats
+    if ca_imbalance_df is not None:
+        stats['ca_imbalance']['total'] = len(ca_imbalance_df)
+
+    # Crossed Feeder stats
+    if crossed_feeder_df is not None:
+        flagged = crossed_feeder_df[crossed_feeder_df.get('flagged', False) == True] if 'flagged' in crossed_feeder_df.columns else crossed_feeder_df
+        stats['crossed_feeders']['total'] = len(flagged)
+
+    # Interference stats
+    if interference_gdf is not None:
+        stats['interference']['total'] = len(interference_gdf)
+
     return stats
 
 
@@ -444,43 +624,77 @@ def _add_all_cells_layer(
     m: folium.Map,
     gis_df: pd.DataFrame,
 ) -> folium.FeatureGroup:
-    """Add a layer showing all cells as grey sector triangles."""
+    """Add a layer showing all cells with their actual sector geometry."""
+    from shapely import wkt
+    from shapely.geometry import mapping
+
     layer = folium.FeatureGroup(name='All Cells', show=False)
 
-    # Find the right columns
-    cell_name_col = 'CILAC' if 'CILAC' in gis_df.columns else 'cell_name'
-    lat_col = 'Latitude' if 'Latitude' in gis_df.columns else 'latitude'
-    lon_col = 'Longitude' if 'Longitude' in gis_df.columns else 'longitude'
-    az_col = 'Bearing' if 'Bearing' in gis_df.columns else 'azimuth_deg'
-    name_col = 'Name' if 'Name' in gis_df.columns else 'cell_name'
-    band_col = 'Band' if 'Band' in gis_df.columns else 'band'
+    # Standard column names (lowercase)
+    cell_name_col = 'cell_name' if 'cell_name' in gis_df.columns else 'CILAC'
+    lat_col = 'latitude' if 'latitude' in gis_df.columns else 'Latitude'
+    lon_col = 'longitude' if 'longitude' in gis_df.columns else 'Longitude'
+    band_col = 'band' if 'band' in gis_df.columns else 'Band'
+    site_col = 'site' if 'site' in gis_df.columns else 'Site'
+    geom_col = 'geometry' if 'geometry' in gis_df.columns else None
+    bearing_col = 'bearing' if 'bearing' in gis_df.columns else 'Bearing'
 
     for _, cell in gis_df.iterrows():
+        cell_name = str(cell.get(cell_name_col, 'N/A'))
         lat = cell.get(lat_col)
         lon = cell.get(lon_col)
+        band = cell.get(band_col, 'N/A')
+        site = cell.get(site_col, '')
+        bearing = cell.get(bearing_col, 0) if bearing_col in gis_df.columns else 0
 
         if pd.isna(lat) or pd.isna(lon):
             continue
 
-        cell_name = cell.get(cell_name_col, 'N/A')
-        cell_name = cell.get(name_col, '') if name_col in gis_df.columns else ''
-        azimuth = cell.get(az_col, 0) if az_col in gis_df.columns else 0
-        band = cell.get(band_col, 'N/A') if band_col in gis_df.columns else 'N/A'
+        tooltip = f"{cell_name} - {band}"
 
-        # Format display
-        if pd.notna(cell_name) and cell_name:
-            display_name = f"{cell_name} ({cell_name})"
-        else:
-            display_name = str(cell_name)
+        # Try to use actual geometry if available
+        has_geometry = False
+        if geom_col and cell.get(geom_col):
+            geom_value = cell.get(geom_col)
+            try:
+                # Handle WKT string geometry
+                if isinstance(geom_value, str) and geom_value.startswith('POLYGON'):
+                    geom = wkt.loads(geom_value)
+                    # GeoJSON expects [lon, lat] but folium expects [lat, lon] for some features
+                    # For GeoJson, we use the geometry directly
+                    folium.GeoJson(
+                        mapping(geom),
+                        style_function=lambda x: {
+                            'fillColor': '#6c757d',
+                            'color': '#495057',
+                            'weight': 1,
+                            'fillOpacity': 0.4,
+                        },
+                        tooltip=tooltip,
+                    ).add_to(layer)
+                    has_geometry = True
+                # Handle shapely geometry object
+                elif hasattr(geom_value, '__geo_interface__'):
+                    folium.GeoJson(
+                        geom_value.__geo_interface__,
+                        style_function=lambda x: {
+                            'fillColor': '#6c757d',
+                            'color': '#495057',
+                            'weight': 1,
+                            'fillOpacity': 0.4,
+                        },
+                        tooltip=tooltip,
+                    ).add_to(layer)
+                    has_geometry = True
+            except Exception:
+                pass  # Fall back to calculated sector
 
-        tooltip = f"{display_name} - {band}"
-
-        # Draw sector triangle if azimuth available
-        if pd.notna(azimuth):
-            sector_points = calculate_sector_points(lat, lon, azimuth, 400, 40.0)
+        # Fall back to calculated sector if no geometry
+        if not has_geometry and pd.notna(bearing) and bearing != 0:
+            sector_points = calculate_sector_points(lat, lon, bearing, 400, 40.0)
             folium.Polygon(
                 locations=sector_points,
-                color='#6c757d',  # Grey
+                color='#495057',
                 weight=1,
                 fill=True,
                 fillColor='#6c757d',
@@ -488,14 +702,14 @@ def _add_all_cells_layer(
                 tooltip=tooltip,
             ).add_to(layer)
 
-        # Draw small center marker
+        # Draw small center marker for cell location
         folium.CircleMarker(
             location=[lat, lon],
-            radius=3,
-            color='#6c757d',
+            radius=2,
+            color='#343a40',
             fill=True,
             fillColor='#495057',
-            fillOpacity=0.6,
+            fillOpacity=0.8,
             weight=1,
             tooltip=tooltip,
         ).add_to(layer)
@@ -631,10 +845,10 @@ def _add_overshooting_layer(
     if gis_df is not None and len(df) > 0:
         df = df.copy()
         # Find the right columns in GIS data
-        gis_cell_name_col = 'CILAC' if 'CILAC' in gis_df.columns else 'cell_name'
-        gis_name_col = 'Name' if 'Name' in gis_df.columns else None
-        gis_band_col = 'Band' if 'Band' in gis_df.columns else None
-        gis_azimuth_col = 'Bearing' if 'Bearing' in gis_df.columns else ('azimuth_deg' if 'azimuth_deg' in gis_df.columns else None)
+        gis_cell_name_col = next((c for c in ['CILAC', 'cell_name'] if c in gis_df.columns), 'cell_name')
+        gis_name_col = next((c for c in ['Name', 'name'] if c in gis_df.columns), None)
+        gis_band_col = next((c for c in ['Band', 'band'] if c in gis_df.columns), None)
+        gis_azimuth_col = next((c for c in ['Bearing', 'bearing', 'azimuth_deg', 'azimuth'] if c in gis_df.columns), None)
 
         if gis_name_col or gis_band_col or gis_azimuth_col:
             gis_cols = [gis_cell_name_col]
@@ -725,14 +939,14 @@ def _add_undershooting_layer(
         cell_name_col = 'cell_name' if 'cell_name' in gis_df.columns else 'CILAC'
         lat_col = 'latitude' if 'latitude' in gis_df.columns else 'Latitude'
         lon_col = 'longitude' if 'longitude' in gis_df.columns else 'Longitude'
-        az_col = 'azimuth_deg' if 'azimuth_deg' in gis_df.columns else 'Bearing'
-        name_col = 'Name' if 'Name' in gis_df.columns else None
-        band_col = 'Band' if 'Band' in gis_df.columns else None
+        az_col = next((c for c in ['azimuth_deg', 'azimuth', 'Bearing', 'bearing'] if c in gis_df.columns), None)
+        name_col = next((c for c in ['Name', 'name'] if c in gis_df.columns), None)
+        band_col = next((c for c in ['Band', 'band'] if c in gis_df.columns), None)
 
         gis_cols = [cell_name_col]
         if lat_col in gis_df.columns:
             gis_cols.extend([lat_col, lon_col])
-        if az_col in gis_df.columns:
+        if az_col and az_col in gis_df.columns:
             gis_cols.append(az_col)
         if name_col:
             gis_cols.append(name_col)
@@ -748,7 +962,7 @@ def _add_undershooting_layer(
         if lat_col != 'latitude' and lat_col in gis_subset.columns:
             rename_map[lat_col] = 'latitude'
             rename_map[lon_col] = 'longitude'
-        if az_col != 'azimuth_deg' and az_col in gis_subset.columns:
+        if az_col and az_col != 'azimuth_deg' and az_col in gis_subset.columns:
             rename_map[az_col] = 'azimuth_deg'
         if name_col and name_col != 'cell_name':
             rename_map[name_col] = 'cell_name'
@@ -858,13 +1072,81 @@ def _add_no_coverage_layer(
     return layer
 
 
+def _add_no_coverage_per_band_layer(
+    m: folium.Map,
+    gdf: gpd.GeoDataFrame,
+) -> folium.FeatureGroup:
+    """Add no coverage per band layer."""
+    layer = folium.FeatureGroup(name='No Coverage (Per Band)', show=False)
+
+    # Color mapping for different bands
+    band_colors = {
+        'L700': '#17a2b8',    # Teal
+        'L800': '#20c997',    # Cyan
+        'L1800': '#6f42c1',   # Purple
+        'L2100': '#e83e8c',   # Pink
+        'L2600': '#fd7e14',   # Orange
+    }
+    default_color = '#17a2b8'
+
+    for idx, row in gdf.iterrows():
+        geom = row['geometry']
+        cluster_id = row.get('cluster_id', idx)
+        area = row.get('area_km2', 0)
+        n_points = row.get('n_points', 0)
+        band = row.get('band', 'Unknown')
+
+        fill_color = band_colors.get(band, default_color)
+        border_color = '#0d6efd'
+
+        popup_html = f"""
+        <div style="font-family: Arial; width: 220px;">
+            <h4 style="margin: 0 0 8px 0; color: {fill_color};">No Coverage ({band})</h4>
+            <div style="background: #e3f2fd; padding: 8px; border-radius: 4px;">
+                <strong>Band:</strong> {band}<br>
+                <strong>Cluster ID:</strong> {cluster_id}<br>
+                <strong>Area:</strong> {area:.2f} km²<br>
+                <strong>Grid points:</strong> {n_points}<br>
+                <em style="color: #666; font-size: 0.9em;">
+                    Area where {band} has no coverage (other bands may cover)
+                </em>
+            </div>
+        </div>
+        """
+
+        folium.GeoJson(
+            geom,
+            style_function=lambda x, fc=fill_color, bc=border_color: {
+                'fillColor': fc,
+                'color': bc,
+                'weight': 2,
+                'fillOpacity': 0.4,
+                'dashArray': '5,5',
+            },
+            popup=folium.Popup(popup_html, max_width=280),
+            tooltip=f"No Coverage ({band}) - {area:.2f} km²",
+        ).add_to(layer)
+
+    layer.add_to(m)
+    return layer
+
+
 def _add_low_coverage_layer(
     m: folium.Map,
     gdf: gpd.GeoDataFrame,
     band: str,
-) -> folium.FeatureGroup:
-    """Add low coverage layer for a specific band."""
-    layer = folium.FeatureGroup(name=f'Low Coverage ({band} MHz)', show=True)
+    cell_coords: Optional[dict] = None,
+) -> Tuple[folium.FeatureGroup, dict]:
+    """
+    Add low coverage layer with serving cell line toggle.
+
+    Returns:
+        Tuple of (FeatureGroup, line_data dict for this layer)
+    """
+    # Use simple name for combined layer
+    layer_name = 'Low Coverage' if band == 'all' else f'Low Coverage ({band} MHz)'
+    layer = folium.FeatureGroup(name=layer_name, show=False)
+    line_data = {}
 
     for idx, row in gdf.iterrows():
         geom = row['geometry']
@@ -874,22 +1156,40 @@ def _add_low_coverage_layer(
         serving_cells = row.get('serving_cells', '')
         serving_cell_names = row.get('serving_cell_names', '')
         n_serving_cells = row.get('n_serving_cells', 0)
+        centroid_lat = row.get('centroid_lat', geom.centroid.y if geom else 0)
+        centroid_lon = row.get('centroid_lon', geom.centroid.x if geom else 0)
+        # Get band from row for combined layers
+        row_band = row.get('band', band) if band == 'all' else band
 
-        # Build serving cells HTML with both names and IDs
+        # Build serving cells list and line data
         serving_cells_html = ""
-        if serving_cells:
-            cells_list = serving_cells.split(',')[:5]  # Show max 5 cells
-            names_list = serving_cell_names.split(',')[:5] if serving_cell_names else []
+        has_line_data = False
+        feature_key = f"low_coverage_{row_band}_{cluster_id}"
 
-            # Combine names and IDs
-            cells_display_parts = []
-            for i, cell_name in enumerate(cells_list):
-                cell_name = names_list[i] if i < len(names_list) and names_list[i] else None
-                if cell_name:
-                    cells_display_parts.append(f"{cell_name} ({cell_name})")
-                else:
-                    cells_display_parts.append(cell_name)
+        if serving_cells and cell_coords:
+            cells_list = [c.strip() for c in serving_cells.split(',') if c.strip()]
 
+            # Build targets for line data
+            targets = []
+            for cell_name in cells_list:
+                if cell_name in cell_coords:
+                    targets.append({
+                        'coords': cell_coords[cell_name],
+                        'name': cell_name,
+                        'color': LINE_COLORS['low_coverage']
+                    })
+
+            if targets:
+                has_line_data = True
+                line_data[feature_key] = {
+                    'source': [centroid_lat, centroid_lon],
+                    'targets': targets,
+                    'color': LINE_COLORS['low_coverage'],
+                    'style': 'dashed'
+                }
+
+            # Build display HTML
+            cells_display_parts = cells_list[:5]
             cells_display = ', '.join(cells_display_parts)
             if n_serving_cells > 5:
                 cells_display += f' (+{n_serving_cells - 5} more)'
@@ -898,16 +1198,34 @@ def _add_low_coverage_layer(
                 <strong>Total Cells:</strong> {n_serving_cells}
             """
 
+        # Build popup with optional line toggle button
+        line_button_html = ""
+        if has_line_data:
+            line_button_html = f"""
+            <div style="text-align: center; margin-top: 10px;">
+                <button id="lineBtn_{feature_key}"
+                        data-show-text="Show Serving Cells"
+                        data-hide-text="Hide Serving Cells"
+                        onclick="toggleLines('{feature_key}', 'lineBtn_{feature_key}')"
+                        style="background: {LINE_COLORS['low_coverage']}; color: white; border: none;
+                               padding: 8px 16px; border-radius: 4px; cursor: pointer;">
+                    Show Serving Cells
+                </button>
+                <div id="lineStatus_{feature_key}" style="margin-top: 5px; font-size: 11px; color: #666;"></div>
+            </div>
+            """
+
         popup_html = f"""
-        <div style="font-family: Arial; width: 250px;">
+        <div style="font-family: Arial; width: 280px;">
             <h4 style="margin: 0 0 8px 0; color: #fd7e14;">Low Coverage Area</h4>
             <div style="background: #ffe5d0; padding: 8px; border-radius: 4px;">
-                <strong>Band:</strong> {band} MHz<br>
+                <strong>Band:</strong> {row_band}<br>
                 <strong>Cluster ID:</strong> {cluster_id}<br>
                 <strong>Area:</strong> {area:.2f} km²<br>
                 <strong>Grid points:</strong> {n_points}<br>
                 {serving_cells_html}
             </div>
+            {line_button_html}
         </div>
         """
 
@@ -919,12 +1237,745 @@ def _add_low_coverage_layer(
                 'weight': 2,
                 'fillOpacity': 0.35,
             },
-            popup=folium.Popup(popup_html, max_width=300),
+            popup=folium.Popup(popup_html, max_width=320),
             tooltip=f"Low Coverage {band}MHz - {area:.2f} km²",
         ).add_to(layer)
 
     layer.add_to(m)
-    return layer
+    return layer, line_data
+
+
+def _add_interference_layer(
+    m: folium.Map,
+    gdf: gpd.GeoDataFrame,
+    cell_coords: Optional[dict] = None,
+) -> Tuple[folium.FeatureGroup, dict]:
+    """
+    Add interference cluster layer with offending cell line toggle.
+
+    Args:
+        m: Folium map object
+        gdf: GeoDataFrame with interference cluster polygons
+        cell_coords: Dict mapping cell_name to [lat, lon]
+
+    Returns:
+        Tuple of (FeatureGroup, line_data dict for this layer)
+    """
+    layer = folium.FeatureGroup(name='Interference Clusters', show=False)
+    line_data = {}
+
+    if gdf is None or len(gdf) == 0:
+        layer.add_to(m)
+        return layer, line_data
+
+    for idx, row in gdf.iterrows():
+        geom = row.get('geometry')
+        if geom is None or geom.is_empty:
+            continue
+
+        cluster_id = row.get('cluster_id', idx)
+        band = row.get('band', 'Unknown')
+        n_grids = row.get('n_grids', 0)
+        n_cells = row.get('n_cells', 0)
+        cells = row.get('cells', [])
+        centroid_lat = row.get('centroid_lat', geom.centroid.y if geom else 0)
+        centroid_lon = row.get('centroid_lon', geom.centroid.x if geom else 0)
+        area_km2 = row.get('area_km2', 0)
+        avg_rsrp = row.get('avg_rsrp', 0)
+
+        # Parse cells if it's a string
+        if isinstance(cells, str):
+            cells = [c.strip() for c in cells.split(',') if c.strip()]
+
+        # Build line data for offending cells
+        feature_key = f"interference_{cluster_id}"
+        has_line_data = False
+
+        if cells and cell_coords:
+            targets = []
+            for cell_name in cells:
+                if cell_name in cell_coords:
+                    targets.append({
+                        'coords': cell_coords[cell_name],
+                        'name': cell_name,
+                        'color': LINE_COLORS['interference']
+                    })
+
+            if targets:
+                has_line_data = True
+                line_data[feature_key] = {
+                    'source': [centroid_lat, centroid_lon],
+                    'targets': targets,
+                    'color': LINE_COLORS['interference'],
+                    'style': 'dashed'
+                }
+
+        # Build cells display
+        cells_display = ', '.join(cells[:5])
+        if len(cells) > 5:
+            cells_display += f' (+{len(cells) - 5} more)'
+
+        # Build popup with optional line toggle button
+        line_button_html = ""
+        if has_line_data:
+            line_button_html = f"""
+            <div style="text-align: center; margin-top: 10px;">
+                <button id="lineBtn_{feature_key}"
+                        data-show-text="Show Offending Cells"
+                        data-hide-text="Hide Offending Cells"
+                        onclick="toggleLines('{feature_key}', 'lineBtn_{feature_key}')"
+                        style="background: {LINE_COLORS['interference']}; color: white; border: none;
+                               padding: 8px 16px; border-radius: 4px; cursor: pointer;">
+                    Show Offending Cells
+                </button>
+                <div id="lineStatus_{feature_key}" style="margin-top: 5px; font-size: 11px; color: #666;"></div>
+            </div>
+            """
+
+        popup_html = f"""
+        <div style="font-family: Arial; width: 280px;">
+            <h4 style="margin: 0 0 8px 0; color: #dc3545;">Interference Cluster</h4>
+            <div style="background: #f8d7da; padding: 8px; border-radius: 4px;">
+                <strong>Cluster ID:</strong> {cluster_id}<br>
+                <strong>Band:</strong> {band}<br>
+                <strong>Area:</strong> {area_km2:.2f} km²<br>
+                <strong>Grid points:</strong> {n_grids}<br>
+                <strong>Cells involved:</strong> {n_cells}<br>
+                <strong>Cells:</strong> {cells_display}<br>
+                <strong>Avg RSRP:</strong> {avg_rsrp:.1f} dBm
+            </div>
+            {line_button_html}
+        </div>
+        """
+
+        folium.GeoJson(
+            geom,
+            style_function=lambda x: {
+                'fillColor': '#dc3545',
+                'color': '#721c24',
+                'weight': 2,
+                'fillOpacity': 0.35,
+            },
+            popup=folium.Popup(popup_html, max_width=320),
+            tooltip=f"Interference {band} - {area_km2:.2f} km²",
+        ).add_to(layer)
+
+    layer.add_to(m)
+    return layer, line_data
+
+
+def _add_pci_confusions_layer(
+    m: folium.Map,
+    df: pd.DataFrame,
+    cell_coords: Optional[dict] = None,
+) -> Tuple[folium.FeatureGroup, dict]:
+    """
+    Add PCI confusions layer with lines to offending cells.
+
+    Args:
+        m: Folium map object
+        df: DataFrame with PCI confusion data (serving, neighbors, confusion_pci, band)
+        cell_coords: Dict mapping cell_name to [lat, lon]
+
+    Returns:
+        Tuple of (FeatureGroup, line_data dict)
+    """
+    layer = folium.FeatureGroup(name='PCI Confusions', show=False)
+    line_data = {}
+
+    if df is None or len(df) == 0:
+        layer.add_to(m)
+        return layer, line_data
+
+    for idx, row in df.iterrows():
+        serving = row.get('serving', '')
+        band = row.get('band', 'Unknown')
+        confusion_pci = row.get('confusion_pci', 0)
+        neighbors_str = row.get('neighbors', '')
+        group_size = row.get('group_size', 0)
+        severity_sum = row.get('severity_act_sum_excl_max', 0)
+
+        # Get serving cell coordinates
+        if serving not in cell_coords:
+            continue
+        source_coords = cell_coords[serving]
+
+        # Parse neighbors
+        neighbors = [n.strip() for n in neighbors_str.split(',') if n.strip()]
+
+        # Build line data
+        feature_key = f"pci_confusion_{idx}"
+        targets = []
+        for neighbor in neighbors:
+            if neighbor in cell_coords:
+                targets.append({
+                    'coords': cell_coords[neighbor],
+                    'name': neighbor,
+                    'color': LINE_COLORS['pci']
+                })
+
+        has_line_data = len(targets) > 0
+        if has_line_data:
+            line_data[feature_key] = {
+                'source': source_coords,
+                'targets': targets,
+                'color': LINE_COLORS['pci'],
+                'style': 'dotted'
+            }
+
+        # Build popup
+        neighbors_display = ', '.join(neighbors[:5])
+        if len(neighbors) > 5:
+            neighbors_display += f' (+{len(neighbors) - 5} more)'
+
+        line_button_html = ""
+        if has_line_data:
+            line_button_html = f"""
+            <div style="text-align: center; margin-top: 10px;">
+                <button id="lineBtn_{feature_key}"
+                        data-show-text="Show Offending Cells"
+                        data-hide-text="Hide Offending Cells"
+                        onclick="toggleLines('{feature_key}', 'lineBtn_{feature_key}')"
+                        style="background: {LINE_COLORS['pci']}; color: white; border: none;
+                               padding: 8px 16px; border-radius: 4px; cursor: pointer;">
+                    Show Offending Cells
+                </button>
+                <div id="lineStatus_{feature_key}" style="margin-top: 5px; font-size: 11px; color: #666;"></div>
+            </div>
+            """
+
+        popup_html = f"""
+        <div style="font-family: Arial; width: 280px;">
+            <h4 style="margin: 0 0 8px 0; color: {LINE_COLORS['pci']};">PCI Confusion</h4>
+            <div style="background: #f3e5f5; padding: 8px; border-radius: 4px;">
+                <strong>Source Cell:</strong> {serving}<br>
+                <strong>Band:</strong> {band}<br>
+                <strong>Confusion PCI:</strong> {confusion_pci}<br>
+                <strong>Group Size:</strong> {group_size}<br>
+                <strong>Neighbors:</strong> {neighbors_display}<br>
+                <strong>Severity Score:</strong> {severity_sum:.2f}
+            </div>
+            <div style="background: #e1bee7; padding: 6px; border-radius: 4px; margin-top: 8px; font-size: 11px;">
+                <strong>Issue:</strong> Multiple cells share the same PCI, causing handover confusion.
+            </div>
+            {line_button_html}
+        </div>
+        """
+
+        # Add marker at source cell
+        folium.CircleMarker(
+            location=source_coords,
+            radius=8,
+            color=LINE_COLORS['pci'],
+            fill=True,
+            fillColor=LINE_COLORS['pci'],
+            fillOpacity=0.7,
+            weight=2,
+            popup=folium.Popup(popup_html, max_width=320),
+            tooltip=f"PCI Confusion: {serving} (PCI {confusion_pci})",
+        ).add_to(layer)
+
+    layer.add_to(m)
+    return layer, line_data
+
+
+def _add_pci_collisions_layer(
+    m: folium.Map,
+    df: pd.DataFrame,
+    cell_coords: Optional[dict] = None,
+) -> Tuple[folium.FeatureGroup, dict]:
+    """
+    Add PCI collisions layer with lines between cell pairs.
+
+    Args:
+        m: Folium map object
+        df: DataFrame with PCI collision data (cell_a, cell_b, pci, band, pair_weight)
+        cell_coords: Dict mapping cell_name to [lat, lon]
+
+    Returns:
+        Tuple of (FeatureGroup, line_data dict)
+    """
+    layer = folium.FeatureGroup(name='PCI Collisions', show=False)
+    line_data = {}
+
+    if df is None or len(df) == 0:
+        layer.add_to(m)
+        return layer, line_data
+
+    for idx, row in df.iterrows():
+        cell_a = row.get('cell_a', '')
+        cell_b = row.get('cell_b', '')
+        pci = row.get('pci', 0)
+        band = row.get('band', 'Unknown')
+        collision_type = row.get('collision_type', 'Unknown')
+        pair_weight = row.get('pair_weight', 0)
+
+        # Get cell coordinates
+        if cell_a not in cell_coords or cell_b not in cell_coords:
+            continue
+
+        coords_a = cell_coords[cell_a]
+        coords_b = cell_coords[cell_b]
+
+        # Calculate midpoint for marker
+        mid_lat = (coords_a[0] + coords_b[0]) / 2
+        mid_lon = (coords_a[1] + coords_b[1]) / 2
+
+        # Build line data
+        feature_key = f"pci_collision_{idx}"
+        line_data[feature_key] = {
+            'source': [mid_lat, mid_lon],
+            'targets': [
+                {'coords': coords_a, 'name': cell_a, 'color': LINE_COLORS['pci']},
+                {'coords': coords_b, 'name': cell_b, 'color': LINE_COLORS['pci']}
+            ],
+            'color': LINE_COLORS['pci'],
+            'style': 'dotted'
+        }
+
+        line_button_html = f"""
+        <div style="text-align: center; margin-top: 10px;">
+            <button id="lineBtn_{feature_key}"
+                    data-show-text="Show Cell Pair"
+                    data-hide-text="Hide Cell Pair"
+                    onclick="toggleLines('{feature_key}', 'lineBtn_{feature_key}')"
+                    style="background: {LINE_COLORS['pci']}; color: white; border: none;
+                           padding: 8px 16px; border-radius: 4px; cursor: pointer;">
+                Show Cell Pair
+            </button>
+            <div id="lineStatus_{feature_key}" style="margin-top: 5px; font-size: 11px; color: #666;"></div>
+        </div>
+        """
+
+        popup_html = f"""
+        <div style="font-family: Arial; width: 280px;">
+            <h4 style="margin: 0 0 8px 0; color: {LINE_COLORS['pci']};">PCI Collision</h4>
+            <div style="background: #f3e5f5; padding: 8px; border-radius: 4px;">
+                <strong>Cell A:</strong> {cell_a}<br>
+                <strong>Cell B:</strong> {cell_b}<br>
+                <strong>Shared PCI:</strong> {pci}<br>
+                <strong>Band:</strong> {band}<br>
+                <strong>Collision Type:</strong> {collision_type}<br>
+                <strong>Severity Weight:</strong> {pair_weight:.2f}
+            </div>
+            <div style="background: #e1bee7; padding: 6px; border-radius: 4px; margin-top: 8px; font-size: 11px;">
+                <strong>Issue:</strong> Adjacent cells share the same PCI, requiring one to change.
+            </div>
+            {line_button_html}
+        </div>
+        """
+
+        # Add marker at midpoint
+        folium.CircleMarker(
+            location=[mid_lat, mid_lon],
+            radius=6,
+            color=LINE_COLORS['pci'],
+            fill=True,
+            fillColor='#ce93d8',
+            fillOpacity=0.8,
+            weight=2,
+            popup=folium.Popup(popup_html, max_width=320),
+            tooltip=f"PCI Collision: {cell_a} <-> {cell_b} (PCI {pci})",
+        ).add_to(layer)
+
+    layer.add_to(m)
+    return layer, line_data
+
+
+def _add_pci_blacklist_layer(
+    m: folium.Map,
+    df: pd.DataFrame,
+    cell_coords: Optional[dict] = None,
+) -> Tuple[folium.FeatureGroup, dict]:
+    """
+    Add PCI blacklist suggestions layer with lines from serving to neighbor.
+
+    Args:
+        m: Folium map object
+        df: DataFrame with blacklist data (serving, neighbor, reason, confusion_pci)
+        cell_coords: Dict mapping cell_name to [lat, lon]
+
+    Returns:
+        Tuple of (FeatureGroup, line_data dict)
+    """
+    layer = folium.FeatureGroup(name='PCI Blacklist Suggestions', show=False)
+    line_data = {}
+
+    if df is None or len(df) == 0:
+        layer.add_to(m)
+        return layer, line_data
+
+    for idx, row in df.iterrows():
+        serving = row.get('serving', '')
+        neighbor = row.get('neighbor', '')
+        reason = row.get('reason', 'Unknown')
+        confusion_pci = row.get('confusion_pci', 0)
+        out_ho = row.get('out_ho', 0)
+        in_ho = row.get('in_ho', 0)
+        act_ho = row.get('act_ho', 0)
+
+        # Get cell coordinates
+        if serving not in cell_coords:
+            continue
+
+        source_coords = cell_coords[serving]
+
+        # Build line data
+        feature_key = f"pci_blacklist_{idx}"
+        has_line_data = False
+
+        if neighbor in cell_coords:
+            has_line_data = True
+            line_data[feature_key] = {
+                'source': source_coords,
+                'targets': [
+                    {'coords': cell_coords[neighbor], 'name': neighbor, 'color': LINE_COLORS['blacklist']}
+                ],
+                'color': LINE_COLORS['blacklist'],
+                'style': 'dotted'
+            }
+
+        line_button_html = ""
+        if has_line_data:
+            line_button_html = f"""
+            <div style="text-align: center; margin-top: 10px;">
+                <button id="lineBtn_{feature_key}"
+                        data-show-text="Show Neighbor"
+                        data-hide-text="Hide Neighbor"
+                        onclick="toggleLines('{feature_key}', 'lineBtn_{feature_key}')"
+                        style="background: {LINE_COLORS['blacklist']}; color: white; border: none;
+                               padding: 8px 16px; border-radius: 4px; cursor: pointer;">
+                    Show Neighbor
+                </button>
+                <div id="lineStatus_{feature_key}" style="margin-top: 5px; font-size: 11px; color: #666;"></div>
+            </div>
+            """
+
+        popup_html = f"""
+        <div style="font-family: Arial; width: 280px;">
+            <h4 style="margin: 0 0 8px 0; color: {LINE_COLORS['blacklist']};">Blacklist Suggestion</h4>
+            <div style="background: #fff3e0; padding: 8px; border-radius: 4px;">
+                <strong>Serving Cell:</strong> {serving}<br>
+                <strong>Neighbor to Blacklist:</strong> {neighbor}<br>
+                <strong>Reason:</strong> {reason}<br>
+                <strong>Confusion PCI:</strong> {confusion_pci}<br>
+                <strong>Handovers (Out/In/Active):</strong> {out_ho:.2f}/{in_ho:.2f}/{act_ho:.2f}
+            </div>
+            <div style="background: #ffe0b2; padding: 6px; border-radius: 4px; margin-top: 8px; font-size: 11px;">
+                <strong>Recommendation:</strong> Add {neighbor} to blacklist for {serving}.
+            </div>
+            {line_button_html}
+        </div>
+        """
+
+        # Add marker at serving cell
+        folium.CircleMarker(
+            location=source_coords,
+            radius=5,
+            color=LINE_COLORS['blacklist'],
+            fill=True,
+            fillColor=LINE_COLORS['blacklist'],
+            fillOpacity=0.6,
+            weight=2,
+            popup=folium.Popup(popup_html, max_width=320),
+            tooltip=f"Blacklist: {serving} -> {neighbor}",
+        ).add_to(layer)
+
+    layer.add_to(m)
+    return layer, line_data
+
+
+def _add_ca_imbalance_layer(
+    m: folium.Map,
+    df: pd.DataFrame,
+    cell_coords: Optional[dict] = None,
+    hulls_gdf: Optional[gpd.GeoDataFrame] = None,
+) -> Tuple[folium.FeatureGroup, dict]:
+    """
+    Add CA imbalance layer with hull toggle to show coverage/capacity areas.
+
+    Args:
+        m: Folium map object
+        df: DataFrame with CA imbalance data
+        cell_coords: Dict mapping cell_name to [lat, lon]
+        hulls_gdf: GeoDataFrame with cell hull geometries
+
+    Returns:
+        Tuple of (FeatureGroup, hull_geometries dict for JavaScript)
+    """
+    layer = folium.FeatureGroup(name='CA Imbalance', show=False)
+    hull_geometries = {}
+
+    if df is None or len(df) == 0:
+        layer.add_to(m)
+        return layer, hull_geometries
+
+    # Build hull lookup
+    hull_lookup = {}
+    if hulls_gdf is not None and len(hulls_gdf) > 0:
+        name_col = 'cell_name' if 'cell_name' in hulls_gdf.columns else 'Name'
+        for _, row in hulls_gdf.iterrows():
+            cell_name = str(row.get(name_col, ''))
+            if cell_name and row.geometry is not None:
+                hull_lookup[cell_name] = row.geometry.__geo_interface__
+
+    for idx, row in df.iterrows():
+        coverage_cell = row.get('coverage_cell_name', '')
+        capacity_cell = row.get('capacity_cell_name', '')
+        ca_pair = row.get('ca_pair', 'Unknown')
+        coverage_band = row.get('coverage_band', '')
+        capacity_band = row.get('capacity_band', '')
+        severity = row.get('severity', 'medium')
+        coverage_area = row.get('coverage_area_km2', 0)
+        capacity_area = row.get('capacity_area_km2', 0)
+        coverage_ratio = row.get('coverage_ratio', 0)
+        coverage_pct = row.get('coverage_percentage', 0)
+        recommendation = row.get('recommendation', '')
+
+        # Get coverage cell coordinates
+        if coverage_cell not in cell_coords:
+            continue
+        source_coords = cell_coords[coverage_cell]
+
+        # Build hull geometries for JavaScript
+        feature_key = f"ca_imbalance_{idx}"
+        has_hull_data = False
+
+        coverage_hull = hull_lookup.get(coverage_cell)
+        capacity_hull = hull_lookup.get(capacity_cell)
+
+        if coverage_hull or capacity_hull:
+            has_hull_data = True
+            hull_geometries[feature_key] = {
+                'coverage': coverage_hull,
+                'capacity': capacity_hull
+            }
+
+        # Severity color mapping
+        severity_color = {
+            'critical': '#dc3545',
+            'high': '#fd7e14',
+            'medium': '#ffc107',
+            'low': '#17a2b8'
+        }.get(severity.lower(), '#17a2b8')
+
+        hull_button_html = ""
+        if has_hull_data:
+            hull_button_html = f"""
+            <div style="text-align: center; margin-top: 10px;">
+                <button id="hullBtn_ca_imbalance_{idx}"
+                        onclick="toggleHulls('{feature_key}', 'hullBtn_ca_imbalance_{idx}')"
+                        style="background: #17a2b8; color: white; border: none;
+                               padding: 8px 16px; border-radius: 4px; cursor: pointer;">
+                    Show Coverage Hulls
+                </button>
+                <div id="hullStatus_{feature_key}" style="margin-top: 5px; font-size: 11px; color: #666;"></div>
+            </div>
+            <div style="margin-top: 8px; font-size: 10px; color: #666;">
+                <span style="color: {LINE_COLORS['ca_coverage']};">&#9632;</span> Coverage Band &nbsp;
+                <span style="color: {LINE_COLORS['ca_capacity']};">&#9632;</span> Capacity Band
+            </div>
+            """
+
+        popup_html = f"""
+        <div style="font-family: Arial; width: 300px;">
+            <h4 style="margin: 0 0 8px 0; color: #17a2b8;">
+                CA Imbalance
+                <span style="float: right; font-size: 12px; background: {severity_color};
+                             color: white; padding: 2px 8px; border-radius: 4px;">{severity.upper()}</span>
+            </h4>
+            <div style="background: #d1ecf1; padding: 8px; border-radius: 4px;">
+                <strong>Band:</strong> {coverage_band}<br>
+                <strong>CA Pair:</strong> {ca_pair}<br>
+                <strong>Coverage Cell:</strong> {coverage_cell} ({coverage_band})<br>
+                <strong>Capacity Cell:</strong> {capacity_cell} ({capacity_band})<br>
+                <strong>Coverage Area:</strong> {coverage_area:.2f} km²<br>
+                <strong>Capacity Area:</strong> {capacity_area:.2f} km²<br>
+                <strong>Coverage Ratio:</strong> {coverage_ratio:.1%}<br>
+                <strong>Coverage %:</strong> {coverage_pct:.1f}%
+            </div>
+            <div style="background: #bee5eb; padding: 6px; border-radius: 4px; margin-top: 8px; font-size: 11px;">
+                <strong>Issue:</strong> Capacity band covers less than expected area relative to coverage band.
+            </div>
+            {hull_button_html}
+        </div>
+        """
+
+        # Add marker at coverage cell
+        folium.CircleMarker(
+            location=source_coords,
+            radius=7,
+            color=severity_color,
+            fill=True,
+            fillColor='#17a2b8',
+            fillOpacity=0.7,
+            weight=2,
+            popup=folium.Popup(popup_html, max_width=340),
+            tooltip=f"CA Imbalance: {coverage_cell} ({severity})",
+        ).add_to(layer)
+
+    layer.add_to(m)
+    return layer, hull_geometries
+
+
+def _add_crossed_feeder_layer(
+    m: folium.Map,
+    df: pd.DataFrame,
+    cell_coords: Optional[dict] = None,
+    cell_geometries: Optional[dict] = None,
+) -> Tuple[folium.FeatureGroup, dict]:
+    """
+    Add crossed feeder layer with lines to suspicious relations.
+
+    Args:
+        m: Folium map object
+        df: DataFrame with crossed feeder data
+        cell_coords: Dict mapping cell_name to [lat, lon]
+        cell_geometries: Dict mapping cell_name to polygon coordinates [[lat, lon], ...]
+
+    Returns:
+        Tuple of (FeatureGroup, line_data dict)
+    """
+    import re
+
+    layer = folium.FeatureGroup(name='Crossed Feeders', show=False)
+    line_data = {}
+
+    if df is None or len(df) == 0:
+        layer.add_to(m)
+        return layer, line_data
+
+    cell_geometries = cell_geometries or {}
+
+    # Only show flagged cells
+    flagged_df = df[df.get('flagged', False) == True] if 'flagged' in df.columns else df
+
+    for idx, row in flagged_df.iterrows():
+        cell_name = row.get('cell_name', '')
+        site = row.get('site', '')
+        band = row.get('band', '')
+        cell_score = row.get('cell_score', 0)
+        threshold = row.get('threshold', 0)
+        suspicious_relations = row.get('top_suspicious_relations', '')
+
+        # Get cell coordinates
+        if cell_name not in cell_coords:
+            continue
+        source_coords = cell_coords[cell_name]
+
+        # Parse suspicious relations: "CKCHML3 (d=13685m, score=30.05) | CK356H1 (d=3962m, score=8.83)"
+        feature_key = f"crossed_feeder_{idx}"
+        targets = []
+
+        if suspicious_relations:
+            pattern = r'(\w+)\s*\(d=(\d+)m,\s*score=([\d.]+)\)'
+            matches = re.findall(pattern, suspicious_relations)
+
+            for neighbor, distance, score in matches:
+                if neighbor in cell_coords:
+                    score_val = float(score)
+                    # All relations in top_suspicious_relations are suspicious - use red
+                    color = LINE_COLORS['crossed_offender']
+
+                    # Get neighbor geometry if available
+                    neighbor_geom = cell_geometries.get(neighbor)
+
+                    # Calculate centroid if geometry available, otherwise use coords
+                    if neighbor_geom and len(neighbor_geom) > 0:
+                        centroid_lat = sum(p[0] for p in neighbor_geom) / len(neighbor_geom)
+                        centroid_lon = sum(p[1] for p in neighbor_geom) / len(neighbor_geom)
+                        line_endpoint = [centroid_lat, centroid_lon]
+                    else:
+                        line_endpoint = cell_coords[neighbor]
+
+                    targets.append({
+                        'coords': line_endpoint,
+                        'name': f"{neighbor} (score={score_val:.1f})",
+                        'color': color,
+                        'geometry': neighbor_geom  # Include polygon for drawing
+                    })
+
+        has_line_data = len(targets) > 0
+        if has_line_data:
+            line_data[feature_key] = {
+                'source': source_coords,
+                'targets': targets,
+                'color': LINE_COLORS['crossed_offender'],
+                'style': 'dotted'
+            }
+
+        # Build relations display
+        relations_display = suspicious_relations[:100] + '...' if len(suspicious_relations) > 100 else suspicious_relations
+
+        line_button_html = ""
+        if has_line_data:
+            line_button_html = f"""
+            <div style="text-align: center; margin-top: 10px;">
+                <button id="lineBtn_{feature_key}"
+                        data-show-text="Show Relations"
+                        data-hide-text="Hide Relations"
+                        onclick="toggleLines('{feature_key}', 'lineBtn_{feature_key}')"
+                        style="background: {LINE_COLORS['crossed_offender']}; color: white; border: none;
+                               padding: 8px 16px; border-radius: 4px; cursor: pointer;">
+                    Show Relations
+                </button>
+                <div id="lineStatus_{feature_key}" style="margin-top: 5px; font-size: 11px; color: #666;"></div>
+            </div>
+            <div style="margin-top: 8px; font-size: 10px; color: #666;">
+                <span style="color: {LINE_COLORS['crossed_offender']};">&#9632;</span> Suspicious relations
+            </div>
+            """
+
+        popup_html = f"""
+        <div style="font-family: Arial; width: 300px;">
+            <h4 style="margin: 0 0 8px 0; color: {LINE_COLORS['crossed_offender']};">
+                Crossed Feeder Suspect
+            </h4>
+            <div style="background: #f8d7da; padding: 8px; border-radius: 4px;">
+                <strong>Cell:</strong> {cell_name}<br>
+                <strong>Site:</strong> {site}<br>
+                <strong>Band:</strong> {band}<br>
+                <strong>Anomaly Score:</strong> {cell_score:.2f}<br>
+                <strong>Threshold:</strong> {threshold:.2f}<br>
+                <strong>Suspicious Relations:</strong><br>
+                <span style="font-size: 10px;">{relations_display}</span>
+            </div>
+            <div style="background: #f5c6cb; padding: 6px; border-radius: 4px; margin-top: 8px; font-size: 11px;">
+                <strong>Issue:</strong> Cell has unusual relation pattern suggesting possible feeder swap.
+            </div>
+            {line_button_html}
+        </div>
+        """
+
+        # Add cell sector polygon if geometry available, otherwise use marker
+        if cell_name in cell_geometries:
+            # Draw the cell sector polygon
+            folium.Polygon(
+                locations=cell_geometries[cell_name],
+                color=LINE_COLORS['crossed_offender'],
+                weight=2,
+                fill=True,
+                fillColor='#f5c6cb',
+                fillOpacity=0.5,
+                popup=folium.Popup(popup_html, max_width=340),
+                tooltip=f"Crossed Feeder: {cell_name} (score={cell_score:.1f})",
+            ).add_to(layer)
+        else:
+            # Fallback to circle marker if no geometry
+            folium.CircleMarker(
+                location=source_coords,
+                radius=8,
+                color=LINE_COLORS['crossed_offender'],
+                fill=True,
+                fillColor='#f5c6cb',
+                fillOpacity=0.8,
+                weight=2,
+                popup=folium.Popup(popup_html, max_width=340),
+                tooltip=f"Crossed Feeder: {cell_name} (score={cell_score:.1f})",
+            ).add_to(layer)
+
+    layer.add_to(m)
+    return layer, line_data
 
 
 def _create_overshooting_popup(cell: pd.Series, has_grid_data: bool = False) -> str:
@@ -1141,8 +2192,13 @@ def _add_summary_panel(m: folium.Map, stats: dict):
     over_total = stats['overshooting']['total']
     under_total = stats['undershooting']['total']
     no_cov_total = stats['no_coverage']['total']
+    no_cov_pb_total = stats['no_coverage_per_band']['total']
     low_cov_total = stats['low_coverage']['total']
-    total_issues = over_total + under_total + no_cov_total + low_cov_total
+    pci_total = stats['pci_confusions']['total'] + stats['pci_collisions']['total'] + stats['pci_blacklist']['total']
+    ca_total = stats['ca_imbalance']['total']
+    xf_total = stats['crossed_feeders']['total']
+    interf_total = stats['interference']['total']
+    total_issues = over_total + under_total + no_cov_total + no_cov_pb_total + low_cov_total + pci_total + ca_total + xf_total + interf_total
 
     html = f"""
     <div id="summaryPanel" style="
@@ -1150,57 +2206,94 @@ def _add_summary_panel(m: folium.Map, stats: dict):
         background-color: white; border: 2px solid #333; border-radius: 8px;
         z-index: 9999; padding: 12px; font-family: Arial;
         box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        max-height: calc(100vh - 150px); overflow-y: auto;
     ">
         <h4 style="margin: 0 0 12px 0; border-bottom: 1px solid #ddd; padding-bottom: 8px;">
             Summary Statistics
         </h4>
 
         <div style="display: flex; justify-content: space-between; margin-bottom: 8px;">
-            <span style="font-size: 28px; font-weight: bold; color: #333;">{total_issues}</span>
+            <span id="summaryTotalIssues" style="font-size: 28px; font-weight: bold; color: #333;">{total_issues}</span>
             <span style="font-size: 12px; color: #6c757d; align-self: flex-end;">Total Issues</span>
         </div>
 
-        <div style="margin-top: 12px;">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+        <div style="margin-top: 12px; font-size: 12px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
                 <span style="display: flex; align-items: center;">
-                    <span style="width: 12px; height: 12px; background: {ISSUE_COLORS['overshooting']}; border-radius: 2px; margin-right: 6px;"></span>
+                    <span style="width: 10px; height: 10px; background: {ISSUE_COLORS['overshooting']}; border-radius: 2px; margin-right: 5px;"></span>
                     Overshooting
                 </span>
-                <strong>{over_total}</strong>
+                <strong id="summaryOvershooting">{over_total}</strong>
             </div>
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
                 <span style="display: flex; align-items: center;">
-                    <span style="width: 12px; height: 12px; background: {ISSUE_COLORS['undershooting']}; border-radius: 2px; margin-right: 6px;"></span>
+                    <span style="width: 10px; height: 10px; background: {ISSUE_COLORS['undershooting']}; border-radius: 2px; margin-right: 5px;"></span>
                     Undershooting
                 </span>
-                <strong>{under_total}</strong>
+                <strong id="summaryUndershooting">{under_total}</strong>
             </div>
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 6px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
                 <span style="display: flex; align-items: center;">
-                    <span style="width: 12px; height: 12px; background: {ISSUE_COLORS['no_coverage']}; border-radius: 2px; margin-right: 6px;"></span>
+                    <span style="width: 10px; height: 10px; background: {ISSUE_COLORS['no_coverage']}; border-radius: 2px; margin-right: 5px;"></span>
                     No Coverage
                 </span>
                 <strong>{no_cov_total}</strong>
             </div>
-            <div style="display: flex; justify-content: space-between; align-items: center;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
                 <span style="display: flex; align-items: center;">
-                    <span style="width: 12px; height: 12px; background: {ISSUE_COLORS['low_coverage']}; border-radius: 2px; margin-right: 6px;"></span>
+                    <span style="width: 10px; height: 10px; background: #17a2b8; border-radius: 2px; margin-right: 5px;"></span>
+                    No Cov (Per Band)
+                </span>
+                <strong>{no_cov_pb_total}</strong>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                <span style="display: flex; align-items: center;">
+                    <span style="width: 10px; height: 10px; background: {ISSUE_COLORS['low_coverage']}; border-radius: 2px; margin-right: 5px;"></span>
                     Low Coverage
                 </span>
                 <strong>{low_cov_total}</strong>
             </div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                <span style="display: flex; align-items: center;">
+                    <span style="width: 10px; height: 10px; background: {ISSUE_COLORS['interference']}; border-radius: 2px; margin-right: 5px;"></span>
+                    Interference
+                </span>
+                <strong>{interf_total}</strong>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                <span style="display: flex; align-items: center;">
+                    <span style="width: 10px; height: 10px; background: {ISSUE_COLORS['pci_confusion']}; border-radius: 2px; margin-right: 5px;"></span>
+                    PCI Issues
+                </span>
+                <strong>{pci_total}</strong>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 4px;">
+                <span style="display: flex; align-items: center;">
+                    <span style="width: 10px; height: 10px; background: {ISSUE_COLORS['ca_imbalance']}; border-radius: 2px; margin-right: 5px;"></span>
+                    CA Imbalance
+                </span>
+                <strong>{ca_total}</strong>
+            </div>
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+                <span style="display: flex; align-items: center;">
+                    <span style="width: 10px; height: 10px; background: {ISSUE_COLORS['crossed_feeder']}; border-radius: 2px; margin-right: 5px;"></span>
+                    Crossed Feeders
+                </span>
+                <strong>{xf_total}</strong>
+            </div>
         </div>
 
-        <hr style="margin: 12px 0; border: 0; border-top: 1px solid #eee;">
+        <hr style="margin: 10px 0; border: 0; border-top: 1px solid #eee;">
 
-        <div style="font-size: 11px; color: #6c757d;">
+        <div style="font-size: 10px; color: #6c757d;">
             <div>Avg downtilt: +{stats['overshooting']['avg_tilt_change']:.1f}°</div>
             <div>Avg uptilt: -{stats['undershooting']['avg_uptilt']:.1f}°</div>
             <div>No cov area: {stats['no_coverage']['total_area_km2']:.1f} km²</div>
+            <div>No cov/band: {stats['no_coverage_per_band']['total_area_km2']:.1f} km²</div>
             <div>Low cov area: {stats['low_coverage']['total_area_km2']:.1f} km²</div>
         </div>
 
-        <div style="margin-top: 10px; font-size: 10px; color: #aaa;">
+        <div style="margin-top: 8px; font-size: 9px; color: #aaa;">
             Generated: {stats['timestamp'][:19]}
         </div>
     </div>
@@ -1214,10 +2307,11 @@ def _add_legend_panel(m: folium.Map, stats: dict):
     <div style="
         position: fixed; bottom: 30px; left: 10px; width: 200px;
         background-color: white; border: 2px solid #333; border-radius: 8px;
-        z-index: 9999; padding: 12px; font-family: Arial; font-size: 11px;
+        z-index: 9999; padding: 12px; font-family: Arial; font-size: 10px;
         box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        max-height: 350px; overflow-y: auto;
     ">
-        <h4 style="margin: 0 0 10px 0;">Legend</h4>
+        <h4 style="margin: 0 0 8px 0; font-size: 12px;">Legend</h4>
 
         <p style="margin: 4px 0; font-weight: bold;">Severity (Sectors)</p>
         <p style="margin: 2px 0;"><span style="color: {SEVERITY_COLORS['CRITICAL']};">&#9650;</span> CRITICAL</p>
@@ -1225,28 +2319,52 @@ def _add_legend_panel(m: folium.Map, stats: dict):
         <p style="margin: 2px 0;"><span style="color: {SEVERITY_COLORS['MEDIUM']};">&#9650;</span> MEDIUM</p>
         <p style="margin: 2px 0;"><span style="color: {SEVERITY_COLORS['LOW']};">&#9650;</span> LOW</p>
 
-        <p style="margin: 10px 0 4px 0; font-weight: bold;">Environment (Markers)</p>
+        <p style="margin: 8px 0 4px 0; font-weight: bold;">Environment</p>
         <p style="margin: 2px 0;"><span style="color: {ENVIRONMENT_COLORS['URBAN']};">&#9679;</span> URBAN</p>
         <p style="margin: 2px 0;"><span style="color: {ENVIRONMENT_COLORS['SUBURBAN']};">&#9679;</span> SUBURBAN</p>
         <p style="margin: 2px 0;"><span style="color: {ENVIRONMENT_COLORS['RURAL']};">&#9679;</span> RURAL</p>
 
-        <p style="margin: 10px 0 4px 0; font-weight: bold;">Coverage Areas</p>
+        <p style="margin: 8px 0 4px 0; font-weight: bold;">Coverage Areas</p>
         <p style="margin: 2px 0;"><span style="color: {ISSUE_COLORS['no_coverage']};">&#9632;</span> No Coverage</p>
         <p style="margin: 2px 0;"><span style="color: {ISSUE_COLORS['low_coverage']};">&#9632;</span> Low Coverage</p>
+        <p style="margin: 2px 0;"><span style="color: {ISSUE_COLORS['interference']};">&#9632;</span> Interference</p>
+
+        <p style="margin: 8px 0 4px 0; font-weight: bold;">Relationship Lines</p>
+        <p style="margin: 2px 0;"><span style="color: {LINE_COLORS['pci']};">- - -</span> PCI Relations</p>
+        <p style="margin: 2px 0;"><span style="color: {LINE_COLORS['blacklist']};">- - -</span> Blacklist</p>
+        <p style="margin: 2px 0;"><span style="color: {LINE_COLORS['crossed_offender']};">&#8212;</span> Crossed (suspicious)</p>
+        <p style="margin: 2px 0;"><span style="color: {LINE_COLORS['crossed_normal']};">&#8212;</span> Crossed (normal)</p>
+
+        <p style="margin: 8px 0 4px 0; font-weight: bold;">CA Imbalance Hulls</p>
+        <p style="margin: 2px 0;"><span style="color: {LINE_COLORS['ca_coverage']};">&#9632;</span> Coverage Band</p>
+        <p style="margin: 2px 0;"><span style="color: {LINE_COLORS['ca_capacity']};">&#9632;</span> Capacity Band</p>
     </div>
     """
     m.get_root().html.add_child(folium.Element(html))
 
 
-def _add_filter_panel(m: folium.Map, stats: dict):
+def _add_filter_panel(m: folium.Map, stats: dict, all_bands: Optional[list] = None):
     """Add filter panel."""
-    # Get unique values for filters
-    severities = list(stats['overshooting'].get('by_severity', {}).keys())
-    environments = list(stats['overshooting'].get('by_environment', {}).keys())
-    environments.extend([e for e in stats['undershooting'].get('by_environment', {}).keys() if e not in environments])
-    bands = list(stats['overshooting'].get('by_band', {}).keys())
-    bands.extend([b for b in stats['undershooting'].get('by_band', {}).keys() if b not in bands])
-    bands = sorted(set(bands))
+    # Get all severities from all detector types
+    severities = set()
+    for key in ['overshooting', 'undershooting']:
+        severities.update(stats.get(key, {}).get('by_severity', {}).keys())
+    severities = sorted(severities, key=lambda x: ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'MINIMAL'].index(x) if x in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'MINIMAL'] else 99)
+
+    # Get all environments from all detector types
+    environments = set()
+    for key in ['overshooting', 'undershooting']:
+        environments.update(stats.get(key, {}).get('by_environment', {}).keys())
+
+    # Get all bands - use provided list or extract from stats
+    if all_bands:
+        bands = sorted(set(all_bands))
+    else:
+        bands = set()
+        for key in ['overshooting', 'undershooting']:
+            bands.update(stats.get(key, {}).get('by_band', {}).keys())
+        bands.update(stats.get('low_coverage', {}).get('by_band', {}).keys())
+        bands = sorted(bands)
 
     html = """
     <div id="filterPanel" style="
@@ -1258,15 +2376,6 @@ def _add_filter_panel(m: folium.Map, stats: dict):
         <h4 style="margin: 0 0 12px 0; border-bottom: 1px solid #ddd; padding-bottom: 8px;">
             Filters
         </h4>
-
-        <div style="margin-bottom: 12px;">
-            <label style="font-weight: bold; display: block; margin-bottom: 4px;">Issue Type</label>
-            <select id="issueFilter" onchange="applyFilters()" style="width: 100%; padding: 4px;">
-                <option value="all">All Issues</option>
-                <option value="overshooting">Overshooting</option>
-                <option value="undershooting">Undershooting</option>
-            </select>
-        </div>
 
         <div style="margin-bottom: 12px;">
             <label style="font-weight: bold; display: block; margin-bottom: 4px;">Severity</label>
@@ -1303,7 +2412,12 @@ def _add_filter_panel(m: folium.Map, stats: dict):
     """
 
     for band in bands:
-        html += f'<option value="{band}">{band} MHz</option>'
+        # Format band display - handle both "L800" and numeric formats
+        if isinstance(band, str) and band.startswith('L'):
+            display_band = band
+        else:
+            display_band = f"{band} MHz" if band else str(band)
+        html += f'<option value="{band}">{display_band}</option>'
 
     html += """
             </select>
@@ -1313,67 +2427,519 @@ def _add_filter_panel(m: folium.Map, stats: dict):
             width: 100%; padding: 8px; background: #6c757d; color: white;
             border: none; border-radius: 4px; cursor: pointer;
         ">Reset Filters</button>
+
+        <div id="filterStatus" style="margin-top: 8px; font-size: 10px; color: #666; text-align: center;"></div>
     </div>
     """
     m.get_root().html.add_child(folium.Element(html))
 
 
 def _add_filter_javascript(m: folium.Map):
-    """Add JavaScript for filtering markers."""
-    js = """
-    <script>
-    function applyFilters() {
-        var issueType = document.getElementById('issueFilter').value;
-        var severity = document.getElementById('severityFilter').value;
-        var env = document.getElementById('envFilter').value;
-        var band = document.getElementById('bandFilter').value;
+    """Add JavaScript for filtering markers and recommendations table based on filter values."""
+    map_var = m.get_name()
 
-        var markers = document.querySelectorAll('.issue-marker');
-        markers.forEach(function(marker) {
+    js = f"""
+    <script>
+    function applyFilters() {{
+        var severity = document.getElementById('severityFilter').value.toUpperCase();
+        var env = document.getElementById('envFilter').value.toUpperCase();
+        var band = document.getElementById('bandFilter').value;
+        var statusDiv = document.getElementById('filterStatus');
+
+        var hidden = 0;
+        var total = 0;
+
+        // Helper function to filter a single layer
+        function filterLayer(layer) {{
+            if (!layer.getPopup || !layer.getPopup()) return;
+            var popup = layer.getPopup();
+            var content = popup.getContent();
+
+            // Content can be string, DOM element, or function
+            var contentStr = '';
+            if (typeof content === 'string') {{
+                contentStr = content;
+            }} else if (content && content.innerHTML) {{
+                contentStr = content.innerHTML;
+            }} else if (content && content.outerHTML) {{
+                contentStr = content.outerHTML;
+            }}
+            if (!contentStr) return;
+
+            total++;
             var show = true;
 
-            // Issue type filter
-            if (issueType !== 'all') {
-                if (!marker.classList.contains('issue-' + issueType)) {
+            // Severity filter
+            if (severity !== 'ALL') {{
+                var sevMatch = contentStr.match(/>(CRITICAL|HIGH|MEDIUM|LOW|MINIMAL)</i);
+                if (sevMatch && sevMatch[1].toUpperCase() !== severity) {{
                     show = false;
-                }
-            }
+                }}
+            }}
+
+            // Environment filter - handles "Environment:</strong>" and "Environment</div>"
+            if (env !== 'ALL' && show) {{
+                var envMatch = contentStr.match(/Environment[:<].*?(URBAN|SUBURBAN|RURAL)/i);
+                if (envMatch && envMatch[1].toUpperCase() !== env) {{
+                    show = false;
+                }}
+            }}
+
+            // Band filter - match "L800" or "L700" etc anywhere after "Band"
+            // Handles multiple formats: "Band:</td><td><strong>L800" and "Band</div>...<div>L700"
+            if (band !== 'all' && show) {{
+                var bandMatch = contentStr.match(/Band[:<].*?(L\\d+)/i);
+                if (bandMatch) {{
+                    if (bandMatch[1] !== band) {{
+                        show = false;
+                    }}
+                }}
+            }}
+
+            // Hide/show the layer element
+            if (layer._path) {{
+                layer._path.style.display = show ? '' : 'none';
+            }}
+            if (layer._icon) {{
+                layer._icon.style.display = show ? '' : 'none';
+            }}
+            // For CircleMarkers and other SVG elements
+            if (layer.getElement) {{
+                var el = layer.getElement();
+                if (el) el.style.display = show ? '' : 'none';
+            }}
+            if (!show) hidden++;
+        }}
+
+        // Filter all layers recursively
+        var layerCount = 0;
+        var featureGroupCount = 0;
+        function processLayers(parentLayer) {{
+            if (parentLayer.eachLayer) {{
+                featureGroupCount++;
+                parentLayer.eachLayer(function(layer) {{
+                    layerCount++;
+                    filterLayer(layer);
+                    if (layer.eachLayer) processLayers(layer);
+                }});
+            }}
+        }}
+
+        processLayers({map_var});
+        console.log('Map filter: found ' + featureGroupCount + ' groups, ' + layerCount + ' layers, ' + total + ' with popups, ' + hidden + ' hidden');
+
+        // Filter recommendations table rows
+        var tableHidden = 0;
+        var tableTotal = 0;
+        console.log('Filter values: band=' + band + ', severity=' + severity + ', env=' + env);
+        document.querySelectorAll('.rec-row').forEach(function(row) {{
+            tableTotal++;
+            var show = true;
+            var rowSeverity = row.getAttribute('data-severity') || '';
+            var rowBand = row.getAttribute('data-band') || '';
+            var rowEnv = row.getAttribute('data-environment') || '';
 
             // Severity filter
-            if (severity !== 'all') {
-                if (!marker.classList.contains('severity-' + severity)) {
-                    show = false;
-                }
-            }
+            if (severity !== 'ALL' && rowSeverity && rowSeverity.toUpperCase() !== severity) {{
+                show = false;
+            }}
 
             // Environment filter
-            if (env !== 'all') {
-                if (!marker.classList.contains('env-' + env)) {
+            if (env !== 'ALL' && rowEnv && rowEnv.toUpperCase() !== env) {{
+                show = false;
+            }}
+
+            // Band filter - compare values directly (both should be like "L800")
+            if (band !== 'all' && rowBand) {{
+                if (rowBand !== band) {{
                     show = false;
-                }
-            }
+                }}
+            }}
 
-            // Band filter
-            if (band !== 'all') {
-                if (!marker.classList.contains('band-' + band)) {
-                    show = false;
-                }
-            }
+            row.style.display = show ? '' : 'none';
+            if (!show) tableHidden++;
+        }});
+        console.log('Table filter: ' + tableHidden + ' hidden of ' + tableTotal + ' total');
 
-            marker.style.display = show ? '' : 'none';
-        });
-    }
+        // Update filter status
+        if (statusDiv) {{
+            var statusParts = [];
+            if (hidden > 0) statusParts.push(hidden + ' map markers hidden');
+            if (tableHidden > 0) statusParts.push(tableHidden + ' table rows hidden');
+            statusDiv.textContent = statusParts.join(', ') || '';
+        }}
 
-    function resetFilters() {
-        document.getElementById('issueFilter').value = 'all';
+        // Update tab counts to show filtered counts
+        updateTabCounts();
+    }}
+
+    function updateTabCounts() {{
+        var tabs = ['overshooting', 'undershooting', 'pci', 'ca_imbalance', 'crossed_feeders'];
+        var totalVisible = 0;
+        var counts = {{}};
+
+        tabs.forEach(function(tabId) {{
+            var tabContent = document.getElementById('recTab_' + tabId);
+            if (tabContent) {{
+                var visibleRows = tabContent.querySelectorAll('.rec-row:not([style*="display: none"])').length;
+                var totalRows = tabContent.querySelectorAll('.rec-row').length;
+                var tabBtn = document.querySelector('[data-tab="' + tabId + '"] span');
+                if (tabBtn && totalRows > 0) {{
+                    tabBtn.textContent = visibleRows;
+                }}
+                counts[tabId] = visibleRows;
+                totalVisible += visibleRows;
+            }}
+        }});
+
+        // Update summary panel counts
+        var totalEl = document.getElementById('summaryTotalIssues');
+        if (totalEl) totalEl.textContent = totalVisible;
+
+        var overEl = document.getElementById('summaryOvershooting');
+        if (overEl) overEl.textContent = counts['overshooting'] || 0;
+
+        var underEl = document.getElementById('summaryUndershooting');
+        if (underEl) underEl.textContent = counts['undershooting'] || 0;
+    }}
+
+    function resetFilters() {{
         document.getElementById('severityFilter').value = 'all';
         document.getElementById('envFilter').value = 'all';
         document.getElementById('bandFilter').value = 'all';
         applyFilters();
-    }
+    }}
     </script>
     """
     m.get_root().html.add_child(folium.Element(js))
+
+
+def _add_recommendations_table_panel(
+    m: folium.Map,
+    cell_coords: dict,
+    overshooting_df: Optional[pd.DataFrame] = None,
+    undershooting_df: Optional[pd.DataFrame] = None,
+    pci_confusions_df: Optional[pd.DataFrame] = None,
+    pci_collisions_df: Optional[pd.DataFrame] = None,
+    pci_blacklist_df: Optional[pd.DataFrame] = None,
+    ca_imbalance_df: Optional[pd.DataFrame] = None,
+    crossed_feeder_df: Optional[pd.DataFrame] = None,
+):
+    """Add collapsible recommendations table panel with tabs for each detector type."""
+
+    # Build recommendations data for each detector
+    recommendations = {
+        'overshooting': [],
+        'undershooting': [],
+        'pci': [],
+        'ca_imbalance': [],
+        'crossed_feeders': []
+    }
+
+    # Helper to extract band from cell name based on VF-IE naming convention
+    # e.g., "CK052L2" -> "L800", "CK329H3" -> "L1800", "CK144T1" -> "L2100", "CK052K1" -> "L700"
+    def extract_band_from_cell(cell_name):
+        if not cell_name:
+            return ''
+        import re
+        # Pattern: letter + digit at end (L1, L2, L3, H1, H2, H3, T1, T2, T3, K1, K2, K3)
+        match = re.search(r'([LHTK])(\d)$', str(cell_name))
+        if match:
+            band_letter = match.group(1)
+            band_map = {'L': 'L800', 'H': 'L1800', 'T': 'L2100', 'K': 'L700'}
+            return band_map.get(band_letter, '')
+        return ''
+
+    # Overshooting recommendations
+    if overshooting_df is not None and len(overshooting_df) > 0:
+        for _, row in overshooting_df.iterrows():
+            cell_name = row.get('cell_name', '')
+            severity = row.get('severity_category', 'MEDIUM')
+            tilt_change = row.get('recommended_tilt_change', 0)
+            environment = row.get('environment', '')
+            band = row.get('band', '') or extract_band_from_cell(cell_name)
+            coords = cell_coords.get(cell_name, [0, 0])
+            recommendations['overshooting'].append({
+                'cell': cell_name,
+                'severity': severity,
+                'recommendation': f"Increase tilt by {tilt_change}°",
+                'coords': coords,
+                'band': band,
+                'environment': environment
+            })
+
+    # Undershooting recommendations
+    if undershooting_df is not None and len(undershooting_df) > 0:
+        for _, row in undershooting_df.iterrows():
+            cell_name = row.get('cell_name', '')
+            severity = row.get('severity_category', 'MEDIUM')
+            uptilt = row.get('recommended_uptilt', 0)
+            environment = row.get('environment', '')
+            band = row.get('band', '') or extract_band_from_cell(cell_name)
+            coords = cell_coords.get(cell_name, [0, 0])
+            recommendations['undershooting'].append({
+                'cell': cell_name,
+                'severity': severity,
+                'recommendation': f"Decrease tilt by {uptilt}°",
+                'coords': coords,
+                'band': band,
+                'environment': environment
+            })
+
+    # PCI recommendations (combine confusions, collisions, blacklist) - only include items with coordinates
+    if pci_confusions_df is not None and len(pci_confusions_df) > 0:
+        for _, row in pci_confusions_df.iterrows():
+            cell_name = row.get('serving', '')
+            if cell_name not in cell_coords:
+                continue  # Skip items without coordinates
+            band = row.get('band', '') or extract_band_from_cell(cell_name)
+            coords = cell_coords[cell_name]
+            recommendations['pci'].append({
+                'cell': cell_name,
+                'severity': 'HIGH',
+                'recommendation': f"PCI confusion with {row.get('neighbors', '')}",
+                'coords': coords,
+                'band': band,
+                'environment': ''
+            })
+
+    if pci_collisions_df is not None and len(pci_collisions_df) > 0:
+        for _, row in pci_collisions_df.iterrows():
+            cell_a = row.get('cell_a', '')
+            cell_b = row.get('cell_b', '')
+            if cell_a not in cell_coords or cell_b not in cell_coords:
+                continue  # Skip items without coordinates for both cells
+            band = row.get('band', '') or extract_band_from_cell(cell_a)
+            coords = cell_coords[cell_a]
+            recommendations['pci'].append({
+                'cell': f"{cell_a} / {cell_b}",
+                'severity': 'MEDIUM',
+                'recommendation': f"PCI collision (PCI={row.get('pci', '')})",
+                'coords': coords,
+                'band': band,
+                'environment': ''
+            })
+
+    if pci_blacklist_df is not None and len(pci_blacklist_df) > 0:
+        for _, row in pci_blacklist_df.iterrows():
+            cell_name = row.get('serving', '')
+            if cell_name not in cell_coords:
+                continue  # Skip items without coordinates
+            band = row.get('band', '') or extract_band_from_cell(cell_name)
+            coords = cell_coords[cell_name]
+            recommendations['pci'].append({
+                'cell': cell_name,
+                'severity': 'LOW',
+                'recommendation': f"Blacklist {row.get('neighbor', '')}",
+                'coords': coords,
+                'band': band,
+                'environment': ''
+            })
+
+    # CA Imbalance recommendations - only include items with coordinates
+    if ca_imbalance_df is not None and len(ca_imbalance_df) > 0:
+        for _, row in ca_imbalance_df.iterrows():
+            cell_name = row.get('coverage_cell_name', '')
+            if cell_name not in cell_coords:
+                continue  # Skip items without coordinates
+            severity = row.get('severity', 'medium').upper()
+            band = row.get('coverage_band', '') or extract_band_from_cell(cell_name)
+            coords = cell_coords[cell_name]
+            recommendations['ca_imbalance'].append({
+                'cell': cell_name,
+                'severity': severity,
+                'recommendation': row.get('recommendation', 'Review CA configuration'),
+                'coords': coords,
+                'band': band,
+                'environment': ''
+            })
+
+    # Crossed Feeder recommendations - only include items with coordinates
+    if crossed_feeder_df is not None and len(crossed_feeder_df) > 0:
+        flagged_df = crossed_feeder_df[crossed_feeder_df.get('flagged', False) == True] if 'flagged' in crossed_feeder_df.columns else crossed_feeder_df
+        for _, row in flagged_df.iterrows():
+            cell_name = row.get('cell_name', '')
+            if cell_name not in cell_coords:
+                continue  # Skip items without coordinates
+            band = row.get('band', '') or extract_band_from_cell(cell_name)
+            coords = cell_coords[cell_name]
+            recommendations['crossed_feeders'].append({
+                'cell': cell_name,
+                'severity': 'HIGH',
+                'recommendation': 'Verify antenna connections',
+                'coords': coords,
+                'band': band,
+                'environment': ''
+            })
+
+    # Build tab buttons and content
+    tab_buttons = ""
+    tab_contents = ""
+    tabs = [
+        ('overshooting', 'Overshooting', ISSUE_COLORS['overshooting']),
+        ('undershooting', 'Undershooting', ISSUE_COLORS['undershooting']),
+        ('pci', 'PCI Issues', ISSUE_COLORS['pci_confusion']),
+        ('ca_imbalance', 'CA Imbalance', ISSUE_COLORS['ca_imbalance']),
+        ('crossed_feeders', 'Crossed Feeders', ISSUE_COLORS['crossed_feeder'])
+    ]
+
+    for idx, (tab_id, tab_name, color) in enumerate(tabs):
+        count = len(recommendations[tab_id])
+        is_active = idx == 0
+        tab_buttons += f"""
+        <button class="rec-tab-btn {'rec-tab-active' if is_active else ''}"
+                onclick="showRecTab('{tab_id}')"
+                data-tab="{tab_id}"
+                style="padding: 6px 10px; margin-right: 4px; border: none; border-radius: 4px 4px 0 0;
+                       background: {'white' if is_active else '#e9ecef'}; cursor: pointer;
+                       border-bottom: 2px solid {color if is_active else 'transparent'};
+                       font-size: 11px;">
+            {tab_name} <span style="background: {color}; color: white; padding: 1px 5px;
+                               border-radius: 10px; font-size: 10px; margin-left: 3px;">{count}</span>
+        </button>
+        """
+
+        rows_html = ""
+        for rec in recommendations[tab_id]:  # Show all recommendations
+            severity_color = {
+                'CRITICAL': '#dc3545', 'HIGH': '#fd7e14', 'MEDIUM': '#ffc107', 'LOW': '#17a2b8', 'MINIMAL': '#28a745'
+            }.get(rec['severity'], '#6c757d')
+            rec_band = rec.get('band', '')
+            rec_env = rec.get('environment', '')
+            rows_html += f"""
+            <tr onclick="zoomToCell({rec['coords'][0]}, {rec['coords'][1]})"
+                style="cursor: pointer;" class="rec-row"
+                data-severity="{rec['severity']}" data-band="{rec_band}" data-environment="{rec_env}">
+                <td style="padding: 4px 6px; border-bottom: 1px solid #eee;">{rec['cell'][:20]}</td>
+                <td style="padding: 4px 6px; border-bottom: 1px solid #eee;">
+                    <span style="background: {severity_color}; color: white; padding: 1px 5px;
+                                 border-radius: 3px; font-size: 10px;">{rec['severity']}</span>
+                </td>
+                <td style="padding: 4px 6px; border-bottom: 1px solid #eee; font-size: 10px;">{rec['recommendation'][:40]}</td>
+            </tr>
+            """
+
+        if not rows_html:
+            rows_html = '<tr><td colspan="3" style="padding: 20px; text-align: center; color: #999;">No issues found</td></tr>'
+
+        tab_contents += f"""
+        <div id="recTab_{tab_id}" class="rec-tab-content" style="display: {'block' if is_active else 'none'};">
+            <table style="width: 100%; border-collapse: collapse; font-size: 11px;">
+                <thead>
+                    <tr style="background: #f8f9fa;">
+                        <th style="padding: 6px; text-align: left; border-bottom: 2px solid #dee2e6;">Cell</th>
+                        <th style="padding: 6px; text-align: left; border-bottom: 2px solid #dee2e6;">Severity</th>
+                        <th style="padding: 6px; text-align: left; border-bottom: 2px solid #dee2e6;">Recommendation</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {rows_html}
+                </tbody>
+            </table>
+        </div>
+        """
+
+    # Total recommendations count
+    total_recs = sum(len(r) for r in recommendations.values())
+
+    html = f"""
+    <div id="recTablePanel" style="
+        position: fixed; bottom: 30px; left: 220px; width: 450px;
+        background-color: white; border: 2px solid #333; border-radius: 8px;
+        z-index: 9998; font-family: Arial;
+        box-shadow: 0 4px 12px rgba(0,0,0,0.15);
+        max-height: 60px; overflow: hidden;
+        transition: max-height 0.3s ease-out;
+    ">
+        <div id="recTableHeader" onclick="toggleRecTable()" style="
+            padding: 10px 12px; cursor: pointer; background: #343a40; color: white;
+            border-radius: 6px 6px 0 0; display: flex; justify-content: space-between;
+            align-items: center;
+        ">
+            <span style="font-weight: bold;">
+                <span id="recTableIcon">▶</span> Recommendations Table
+            </span>
+            <span style="background: #0d6efd; padding: 2px 8px; border-radius: 10px; font-size: 12px;">
+                {total_recs} issues
+            </span>
+        </div>
+
+        <div id="recTableBody" style="display: none; padding: 0;">
+            <div style="padding: 8px 12px 4px 12px; border-bottom: 1px solid #dee2e6;">
+                {tab_buttons}
+            </div>
+            <div style="max-height: 250px; overflow-y: auto; padding: 0 12px 12px 12px;">
+                {tab_contents}
+            </div>
+        </div>
+    </div>
+
+    <style>
+    .rec-row:hover {{ background: #f0f7ff !important; }}
+    .rec-tab-btn:hover {{ background: #dee2e6 !important; }}
+    </style>
+
+    <script>
+    var recTableExpanded = false;
+
+    function toggleRecTable() {{
+        var panel = document.getElementById('recTablePanel');
+        var body = document.getElementById('recTableBody');
+        var icon = document.getElementById('recTableIcon');
+
+        recTableExpanded = !recTableExpanded;
+
+        if (recTableExpanded) {{
+            panel.style.maxHeight = '400px';
+            body.style.display = 'block';
+            icon.textContent = '▼';
+        }} else {{
+            panel.style.maxHeight = '60px';
+            body.style.display = 'none';
+            icon.textContent = '▶';
+        }}
+    }}
+
+    function showRecTab(tabId) {{
+        // Hide all tab contents
+        document.querySelectorAll('.rec-tab-content').forEach(function(el) {{
+            el.style.display = 'none';
+        }});
+
+        // Show selected tab
+        document.getElementById('recTab_' + tabId).style.display = 'block';
+
+        // Update button styles
+        document.querySelectorAll('.rec-tab-btn').forEach(function(btn) {{
+            btn.classList.remove('rec-tab-active');
+            btn.style.background = '#e9ecef';
+            btn.style.borderBottom = '2px solid transparent';
+        }});
+
+        var activeBtn = document.querySelector('[data-tab="' + tabId + '"]');
+        if (activeBtn) {{
+            activeBtn.classList.add('rec-tab-active');
+            activeBtn.style.background = 'white';
+            // Get color from the span inside
+            var colors = {{
+                'overshooting': '{ISSUE_COLORS["overshooting"]}',
+                'undershooting': '{ISSUE_COLORS["undershooting"]}',
+                'pci': '{ISSUE_COLORS["pci_confusion"]}',
+                'ca_imbalance': '{ISSUE_COLORS["ca_imbalance"]}',
+                'crossed_feeders': '{ISSUE_COLORS["crossed_feeder"]}'
+            }};
+            activeBtn.style.borderBottom = '2px solid ' + colors[tabId];
+        }}
+    }}
+
+    function zoomToCell(lat, lon) {{
+        if (lat && lon && lat !== 0 && lon !== 0) {{
+            {m.get_name()}.setView([lat, lon], 15);
+        }}
+    }}
+    </script>
+    """
+    m.get_root().html.add_child(folium.Element(html))
 
 
 def _add_grid_loading_javascript(m: folium.Map, grid_paths: dict):
@@ -1467,9 +3033,16 @@ def _add_grid_loading_javascript(m: folium.Map, grid_paths: dict):
                 }}
             }})
             .catch(error => {{
-                if (statusDiv) statusDiv.textContent = 'Error loading grids';
+                if (statusDiv) {{
+                    if (window.location.protocol === 'file:') {{
+                        statusDiv.innerHTML = '<span style="color: red;">CORS blocked - use HTTP server</span>';
+                    }} else {{
+                        statusDiv.textContent = 'Error loading grids';
+                    }}
+                }}
                 if (btn) btn.disabled = false;
                 console.error('Error loading grids:', error);
+                console.log('TIP: If you see CORS errors, serve via HTTP: python tests/integration/serve_map.py');
             }});
     }}
 
@@ -1493,6 +3066,261 @@ def _add_grid_loading_javascript(m: folium.Map, grid_paths: dict):
     """
 
     js += "</script>"
+    m.get_root().html.add_child(folium.Element(js))
+
+
+def _build_cell_coords_lookup(gis_df: pd.DataFrame) -> dict:
+    """
+    Build a lookup dictionary of cell coordinates from GIS data.
+
+    Args:
+        gis_df: DataFrame with cell GIS data
+
+    Returns:
+        Dict mapping cell_name to [latitude, longitude]
+    """
+    if gis_df is None or len(gis_df) == 0:
+        return {}
+
+    cell_coords = {}
+    lat_col = 'latitude' if 'latitude' in gis_df.columns else 'Latitude'
+    lon_col = 'longitude' if 'longitude' in gis_df.columns else 'Longitude'
+    name_col = 'cell_name' if 'cell_name' in gis_df.columns else 'CILAC'
+
+    for _, row in gis_df.iterrows():
+        cell_name = str(row.get(name_col, ''))
+        lat = row.get(lat_col)
+        lon = row.get(lon_col)
+        if cell_name and pd.notna(lat) and pd.notna(lon):
+            cell_coords[cell_name] = [float(lat), float(lon)]
+
+    return cell_coords
+
+
+def _build_cell_geometries_lookup(gis_df: pd.DataFrame) -> dict:
+    """
+    Build a lookup dictionary of cell sector geometries from GIS data.
+
+    Args:
+        gis_df: DataFrame with cell GIS data including geometry column
+
+    Returns:
+        Dict mapping cell_name to list of [lat, lon] coordinate pairs forming the polygon
+    """
+    from shapely import wkt
+
+    if gis_df is None or len(gis_df) == 0:
+        return {}
+
+    cell_geometries = {}
+    name_col = 'cell_name' if 'cell_name' in gis_df.columns else 'CILAC'
+    geom_col = 'geometry' if 'geometry' in gis_df.columns else None
+
+    if geom_col is None:
+        return {}
+
+    for _, row in gis_df.iterrows():
+        cell_name = str(row.get(name_col, ''))
+        geom_str = row.get(geom_col)
+
+        if cell_name and geom_str and pd.notna(geom_str):
+            try:
+                geom = wkt.loads(str(geom_str))
+                if hasattr(geom, 'exterior'):
+                    # Extract coordinates from polygon exterior ring
+                    # Note: Folium/Leaflet expects [lat, lon] but WKT is [lon, lat]
+                    coords = [[y, x] for x, y in geom.exterior.coords]
+                    cell_geometries[cell_name] = coords
+            except Exception:
+                continue
+
+    return cell_geometries
+
+
+def _add_line_toggle_javascript(
+    m: folium.Map,
+    line_data: dict,
+    cell_coords: dict,
+    hull_geometries: Optional[dict] = None,
+) -> None:
+    """
+    Add JavaScript for dynamically drawing/hiding lines between features.
+
+    Args:
+        m: Folium map object
+        line_data: Dict mapping feature_key to line configuration:
+            {
+                'pci_confusion_0': {
+                    'source': [lat, lon],
+                    'targets': [[lat, lon], ...],
+                    'color': '#9b59b6',
+                    'style': 'dotted',  # or 'dashed'
+                },
+                ...
+            }
+        cell_coords: Dict mapping cell_name to [lat, lon]
+        hull_geometries: Dict mapping feature_key to hull geometry data for CA imbalance
+    """
+    if not line_data and not hull_geometries:
+        return
+
+    map_var_name = m.get_name()
+
+    js = f"""
+    <script>
+    // Line toggle state and layers
+    var lineLayers = {{}};
+    var lineLayersVisible = {{}};
+
+    // Cell coordinates lookup
+    var cellCoords = {json.dumps(cell_coords)};
+
+    // Line data for each feature
+    var lineData = {json.dumps(line_data)};
+
+    // Generic function to toggle lines for any feature
+    function toggleLines(featureKey, btnId) {{
+        var btn = document.getElementById(btnId);
+        var statusDiv = document.getElementById('lineStatus_' + featureKey);
+
+        if (lineLayersVisible[featureKey]) {{
+            // Hide lines
+            if (lineLayers[featureKey]) {{
+                {map_var_name}.removeLayer(lineLayers[featureKey]);
+            }}
+            lineLayersVisible[featureKey] = false;
+            if (btn) btn.textContent = btn.dataset.showText || 'Show Lines';
+            if (statusDiv) statusDiv.textContent = '';
+        }} else {{
+            // Show lines
+            var data = lineData[featureKey];
+            if (data && data.source && data.targets && data.targets.length > 0) {{
+                var lineGroup = L.layerGroup();
+                var source = data.source;
+
+                data.targets.forEach(function(targetInfo) {{
+                    var target = targetInfo.coords || targetInfo;
+                    var lineColor = targetInfo.color || data.color || '#999';
+
+                    var style = {{
+                        color: lineColor,
+                        weight: 2,
+                        opacity: 0.8
+                    }};
+
+                    if (data.style === 'dotted') {{
+                        style.dashArray = '5, 10';
+                    }} else if (data.style === 'dashed') {{
+                        style.dashArray = '10, 5';
+                    }}
+
+                    var line = L.polyline([source, target], style);
+
+                    // Add tooltip if target has name
+                    if (targetInfo.name) {{
+                        line.bindTooltip(targetInfo.name, {{permanent: false, direction: 'center'}});
+                    }}
+
+                    line.addTo(lineGroup);
+
+                    // Add polygon if geometry available, otherwise small circle at target
+                    if (targetInfo.geometry && targetInfo.geometry.length > 0) {{
+                        var polygon = L.polygon(targetInfo.geometry, {{
+                            color: lineColor,
+                            weight: 2,
+                            fill: true,
+                            fillColor: lineColor,
+                            fillOpacity: 0.3
+                        }});
+                        if (targetInfo.name) {{
+                            polygon.bindTooltip(targetInfo.name, {{permanent: false, direction: 'center'}});
+                        }}
+                        polygon.addTo(lineGroup);
+                    }} else {{
+                        L.circleMarker(target, {{
+                            radius: 4,
+                            color: lineColor,
+                            fillColor: lineColor,
+                            fillOpacity: 0.8,
+                            weight: 1
+                        }}).addTo(lineGroup);
+                    }}
+                }});
+
+                lineGroup.addTo({map_var_name});
+                lineLayers[featureKey] = lineGroup;
+                lineLayersVisible[featureKey] = true;
+
+                if (btn) btn.textContent = btn.dataset.hideText || 'Hide Lines';
+                if (statusDiv) statusDiv.textContent = data.targets.length + ' connections shown';
+            }} else {{
+                if (statusDiv) statusDiv.textContent = 'No connections available';
+            }}
+        }}
+    }}
+
+    // Hull toggle state and layers
+    var hullLayers = {{}};
+    var hullLayersVisible = {{}};
+    var hullGeometries = {json.dumps(hull_geometries if hull_geometries else {})};
+
+
+    // Function to toggle hull display for CA imbalance
+    function toggleHulls(featureKey, btnId) {{
+        var btn = document.getElementById(btnId);
+        var statusDiv = document.getElementById('hullStatus_' + featureKey);
+
+        if (hullLayersVisible[featureKey]) {{
+            // Hide hulls
+            if (hullLayers[featureKey]) {{
+                {map_var_name}.removeLayer(hullLayers[featureKey]);
+            }}
+            hullLayersVisible[featureKey] = false;
+            if (btn) btn.textContent = 'Show Hulls';
+            if (statusDiv) statusDiv.textContent = '';
+        }} else {{
+            // Show hulls
+            var data = hullGeometries[featureKey];
+            if (data) {{
+                var hullGroup = L.layerGroup();
+
+                // Coverage cell hull (blue)
+                if (data.coverage) {{
+                    L.geoJSON(data.coverage, {{
+                        style: {{
+                            fillColor: '{LINE_COLORS["ca_coverage"]}',
+                            color: '{LINE_COLORS["ca_coverage"]}',
+                            weight: 2,
+                            fillOpacity: 0.2
+                        }}
+                    }}).bindTooltip('Coverage Band', {{permanent: false}}).addTo(hullGroup);
+                }}
+
+                // Capacity cell hull (green)
+                if (data.capacity) {{
+                    L.geoJSON(data.capacity, {{
+                        style: {{
+                            fillColor: '{LINE_COLORS["ca_capacity"]}',
+                            color: '{LINE_COLORS["ca_capacity"]}',
+                            weight: 2,
+                            fillOpacity: 0.2
+                        }}
+                    }}).bindTooltip('Capacity Band', {{permanent: false}}).addTo(hullGroup);
+                }}
+
+                hullGroup.addTo({map_var_name});
+                hullLayers[featureKey] = hullGroup;
+                hullLayersVisible[featureKey] = true;
+
+                if (btn) btn.textContent = 'Hide Hulls';
+                if (statusDiv) statusDiv.textContent = 'Coverage comparison shown';
+            }} else {{
+                if (statusDiv) statusDiv.textContent = 'Hull data not available';
+            }}
+        }}
+    }}
+    </script>
+    """
     m.get_root().html.add_child(folium.Element(js))
 
 

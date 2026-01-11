@@ -1,11 +1,16 @@
 """
 Unified runner for all RAN optimization algorithms.
 
-This script runs all four detection algorithms:
+This script runs all detection algorithms:
 1. Overshooting detection (with environment-aware parameters)
 2. Undershooting detection (with environment-aware parameters, band-aware)
 3. No coverage gap detection
 4. Low coverage detection (per-band)
+5. Interference detection (high interference clusters)
+6. PCI planning (confusions, collisions, blacklist suggestions)
+7. PCI conflict detection (hull overlap-based same-PCI detection)
+8. CA imbalance detection (carrier aggregation coverage gaps)
+9. Crossed feeder detection
 
 Usage:
     python -m ran_optimizer.runner --input-dir data/vf-ie/input-data --output-dir data/vf-ie/output-data
@@ -20,10 +25,11 @@ Usage:
     python -m ran_optimizer.runner --no-environment-aware
 """
 import argparse
+import json
 import sys
 from pathlib import Path
 from datetime import datetime
-from typing import Optional, List
+from typing import Optional, List, Dict, Any
 
 import pandas as pd
 import geopandas as gpd
@@ -49,6 +55,26 @@ from ran_optimizer.recommendations.coverage_gaps import (
     LowCoverageDetector,
     LowCoverageParams,
 )
+from ran_optimizer.recommendations.interference import (
+    InterferenceDetector,
+    InterferenceParams,
+)
+from ran_optimizer.recommendations.pci_planner import (
+    PCIPlanner,
+    PCIPlannerParams,
+)
+from ran_optimizer.recommendations.pci_conflict import (
+    PCIConflictDetector,
+    PCIConflictParams,
+)
+from ran_optimizer.recommendations.ca_imbalance import (
+    CAImbalanceDetector,
+    CAImbalanceParams,
+)
+from ran_optimizer.recommendations.crossed_feeder import (
+    CrossedFeederDetector,
+    CrossedFeederParams,
+)
 from ran_optimizer.visualization.enhanced_map import create_enhanced_map
 from ran_optimizer.recommendations.daily_resolution import (
     generate_daily_resolution_recommendations,
@@ -57,7 +83,10 @@ from ran_optimizer.recommendations.daily_resolution import (
 
 logger = get_logger(__name__)
 
-AVAILABLE_ALGORITHMS = ['overshooting', 'undershooting', 'no_coverage', 'low_coverage']
+AVAILABLE_ALGORITHMS = [
+    'overshooting', 'undershooting', 'no_coverage', 'no_coverage_per_band', 'low_coverage',
+    'interference', 'pci', 'pci_conflict', 'ca_imbalance', 'crossed_feeder'
+]
 
 
 def load_input_data(input_dir: Path) -> dict:
@@ -66,11 +95,12 @@ def load_input_data(input_dir: Path) -> dict:
 
     Expected files:
     - cell_coverage.csv: Grid measurements with RSRP, distance, traffic
-    - cork-gis.csv: Cell GIS data (location, tilt, height, etc.)
+    - cell_gis.csv: Cell GIS data (location, tilt, height, etc.)
     - cell_hulls.csv: Cell coverage hull polygons
+    - cell_impacts.csv / relations.csv: Cell relations for PCI/crossed feeder
 
     Returns:
-        Dictionary with 'grid_df', 'gis_df', 'hulls_gdf' keys
+        Dictionary with 'grid_df', 'gis_df', 'hulls_gdf', 'relations_df' keys
     """
     logger.info("Loading input data", input_dir=str(input_dir))
 
@@ -106,10 +136,23 @@ def load_input_data(input_dir: Path) -> dict:
     else:
         logger.warning("Cell hulls not found - coverage gap detection will be skipped")
 
+    # Load relations/impacts data (optional - needed for PCI, crossed feeder)
+    relations_df = None
+    relations_path = input_dir / 'cell_impacts.csv'
+    if not relations_path.exists():
+        relations_path = input_dir / 'relations.csv'
+    if relations_path.exists():
+        logger.info("Loading relations data", path=str(relations_path))
+        relations_df = pd.read_csv(relations_path)
+        logger.info("Relations data loaded", rows=len(relations_df), columns=len(relations_df.columns))
+    else:
+        logger.warning("Relations data not found - PCI/crossed feeder detection will be skipped")
+
     return {
         'grid_df': grid_df,
         'gis_df': gis_df,
         'hulls_gdf': hulls_gdf,
+        'relations_df': relations_df,
     }
 
 
@@ -282,13 +325,91 @@ def run_no_coverage(
     detector = CoverageGapDetector(params, boundary_shapefile=boundary_shapefile)
     results = detector.detect(hulls_gdf)
 
-    # Save results
+    # Save results (always write file, even if empty, to avoid stale data)
+    output_file = output_dir / 'no_coverage_clusters.geojson'
     if len(results) > 0:
-        output_file = output_dir / 'no_coverage_clusters.geojson'
         results.to_file(output_file, driver='GeoJSON')
         logger.info("No coverage results saved", path=str(output_file), clusters=len(results))
     else:
-        logger.warning("No coverage gap clusters detected")
+        # Write empty GeoDataFrame to clear any stale data
+        empty_gdf = gpd.GeoDataFrame(columns=['cluster_id', 'geometry'], crs="EPSG:4326")
+        empty_gdf.to_file(output_file, driver='GeoJSON')
+        logger.warning("No coverage gap clusters detected - wrote empty file")
+
+    return results
+
+
+def run_no_coverage_per_band(
+    hulls_gdf: gpd.GeoDataFrame,
+    gis_df: pd.DataFrame,
+    output_dir: Path,
+    config_path: Optional[str] = None,
+    boundary_shapefile: Optional[str] = None,
+    bands: Optional[List[str]] = None,
+) -> Dict[str, gpd.GeoDataFrame]:
+    """
+    Run no-coverage gap detection per band.
+
+    For each band, finds areas where cells of that band don't provide coverage,
+    even if other bands cover the area. Complements low coverage detection.
+
+    Args:
+        hulls_gdf: Cell convex hulls
+        gis_df: Cell GIS data with band information
+        output_dir: Output directory for GeoJSON files
+        config_path: Path to coverage_gaps.json
+        boundary_shapefile: Optional boundary to clip results
+        bands: Optional list of bands to process (None = all bands)
+
+    Returns:
+        Dict mapping band to GeoDataFrame of no coverage clusters
+    """
+    logger.info("=" * 80)
+    logger.info("Running NO COVERAGE PER BAND detection")
+    logger.info("=" * 80)
+
+    if hulls_gdf is None:
+        logger.warning("Cell hulls not available - skipping no coverage per band detection")
+        return {}
+
+    if gis_df is None:
+        logger.warning("GIS data not available - skipping no coverage per band detection")
+        return {}
+
+    params = CoverageGapParams.from_config(config_path=Path(config_path) if config_path else None)
+    detector = CoverageGapDetector(params, boundary_shapefile=boundary_shapefile)
+    results = detector.detect_per_band(hulls_gdf, gis_df, bands=bands)
+
+    # Save results per band
+    for band, band_gdf in results.items():
+        output_file = output_dir / f'no_coverage_{band}.geojson'
+        if len(band_gdf) > 0:
+            band_gdf.to_file(output_file, driver='GeoJSON')
+            total_area = band_gdf['area_km2'].sum() if 'area_km2' in band_gdf.columns else 0
+            logger.info(
+                "No coverage per band results saved",
+                band=band,
+                path=str(output_file),
+                clusters=len(band_gdf),
+                total_area_km2=round(total_area, 2)
+            )
+        else:
+            # Write empty GeoDataFrame
+            empty_gdf = gpd.GeoDataFrame(columns=['cluster_id', 'band', 'geometry'], crs="EPSG:4326")
+            empty_gdf.to_file(output_file, driver='GeoJSON')
+            logger.info("No coverage per band - no gaps found", band=band)
+
+    # Also save combined file
+    if results:
+        combined_gdf = gpd.GeoDataFrame(pd.concat(results.values(), ignore_index=True), crs="EPSG:4326")
+        combined_file = output_dir / 'no_coverage_per_band_combined.geojson'
+        combined_gdf.to_file(combined_file, driver='GeoJSON')
+        logger.info(
+            "Combined no coverage per band saved",
+            path=str(combined_file),
+            total_clusters=len(combined_gdf),
+            bands=list(results.keys())
+        )
 
     return results
 
@@ -301,8 +422,24 @@ def run_low_coverage(
     config_path: Optional[str] = None,
     bands: Optional[List[int]] = None,
     boundary_shapefile: Optional[str] = None,
+    env_df: Optional[pd.DataFrame] = None,
 ) -> dict:
-    """Run low-coverage detection per band."""
+    """
+    Run low-coverage detection per band with environment-aware thresholds.
+
+    Args:
+        hulls_gdf: Cell convex hulls
+        grid_df: Grid measurements
+        gis_df: Cell GIS data
+        output_dir: Output directory
+        config_path: Path to coverage_gaps.json
+        bands: Optional list of bands to process
+        boundary_shapefile: Optional boundary to clip results
+        env_df: Optional environment classification per cell (for environment-aware thresholds)
+
+    Returns:
+        Dict mapping band to GeoDataFrame of low coverage clusters
+    """
     logger.info("=" * 80)
     logger.info("Running LOW COVERAGE detection")
     logger.info("=" * 80)
@@ -311,9 +448,17 @@ def run_low_coverage(
         logger.warning("Cell hulls not available - skipping low coverage detection")
         return {}
 
-    params = LowCoverageParams.from_config(config_path=Path(config_path) if config_path else None)
+    config_path_obj = Path(config_path) if config_path else None
+    params = LowCoverageParams.from_config(config_path=config_path_obj)
     detector = LowCoverageDetector(params, boundary_shapefile=boundary_shapefile)
-    results = detector.detect(hulls_gdf, grid_df, gis_df, bands=bands)
+    results = detector.detect(
+        hulls_gdf,
+        grid_df,
+        gis_df,
+        bands=bands,
+        env_df=env_df,
+        config_path=config_path_obj,
+    )
 
     # Combine all bands into single GeoDataFrame
     all_clusters = []
@@ -333,6 +478,315 @@ def run_low_coverage(
         logger.warning("No low coverage clusters detected")
 
     return results
+
+
+def run_interference(
+    grid_df: pd.DataFrame,
+    output_dir: Path,
+    config_path: Optional[str] = None,
+) -> gpd.GeoDataFrame:
+    """Run interference detection."""
+    logger.info("=" * 80)
+    logger.info("Running INTERFERENCE detection")
+    logger.info("=" * 80)
+
+    # Normalize column names for detector (expects lowercase)
+    col_map = {}
+    if 'Band' in grid_df.columns and 'band' not in grid_df.columns:
+        col_map['Band'] = 'band'
+    if 'cilac' in grid_df.columns and 'cell_name' not in grid_df.columns:
+        col_map['cilac'] = 'cell_name'
+
+    if col_map:
+        grid_df = grid_df.rename(columns=col_map)
+        logger.info("Normalized column names", mapping=col_map)
+
+    params = InterferenceParams.from_config(config_path)
+    detector = InterferenceDetector(params)
+    results = detector.detect(grid_df, data_type='measured')
+
+    # Save results
+    output_file = output_dir / 'interference_clusters.geojson'
+    if len(results) > 0:
+        results.to_file(output_file, driver='GeoJSON')
+        logger.info("Interference results saved", path=str(output_file), clusters=len(results))
+    else:
+        # Write empty file to avoid stale data
+        empty_gdf = gpd.GeoDataFrame(columns=['cluster_id', 'geometry'], crs="EPSG:4326")
+        empty_gdf.to_file(output_file, driver='GeoJSON')
+        logger.warning("No interference clusters detected - wrote empty file")
+
+    return results
+
+
+def run_pci_planner(
+    relations_df: pd.DataFrame,
+    output_dir: Path,
+    config_path: Optional[str] = None,
+) -> Dict[str, pd.DataFrame]:
+    """Run PCI planning (confusions, collisions, blacklist)."""
+    logger.info("=" * 80)
+    logger.info("Running PCI PLANNER detection")
+    logger.info("=" * 80)
+
+    if relations_df is None:
+        logger.warning("Relations data not available - skipping PCI detection")
+        return {}
+
+    # Normalize column names for detector
+    # Expected: cell_name, to_cell_name, pci, to_pci, band, to_band, weight
+    col_map = {}
+    if 'cell_impact_name' in relations_df.columns and 'to_cell_name' not in relations_df.columns:
+        col_map['cell_impact_name'] = 'to_cell_name'
+    if 'cell_pci' in relations_df.columns and 'pci' not in relations_df.columns:
+        col_map['cell_pci'] = 'pci'
+    if 'cell_impact_pci' in relations_df.columns and 'to_pci' not in relations_df.columns:
+        col_map['cell_impact_pci'] = 'to_pci'
+    if 'cell_band' in relations_df.columns and 'band' not in relations_df.columns:
+        col_map['cell_band'] = 'band'
+    if 'cell_impact_band' in relations_df.columns and 'to_band' not in relations_df.columns:
+        col_map['cell_impact_band'] = 'to_band'
+    if 'relation_impact_data_perc' in relations_df.columns and 'weight' not in relations_df.columns:
+        col_map['relation_impact_data_perc'] = 'weight'
+
+    if col_map:
+        relations_df = relations_df.rename(columns=col_map)
+        logger.info("Normalized column names for PCI planner", mapping=col_map)
+
+    # Check if we have the required columns after mapping
+    required = ["cell_name", "to_cell_name", "pci", "to_pci", "band", "to_band", "weight"]
+    missing = [c for c in required if c not in relations_df.columns]
+    if missing:
+        logger.warning(f"Missing required columns for PCI planner: {missing} - skipping")
+        return {}
+
+    params = PCIPlannerParams.from_config(config_path)
+    planner = PCIPlanner(relations_df, params)
+
+    # Detect confusions
+    confusions = planner.detect_confusions()
+    if len(confusions) > 0:
+        output_file = output_dir / 'pci_confusions.csv'
+        confusions.to_csv(output_file, index=False)
+        logger.info("PCI confusions saved", path=str(output_file), count=len(confusions))
+
+    # Detect collisions
+    collisions = planner.detect_collisions()
+    if len(collisions) > 0:
+        output_file = output_dir / 'pci_collisions.csv'
+        collisions.to_csv(output_file, index=False)
+        logger.info("PCI collisions saved", path=str(output_file), count=len(collisions))
+
+    # Suggest blacklists
+    blacklist_df, auto_apply = planner.suggest_blacklists()
+    if len(blacklist_df) > 0:
+        output_file = output_dir / 'pci_blacklist_suggestions.csv'
+        blacklist_df.to_csv(output_file, index=False)
+        logger.info("PCI blacklist suggestions saved", path=str(output_file), count=len(blacklist_df))
+
+    return {
+        'confusions': confusions,
+        'collisions': collisions,
+        'blacklist_suggestions': blacklist_df,
+    }
+
+
+def run_pci_conflict(
+    hulls_gdf: gpd.GeoDataFrame,
+    gis_df: pd.DataFrame,
+    output_dir: Path,
+    config_path: Optional[str] = None,
+) -> pd.DataFrame:
+    """Run PCI conflict detection (hull overlap-based)."""
+    logger.info("=" * 80)
+    logger.info("Running PCI CONFLICT detection (hull overlap)")
+    logger.info("=" * 80)
+
+    if hulls_gdf is None:
+        logger.warning("Cell hulls not available - skipping PCI conflict detection")
+        return pd.DataFrame()
+
+    # Enrich hulls with band and pci info from GIS if missing
+    hulls_enriched = hulls_gdf.copy()
+
+    if gis_df is not None:
+        gis_lookup = gis_df.set_index('cell_name')
+
+        if 'band' not in hulls_enriched.columns and 'band' in gis_df.columns:
+            hulls_enriched['band'] = hulls_enriched['cell_name'].map(gis_lookup['band'].to_dict())
+            logger.info("Enriched hulls with band info from GIS data")
+
+        if 'pci' not in hulls_enriched.columns and 'pci' in gis_df.columns:
+            hulls_enriched['pci'] = hulls_enriched['cell_name'].map(gis_lookup['pci'].to_dict())
+            logger.info("Enriched hulls with PCI info from GIS data")
+
+    # Drop rows without required info
+    before_count = len(hulls_enriched)
+    hulls_enriched = hulls_enriched.dropna(subset=['band', 'pci'])
+    if len(hulls_enriched) < before_count:
+        logger.warning(f"Dropped {before_count - len(hulls_enriched)} hulls without band/pci info")
+
+    if len(hulls_enriched) == 0:
+        logger.warning("No hulls with band and PCI info - skipping PCI conflict detection")
+        return pd.DataFrame()
+
+    try:
+        params = PCIConflictParams.from_config(config_path)
+        detector = PCIConflictDetector(params)
+        results_list = detector.detect(hulls_enriched)
+
+        # Convert list of dicts to DataFrame
+        if results_list and len(results_list) > 0:
+            results = pd.DataFrame(results_list)
+            output_file = output_dir / 'pci_conflicts.csv'
+            results.to_csv(output_file, index=False)
+            logger.info("PCI conflict results saved", path=str(output_file), count=len(results))
+        else:
+            results = pd.DataFrame()
+            logger.info("No PCI conflicts detected")
+
+        return results
+    except Exception as e:
+        logger.warning(f"PCI conflict detection failed: {e}")
+        return pd.DataFrame()
+
+
+def run_ca_imbalance(
+    hulls_gdf: gpd.GeoDataFrame,
+    gis_df: pd.DataFrame,
+    output_dir: Path,
+    config_path: Optional[str] = None,
+) -> pd.DataFrame:
+    """Run CA imbalance detection."""
+    logger.info("=" * 80)
+    logger.info("Running CA IMBALANCE detection")
+    logger.info("=" * 80)
+
+    if hulls_gdf is None:
+        logger.warning("Cell hulls not available - skipping CA imbalance detection")
+        return pd.DataFrame()
+
+    if config_path is None:
+        config_path = 'config/ca_imbalance_params.json'
+
+    # Check if config exists
+    if not Path(config_path).exists():
+        logger.warning(f"CA imbalance config not found: {config_path} - skipping")
+        return pd.DataFrame()
+
+    # Enrich hulls with band info from GIS if missing
+    if 'band' not in hulls_gdf.columns and gis_df is not None and 'band' in gis_df.columns:
+        logger.info("Enriching hulls with band info from GIS data")
+        band_map = gis_df.set_index('cell_name')['band'].to_dict()
+        hulls_gdf = hulls_gdf.copy()
+        hulls_gdf['band'] = hulls_gdf['cell_name'].map(band_map)
+        # Drop rows without band info
+        before_count = len(hulls_gdf)
+        hulls_gdf = hulls_gdf.dropna(subset=['band'])
+        if len(hulls_gdf) < before_count:
+            logger.warning(f"Dropped {before_count - len(hulls_gdf)} hulls without band info")
+
+    try:
+        params = CAImbalanceParams.from_config(config_path)
+        detector = CAImbalanceDetector(params)
+        results_list = detector.detect(hulls_gdf)
+
+        # Convert list of dicts to DataFrame
+        if results_list and len(results_list) > 0:
+            results = pd.DataFrame(results_list)
+            output_file = output_dir / 'ca_imbalance.csv'
+            results.to_csv(output_file, index=False)
+            logger.info("CA imbalance results saved", path=str(output_file), count=len(results))
+        else:
+            results = pd.DataFrame()
+            logger.info("No CA imbalance issues detected")
+
+        return results
+    except Exception as e:
+        logger.warning(f"CA imbalance detection failed: {e}")
+        return pd.DataFrame()
+
+
+def run_crossed_feeder(
+    relations_df: pd.DataFrame,
+    gis_df: pd.DataFrame,
+    output_dir: Path,
+    config_path: Optional[str] = None,
+) -> pd.DataFrame:
+    """Run crossed feeder detection."""
+    logger.info("=" * 80)
+    logger.info("Running CROSSED FEEDER detection")
+    logger.info("=" * 80)
+
+    if relations_df is None:
+        logger.warning("Relations data not available - skipping crossed feeder detection")
+        return pd.DataFrame()
+
+    # Normalize column names for detector
+    # Expected REL: cell_name, to_cell_name, distance, band, to_band, intra_site, intra_cell, weight
+    col_map = {}
+    if 'cell_impact_name' in relations_df.columns and 'to_cell_name' not in relations_df.columns:
+        col_map['cell_impact_name'] = 'to_cell_name'
+    if 'cell_band' in relations_df.columns and 'band' not in relations_df.columns:
+        col_map['cell_band'] = 'band'
+    if 'cell_impact_band' in relations_df.columns and 'to_band' not in relations_df.columns:
+        col_map['cell_impact_band'] = 'to_band'
+    if 'relation_impact_data_perc' in relations_df.columns and 'weight' not in relations_df.columns:
+        col_map['relation_impact_data_perc'] = 'weight'
+
+    if col_map:
+        relations_df = relations_df.rename(columns=col_map)
+        logger.info("Normalized column names for crossed feeder", mapping=col_map)
+
+    # Derive intra_site from co_site if missing
+    if 'intra_site' not in relations_df.columns and 'co_site' in relations_df.columns:
+        relations_df['intra_site'] = relations_df['co_site'].map(lambda x: 'y' if x == 'Y' or x == 1 or x == True else 'n')
+        logger.info("Derived intra_site from co_site column")
+    elif 'intra_site' not in relations_df.columns:
+        relations_df['intra_site'] = 'n'
+        logger.info("Added default intra_site=n (no data available)")
+
+    # Derive intra_cell from co_sectored if missing
+    if 'intra_cell' not in relations_df.columns and 'co_sectored' in relations_df.columns:
+        relations_df['intra_cell'] = relations_df['co_sectored'].map(lambda x: 'y' if x == 'Y' or x == 1 or x == True else 'n')
+        logger.info("Derived intra_cell from co_sectored column")
+    elif 'intra_cell' not in relations_df.columns:
+        relations_df['intra_cell'] = 'n'
+        logger.info("Added default intra_cell=n (no data available)")
+
+    # Check required columns
+    required = ["cell_name", "to_cell_name", "distance", "band", "to_band", "intra_site", "intra_cell", "weight"]
+    missing = [c for c in required if c not in relations_df.columns]
+    if missing:
+        logger.warning(f"Missing required columns for crossed feeder: {missing} - skipping")
+        return pd.DataFrame()
+
+    params = CrossedFeederParams.from_config(config_path)
+    detector = CrossedFeederDetector(params)
+    results = detector.detect(relations_df, gis_df)
+
+    # Results is a dict: relation_scores, cell_scores, site_summary, cosectored_anomalies
+    cell_scores = results.get('cell_scores', pd.DataFrame())
+    site_summary = results.get('site_summary', pd.DataFrame())
+
+    if len(cell_scores) > 0:
+        output_file = output_dir / 'crossed_feeder_cells.csv'
+        cell_scores.to_csv(output_file, index=False)
+        logger.info("Crossed feeder cell scores saved", path=str(output_file), count=len(cell_scores))
+
+    if len(site_summary) > 0:
+        output_file = output_dir / 'crossed_feeder_sites.csv'
+        site_summary.to_csv(output_file, index=False)
+        logger.info("Crossed feeder site summary saved", path=str(output_file), count=len(site_summary))
+
+    # Return flagged cells for summary
+    if len(cell_scores) > 0 and 'flagged' in cell_scores.columns:
+        flagged = cell_scores[cell_scores['flagged'] == True]
+        logger.info("Crossed feeders flagged", count=len(flagged))
+        return flagged
+    else:
+        logger.info("No crossed feeders detected")
+        return pd.DataFrame()
 
 
 def run_all(
@@ -373,6 +827,7 @@ def run_all(
     grid_df = data['grid_df']
     gis_df = data['gis_df']
     hulls_gdf = data['hulls_gdf']
+    relations_df = data['relations_df']
 
     # Load or create environment classification
     env_output_path = output_dir / 'cell_environment.csv'
@@ -382,6 +837,11 @@ def run_all(
     overshooting_config = str(config_dir / 'overshooting_params.json') if config_dir else None
     undershooting_config = str(config_dir / 'undershooting_params.json') if config_dir else None
     coverage_config = str(config_dir / 'coverage_gaps.json') if config_dir else None
+    interference_config = str(config_dir / 'interference_params.json') if config_dir else None
+    pci_config = str(config_dir / 'pci_planner_params.json') if config_dir else None
+    pci_conflict_config = str(config_dir / 'pci_conflict_params.json') if config_dir else None
+    ca_imbalance_config = str(config_dir / 'ca_imbalance_params.json') if config_dir else None
+    crossed_feeder_config = str(config_dir / 'crossed_feeder_params.json') if config_dir else None
 
     results = {}
     overshooting_grids = None
@@ -423,12 +883,58 @@ def run_all(
             boundary_shapefile=boundary_path,
         )
 
+    # Run no coverage per band
+    if 'no_coverage_per_band' in algorithms:
+        results['no_coverage_per_band'] = run_no_coverage_per_band(
+            hulls_gdf, gis_df, output_dir,
+            config_path=coverage_config,
+            boundary_shapefile=boundary_path,
+        )
+
     # Run low coverage
     if 'low_coverage' in algorithms:
         results['low_coverage'] = run_low_coverage(
             hulls_gdf, grid_df, gis_df, output_dir,
             config_path=coverage_config,
             boundary_shapefile=boundary_path,
+        )
+
+    # Run interference detection
+    if 'interference' in algorithms:
+        results['interference'] = run_interference(
+            grid_df, output_dir,
+            config_path=interference_config,
+        )
+
+    # Run PCI planner
+    if 'pci' in algorithms:
+        pci_results = run_pci_planner(
+            relations_df, output_dir,
+            config_path=pci_config,
+        )
+        results['confusions'] = pci_results.get('confusions', pd.DataFrame())
+        results['collisions'] = pci_results.get('collisions', pd.DataFrame())
+        results['blacklist_suggestions'] = pci_results.get('blacklist_suggestions', pd.DataFrame())
+
+    # Run PCI conflict detection (hull overlap-based)
+    if 'pci_conflict' in algorithms:
+        results['pci_conflicts'] = run_pci_conflict(
+            hulls_gdf, gis_df, output_dir,
+            config_path=pci_conflict_config,
+        )
+
+    # Run CA imbalance detection
+    if 'ca_imbalance' in algorithms:
+        results['ca_imbalance'] = run_ca_imbalance(
+            hulls_gdf, gis_df, output_dir,
+            config_path=ca_imbalance_config,
+        )
+
+    # Run crossed feeder detection
+    if 'crossed_feeder' in algorithms:
+        results['crossed_feeder'] = run_crossed_feeder(
+            relations_df, gis_df, output_dir,
+            config_path=crossed_feeder_config,
         )
 
     # Generate daily resolution recommendations
@@ -468,8 +974,9 @@ def run_all(
         undershooting_grid_df = None
 
         # Determine the column name mappings for grid_df
+        # Only rename if the destination column doesn't already exist to avoid duplicates
         col_map = {}
-        if 'cilac' in grid_df.columns:
+        if 'cilac' in grid_df.columns and 'cell_name' not in grid_df.columns:
             col_map['cilac'] = 'cell_name'
         if 'grid' in grid_df.columns and 'geohash7' not in grid_df.columns:
             col_map['grid'] = 'geohash7'
@@ -556,10 +1063,18 @@ def run_all(
             undershooting_df=results.get('undershooting'),
             gis_df=gis_df,
             no_coverage_gdf=results.get('no_coverage'),
+            no_coverage_per_band_gdfs=results.get('no_coverage_per_band'),
             low_coverage_gdfs=results.get('low_coverage'),
             overshooting_grid_df=overshooting_grid_df,
             undershooting_grid_df=undershooting_grid_df,
             cell_hulls_gdf=hulls_gdf,
+            # New detector DataFrames
+            pci_confusions_df=results.get('confusions'),
+            pci_collisions_df=results.get('collisions'),
+            pci_blacklist_df=results.get('blacklist_suggestions'),
+            ca_imbalance_df=results.get('ca_imbalance'),
+            crossed_feeder_df=results.get('crossed_feeder'),
+            interference_gdf=results.get('interference'),
             output_file=map_output,
             title="RAN Optimizer - Network Issues Dashboard",
         )
@@ -577,7 +1092,14 @@ def run_all(
                 overshooting_count=len(results.get('overshooting', [])),
                 undershooting_count=len(results.get('undershooting', [])),
                 no_coverage_clusters=len(results.get('no_coverage', [])),
-                low_coverage_bands=len(results.get('low_coverage', {})))
+                low_coverage_bands=len(results.get('low_coverage', {})),
+                interference_clusters=len(results.get('interference', [])),
+                pci_confusions=len(results.get('confusions', [])),
+                pci_collisions=len(results.get('collisions', [])),
+                pci_conflicts=len(results.get('pci_conflicts', [])),
+                blacklist_suggestions=len(results.get('blacklist_suggestions', [])),
+                ca_imbalance_count=len(results.get('ca_imbalance', [])),
+                crossed_feeders=len(results.get('crossed_feeder', [])))
 
     return results
 
