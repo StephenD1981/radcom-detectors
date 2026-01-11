@@ -104,6 +104,25 @@ BAND_MAX_RADIUS_M = {
 }
 DEFAULT_MAX_RADIUS_M = 32000  # Default for unknown bands
 
+# Technology prefixes for same-tech filtering
+TECH_PREFIXES = {
+    'L': 'LTE',    # L700, L800, L900, L1800, L2100, L2600
+    'N': 'NR',     # N78, N258 (5G NR)
+    'U': 'UMTS',   # U900, U2100
+    'G': 'GSM',    # G900, G1800
+}
+
+
+def _get_tech_from_band(band: str) -> str:
+    """Extract technology from band string (e.g., 'L800' -> 'LTE')."""
+    if not band or not isinstance(band, str):
+        return 'UNKNOWN'
+    band_upper = band.upper().strip()
+    if not band_upper:
+        return 'UNKNOWN'
+    prefix = band_upper[0]
+    return TECH_PREFIXES.get(prefix, 'UNKNOWN')
+
 
 @dataclass
 class CrossedFeederParams:
@@ -350,6 +369,26 @@ class CrossedFeederDetector:
         """Build per-relation geometry and suspiciousness score."""
         cfg = self.params
 
+        # Filter to same-technology relations before GIS merge
+        # This ensures data quality metrics only consider valid same-tech relations
+        rel["_src_tech"] = rel["band"].apply(_get_tech_from_band)
+        rel["_tgt_tech"] = rel["to_band"].apply(_get_tech_from_band)
+
+        total_before_tech_filter = len(rel)
+        rel = rel[rel["_src_tech"] == rel["_tgt_tech"]].copy()
+        cross_tech_dropped = total_before_tech_filter - len(rel)
+
+        if cross_tech_dropped > 0:
+            logger.info(
+                "Filtered to same-technology relations",
+                same_tech_relations=len(rel),
+                cross_tech_dropped=cross_tech_dropped,
+                total_before=total_before_tech_filter,
+            )
+
+        # Clean up temp columns
+        rel = rel.drop(columns=["_src_tech", "_tgt_tech"])
+
         # Join GIS for serving cell
         gis_s = gis.rename(
             columns={
@@ -398,9 +437,9 @@ class CrossedFeederDetector:
         df = df.dropna(subset=["bearing", "hbw", "lat", "lon", "to_lat", "to_lon"]).copy()
         dropped = before - len(df)
         if dropped > 0:
-            logger.warning(f"Dropped {dropped} relations due to missing GIS geometry")
+            logger.warning(f"Dropped {dropped} same-tech relations due to missing GIS geometry")
 
-            # Data quality check: warn if too much data dropped
+            # Data quality check: warn if too much same-tech data dropped
             drop_ratio = dropped / before if before > 0 else 0
             if drop_ratio > cfg.max_data_drop_ratio:
                 logger.error(
@@ -409,7 +448,7 @@ class CrossedFeederDetector:
                     total=before,
                     drop_ratio=round(drop_ratio, 2),
                     threshold=cfg.max_data_drop_ratio,
-                    message=f"High data drop rate ({drop_ratio:.1%}) - check GIS data quality"
+                    message=f"High same-tech data drop rate ({drop_ratio:.1%}) - check GIS data quality"
                 )
 
         # Beam sanity filter

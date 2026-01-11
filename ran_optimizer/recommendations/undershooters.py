@@ -518,8 +518,10 @@ class UndershooterDetector:
             how='inner'
         )
 
-        # Step 6: Calculate uptilt impact
-        filtered = self._calculate_uptilt_impact(filtered)
+        # Step 6: Calculate uptilt impact with environment-specific path loss exponents
+        filtered = self._calculate_uptilt_impact_by_environment(
+            filtered, cell_env_map, env_params
+        )
 
         # Step 7: Select recommendations using per-cell thresholds
         undershooters = self._select_recommendations_by_environment(
@@ -627,6 +629,10 @@ class UndershooterDetector:
     ) -> pd.DataFrame:
         """
         Select uptilt recommendations using per-cell environment thresholds (vectorized).
+
+        Cells with physical constraints (e.g., already at 0° tilt) are still included
+        in the output with a flag indicating the constraint, as they may indicate
+        physical build issues that should be investigated.
         """
         # Build environment-based threshold lookups
         env_min_cov_2deg = {env: p.min_coverage_increase_2deg for env, p in env_params.items()}
@@ -654,6 +660,9 @@ class UndershooterDetector:
             (dist_gain_1deg >= min_dist_1deg)
         )
 
+        # Identify cells with physical constraints (can't uptilt)
+        has_constraint = candidates['uptilt_constraint'].notna() if 'uptilt_constraint' in candidates.columns else pd.Series(False, index=candidates.index)
+
         # Apply recommendations using np.select
         conditions = [meets_2deg, meets_1deg]
         candidates['recommended_uptilt_deg'] = np.select(conditions, [2, 1], default=0)
@@ -668,11 +677,31 @@ class UndershooterDetector:
             default=0.0
         )
 
-        # Filter to only cells with valid recommendations
-        undershooters = candidates[candidates['recommended_uptilt_deg'] > 0].copy()
+        # Add physical constraint note for cells that can't uptilt
+        # These cells are undershooting but can't be fixed via tilt - may indicate physical build issue
+        if 'uptilt_constraint' in candidates.columns:
+            candidates['physical_constraint_note'] = candidates['uptilt_constraint'].apply(
+                lambda x: "Cell at minimum tilt (0°) - investigate physical build" if x == 'MIN_TILT_REACHED' else None
+            )
+        else:
+            candidates['physical_constraint_note'] = None
+
+        # Include cells with valid recommendations OR physical constraints
+        # (physical constraints indicate potential build issues worth investigating)
+        has_recommendation = candidates['recommended_uptilt_deg'] > 0
+        undershooters = candidates[has_recommendation | has_constraint].copy()
 
         if len(undershooters) == 0:
             return pd.DataFrame()
+
+        # Log constraint info
+        constrained_count = has_constraint.sum()
+        if constrained_count > 0:
+            logger.info(
+                "Cells with physical constraints included in output",
+                constrained_cells=constrained_count,
+                note="These cells are undershooting but can't uptilt - investigate physical build"
+            )
 
         # Add coverage expansion metrics
         undershooters = self._add_coverage_metrics(undershooters)
@@ -680,14 +709,14 @@ class UndershooterDetector:
         # Calculate severity scores
         undershooters = self._calculate_severity_scores(undershooters, grid_df)
 
-        # Select final columns
+        # Select final columns (including new physical_constraint_note)
         output_cols = [
             'cell_name', 'max_distance_m', 'total_grids', 'interference_grids',
             'interference_percentage', 'total_traffic', 'tilt_mech', 'tilt_elc',
             'recommended_uptilt_deg', 'new_max_distance_m', 'coverage_increase_percentage',
             'current_coverage_grids', 'current_distance_m', 'distance_increase_m',
             'new_coverage_grids', 'total_coverage_after_uptilt',
-            'severity_score', 'severity_category'
+            'severity_score', 'severity_category', 'physical_constraint_note'
         ]
         available_cols = [c for c in output_cols if c in undershooters.columns]
 
@@ -909,6 +938,135 @@ class UndershooterDetector:
         candidates['coverage_increase_2deg_pct'] = uptilt_2deg[1]
 
         return candidates
+
+    def _calculate_uptilt_impact_by_environment(
+        self,
+        candidates: pd.DataFrame,
+        cell_env_map: dict,
+        env_params: dict,
+    ) -> pd.DataFrame:
+        """
+        Calculate predicted impact of 1° and 2° uptilt using environment-specific path loss exponents.
+
+        Args:
+            candidates: DataFrame with cell info including tilt and antenna height
+            cell_env_map: Dict mapping cell_name to environment ('urban', 'suburban', 'rural')
+            env_params: Dict mapping environment name to UndershooterParams
+
+        Returns:
+            DataFrame with uptilt impact columns added
+        """
+        def get_path_loss_exponent(cell_name: str) -> float:
+            """Get path loss exponent for a cell based on its environment."""
+            env = cell_env_map.get(str(cell_name), 'suburban')
+            params = env_params.get(env, env_params['suburban'])
+            return params.path_loss_exponent
+
+        # Calculate for 1 degree uptilt
+        uptilt_1deg = candidates.apply(
+            lambda row: self._estimate_distance_after_tilt_with_ple(
+                d_max_m=row['max_distance_m'],
+                alpha_deg=row['tilt_elc'] + row['tilt_mech'],
+                h_m=row['antenna_height'],
+                delta_tilt_deg=-1.0,  # negative = uptilt
+                path_loss_exponent=get_path_loss_exponent(row['cell_name'])
+            ),
+            axis=1,
+            result_type='expand'
+        )
+
+        candidates['new_distance_1deg_m'] = uptilt_1deg[0]
+        candidates['coverage_increase_1deg_pct'] = uptilt_1deg[1]
+        candidates['uptilt_constraint'] = uptilt_1deg[2]
+
+        # Calculate for 2 degrees uptilt
+        uptilt_2deg = candidates.apply(
+            lambda row: self._estimate_distance_after_tilt_with_ple(
+                d_max_m=row['max_distance_m'],
+                alpha_deg=row['tilt_elc'] + row['tilt_mech'],
+                h_m=row['antenna_height'],
+                delta_tilt_deg=-2.0,  # negative = uptilt
+                path_loss_exponent=get_path_loss_exponent(row['cell_name'])
+            ),
+            axis=1,
+            result_type='expand'
+        )
+
+        candidates['new_distance_2deg_m'] = uptilt_2deg[0]
+        candidates['coverage_increase_2deg_pct'] = uptilt_2deg[1]
+
+        logger.info(
+            "Calculated uptilt impact with environment-specific path loss exponents",
+            cells_with_constraint=candidates['uptilt_constraint'].notna().sum(),
+        )
+
+        return candidates
+
+    def _estimate_distance_after_tilt_with_ple(
+        self,
+        d_max_m: float,
+        alpha_deg: float,
+        h_m: float,
+        delta_tilt_deg: float,
+        path_loss_exponent: float
+    ) -> Tuple[float, float, Optional[str]]:
+        """
+        Estimate new max coverage distance after changing tilt.
+
+        Uses 3GPP antenna pattern and log-distance path loss model with
+        environment-specific path loss exponent.
+
+        Parameters
+        ----------
+        d_max_m : float
+            Current maximum serving distance (meters)
+        alpha_deg : float
+            Current total downtilt (mechanical + electrical, degrees)
+        h_m : float
+            Antenna height above UE (meters)
+        delta_tilt_deg : float
+            Tilt change (negative for uptilt, positive for downtilt)
+        path_loss_exponent : float
+            Path loss exponent (varies by environment: urban=4.0, suburban=3.5, rural=3.0)
+
+        Returns
+        -------
+        Tuple[float, float, Optional[str]]
+            - new_distance_m: Predicted new maximum distance
+            - increase_pct: Fractional increase (e.g., 0.15 = 15% increase)
+            - constraint: None if no constraint, or string describing physical limitation
+        """
+        constraint = None
+
+        # Check if cell is already at minimum tilt (can't uptilt further)
+        if alpha_deg <= 0 and delta_tilt_deg < 0:
+            # Cell at 0° or negative tilt - can't uptilt, flag as physical build constraint
+            constraint = "MIN_TILT_REACHED"
+            return d_max_m, 0.0, constraint
+
+        if d_max_m <= 0 or h_m < 0:
+            return d_max_m, 0.0, constraint
+
+        # Elevation angle from site to current edge user
+        theta_e_deg = math.degrees(math.atan2(h_m, d_max_m))
+
+        # 3GPP vertical attenuation before/after
+        A_before = self._vertical_attenuation(theta_e_deg, alpha_deg)
+        A_after = self._vertical_attenuation(theta_e_deg, alpha_deg + delta_tilt_deg)
+
+        # Gain change at edge direction (dB)
+        deltaG_dB = -(A_after - A_before)
+
+        # Translate to distance using log-distance model with environment-specific exponent
+        d_new_m = d_max_m * (10.0 ** (deltaG_dB / (10.0 * path_loss_exponent)))
+
+        # For uptilt, don't allow decrease
+        if d_new_m < d_max_m:
+            d_new_m = d_max_m
+
+        increase_pct = (d_new_m - d_max_m) / d_max_m
+
+        return d_new_m, increase_pct, constraint
 
     def _estimate_distance_after_tilt(
         self,

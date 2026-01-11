@@ -12,7 +12,7 @@ import time
 import threading
 
 PORT = 8888
-DIRECTORY = Path("data/output-data/vf-ie/recommendations/maps").resolve()
+DIRECTORY = Path("data/vf-ie/output-data/maps").resolve()
 
 
 class Handler(http.server.SimpleHTTPRequestHandler):
@@ -28,7 +28,7 @@ class Handler(http.server.SimpleHTTPRequestHandler):
 def open_browser():
     """Open browser after short delay to allow server to start."""
     time.sleep(1)
-    url = f"http://localhost:{PORT}/overshooting_cells_map.html"
+    url = f"http://localhost:{PORT}/enhanced_dashboard.html"
     print(f"\n🌐 Opening browser to: {url}")
     webbrowser.open(url)
 
@@ -39,15 +39,15 @@ if __name__ == "__main__":
     print("="*80)
     print(f"\n📁 Serving directory: {DIRECTORY}")
     print(f"🌐 Server URL: http://localhost:{PORT}")
-    print(f"📄 Map URL: http://localhost:{PORT}/overshooting_cells_map.html")
+    print(f"📄 Map URL: http://localhost:{PORT}/enhanced_dashboard.html")
     print(f"\n✅ Server starting...")
     print(f"   Press Ctrl+C to stop\n")
 
     # Check if map file exists
-    map_file = DIRECTORY / "overshooting_cells_map.html"
+    map_file = DIRECTORY / "enhanced_dashboard.html"
     if not map_file.exists():
         print(f"❌ Error: Map file not found at {map_file}")
-        print(f"   Please run test_visualize_overshooters.py first")
+        print(f"   Please run the pipeline first: python -m ran_optimizer.runner")
         exit(1)
 
     # Start browser in background thread
