@@ -15,7 +15,7 @@ based on customer device measurements.
 
 import geopandas as gpd
 import pandas as pd
-import re
+from datetime import datetime, timedelta
 from typing import List, Dict, Any, Optional
 from dataclasses import dataclass, field
 
@@ -42,6 +42,7 @@ class CAImbalanceParams:
         'critical': 0.30,
         'high': 0.50,
         'medium': 0.60,
+        'warning': 0.70,
         'low': 1.00
     })
     environment_thresholds: Dict[str, Dict[str, float]] = field(default_factory=lambda: {
@@ -50,6 +51,13 @@ class CAImbalanceParams:
         'rural': {'coverage_threshold': 0.60}
     })
     use_environment_thresholds: bool = False
+    # Data quality thresholds
+    min_sample_count: int = 100  # Minimum UE measurement points for hull confidence
+    sample_count_column: str = 'sample_count'  # Column name for sample count in hulls_gdf
+    # Temporal alignment thresholds
+    timestamp_column: str = 'data_timestamp'  # Column name for hull data timestamp
+    max_data_age_days: int = 30  # Maximum age of hull data in days
+    max_temporal_gap_days: int = 7  # Maximum gap between coverage and capacity hull timestamps
 
     @classmethod
     def from_config(cls, config_path: str) -> 'CAImbalanceParams':
@@ -90,7 +98,7 @@ class CAImbalanceParams:
 
         # Get default severity/environment thresholds
         default_severity = {
-            'critical': 0.30, 'high': 0.50, 'medium': 0.60, 'low': 1.00
+            'critical': 0.30, 'high': 0.50, 'medium': 0.60, 'warning': 0.70, 'low': 1.00
         }
         default_env = {
             'urban': {'coverage_threshold': 0.85},
@@ -104,6 +112,11 @@ class CAImbalanceParams:
             severity_thresholds=config.get('severity_thresholds', default_severity),
             environment_thresholds=config.get('environment_thresholds', default_env),
             use_environment_thresholds=config.get('use_environment_thresholds', False),
+            min_sample_count=config.get('min_sample_count', 100),
+            sample_count_column=config.get('sample_count_column', 'sample_count'),
+            timestamp_column=config.get('timestamp_column', 'data_timestamp'),
+            max_data_age_days=config.get('max_data_age_days', 30),
+            max_temporal_gap_days=config.get('max_temporal_gap_days', 7),
         )
 
 
@@ -211,6 +224,52 @@ class CAImbalanceDetector:
         if len(hulls_gdf) == 0:
             raise ValueError("GeoDataFrame is empty after filtering invalid geometry types")
 
+        # Check for sample count (data confidence) if column exists
+        sample_col = self.params.sample_count_column
+        if sample_col in hulls_gdf.columns:
+            min_samples = self.params.min_sample_count
+            low_confidence_mask = hulls_gdf[sample_col] < min_samples
+            low_confidence_count = low_confidence_mask.sum()
+
+            if low_confidence_count > 0:
+                low_conf_cells = hulls_gdf.loc[low_confidence_mask, 'cell_name'].head(5).tolist()
+                logger.warning(
+                    f"Found {low_confidence_count} hulls with <{min_samples} UE samples (low confidence)",
+                    sample_cells=low_conf_cells,
+                )
+
+        # Check temporal alignment if timestamp column exists
+        ts_col = self.params.timestamp_column
+        if ts_col in hulls_gdf.columns:
+            try:
+                timestamps = pd.to_datetime(hulls_gdf[ts_col], errors='coerce')
+                valid_timestamps = timestamps.dropna()
+
+                if len(valid_timestamps) > 0:
+                    now = datetime.now()
+                    oldest = valid_timestamps.min()
+                    newest = valid_timestamps.max()
+                    data_age_days = (now - newest).days
+                    data_span_days = (newest - oldest).days
+
+                    # Warn if data is too old
+                    if data_age_days > self.params.max_data_age_days:
+                        logger.warning(
+                            f"Hull data is {data_age_days} days old (max recommended: {self.params.max_data_age_days})",
+                            newest_data=newest.isoformat(),
+                        )
+
+                    # Warn if data spans too long a period (potential inconsistency)
+                    if data_span_days > self.params.max_temporal_gap_days:
+                        logger.warning(
+                            f"Hull data spans {data_span_days} days (max recommended: {self.params.max_temporal_gap_days}). "
+                            "Consider using data from a narrower time window for consistency.",
+                            oldest_data=oldest.isoformat(),
+                            newest_data=newest.isoformat(),
+                        )
+            except Exception as e:
+                logger.warning(f"Could not parse timestamp column '{ts_col}': {e}")
+
         valid_count = len(hulls_gdf)
         logger.info(
             f"Input validation: {valid_count}/{initial_count} cells valid",
@@ -247,8 +306,19 @@ class CAImbalanceDetector:
         # Create site_sector column (e.g., "CK001_1")
         valid_cells['site_sector'] = extracted['site_id'] + '_' + extracted['sector']
 
+        # Log cells where parsing failed before filtering them out
+        parse_failed_mask = valid_cells['site_sector'].isna()
+        parse_failed_count = parse_failed_mask.sum()
+
+        if parse_failed_count > 0:
+            failed_cell_names = valid_cells.loc[parse_failed_mask, 'cell_name'].head(10).tolist()
+            logger.warning(
+                f"Failed to parse {parse_failed_count} cell names with pattern '{pattern}'",
+                sample_failed_cells=failed_cell_names,
+            )
+
         # Filter out cells where parsing failed
-        valid_cells = valid_cells[valid_cells['site_sector'].notna()].copy()
+        valid_cells = valid_cells[~parse_failed_mask].copy()
 
         logger.info(f"Successfully parsed {len(valid_cells)} cell names")
 
@@ -294,16 +364,46 @@ class CAImbalanceDetector:
 
             pairs_with_both_bands += 1
 
-            # Get the coverage and capacity cells
-            coverage_cell = group[group['band'] == ca_pair.coverage_band].iloc[0]
-            capacity_cell = group[group['band'] == ca_pair.capacity_band].iloc[0]
+            # Get cells for each band (may have multiple cells per band in advanced deployments)
+            coverage_cells = group[group['band'] == ca_pair.coverage_band]
+            capacity_cells = group[group['band'] == ca_pair.capacity_band]
 
-            # Get accurate areas from projected CRS calculation
+            # Handle multiple cells per band - use the one with largest area (most representative)
+            if len(coverage_cells) > 1:
+                logger.info(
+                    f"Multiple {ca_pair.coverage_band} cells at {site_sector}, using largest by area",
+                    cell_count=len(coverage_cells),
+                )
+                coverage_cell = coverage_cells.loc[coverage_cells['area_km2'].idxmax()]
+            else:
+                coverage_cell = coverage_cells.iloc[0]
+
+            if len(capacity_cells) > 1:
+                logger.info(
+                    f"Multiple {ca_pair.capacity_band} cells at {site_sector}, using largest by area",
+                    cell_count=len(capacity_cells),
+                )
+                capacity_cell = capacity_cells.loc[capacity_cells['area_km2'].idxmax()]
+            else:
+                capacity_cell = capacity_cells.iloc[0]
+
+            # Get geometries and areas
+            coverage_geom = coverage_cell['geometry']
+            capacity_geom = capacity_cell['geometry']
             coverage_area_km2 = coverage_cell['area_km2']
             capacity_area_km2 = capacity_cell['area_km2']
 
-            # Calculate coverage ratio (capacity / coverage)
-            coverage_ratio = capacity_area_km2 / coverage_area_km2 if coverage_area_km2 > 0 else 0
+            # Calculate intersection area - this is what matters for CA capability
+            # CA requires UE to be in BOTH coverage and capacity cell footprints
+            if coverage_geom.is_valid and capacity_geom.is_valid:
+                intersection = coverage_geom.intersection(capacity_geom)
+                intersection_area_km2 = intersection.area / 1_000_000 if not intersection.is_empty else 0
+            else:
+                logger.warning(f"Invalid geometry for {site_sector}, skipping intersection calculation")
+                intersection_area_km2 = 0
+
+            # Coverage ratio = intersection / coverage area (what % of coverage band has CA capability)
+            coverage_ratio = intersection_area_km2 / coverage_area_km2 if coverage_area_km2 > 0 else 0
 
             # Determine threshold (environment-aware if enabled)
             site_id = site_sector.split('_')[0]
@@ -328,6 +428,7 @@ class CAImbalanceDetector:
                     'capacity_cell_name': capacity_cell['cell_name'],
                     'coverage_area_km2': round(coverage_area_km2, 2),
                     'capacity_area_km2': round(capacity_area_km2, 2),
+                    'intersection_area_km2': round(intersection_area_km2, 2),
                     'coverage_ratio': round(coverage_ratio, 3),
                     'coverage_percentage': round(coverage_ratio * 100, 1),
                     'threshold_percentage': round(effective_threshold * 100, 1),
@@ -358,12 +459,14 @@ class CAImbalanceDetector:
         """Calculate severity based on coverage ratio."""
         thresholds = self.params.severity_thresholds
 
-        if coverage_ratio < thresholds['critical']:
+        if coverage_ratio < thresholds.get('critical', 0.30):
             return 'critical'
-        elif coverage_ratio < thresholds['high']:
+        elif coverage_ratio < thresholds.get('high', 0.50):
             return 'high'
-        elif coverage_ratio < thresholds['medium']:
+        elif coverage_ratio < thresholds.get('medium', 0.60):
             return 'medium'
+        elif coverage_ratio < thresholds.get('warning', 0.70):
+            return 'warning'
         else:
             return 'low'
 
@@ -376,24 +479,24 @@ class CAImbalanceDetector:
         coverage_ratio: float,
         threshold: float
     ) -> str:
-        """Generate recommendation for improving capacity band coverage."""
-        coverage_pct = coverage_ratio * 100
+        """Generate recommendation for improving capacity band coverage overlap."""
+        overlap_pct = coverage_ratio * 100
         threshold_pct = threshold * 100
-        gap_pct = threshold_pct - coverage_pct
+        gap_pct = 100 - overlap_pct
 
         return (
-            f"{capacity_band} cell '{capacity_cell}' provides only {coverage_pct:.1f}% coverage of its "
-            f"{coverage_band} counterpart '{coverage_cell}' (threshold: {threshold_pct:.0f}%). "
-            f"This leaves {gap_pct:.1f}% of {coverage_band} coverage without {capacity_band}, "
-            f"preventing carrier aggregation in those areas. "
-            f"Recommendation: Increase {capacity_band} transmit power, adjust antenna tilt/azimuth, "
-            f"or add additional {capacity_band} capacity to match {coverage_band} footprint."
+            f"{capacity_band} cell '{capacity_cell}' overlaps only {overlap_pct:.1f}% of "
+            f"{coverage_band} cell '{coverage_cell}' footprint (threshold: {threshold_pct:.0f}%). "
+            f"This means {gap_pct:.1f}% of {coverage_band} coverage area cannot use carrier aggregation "
+            f"with {capacity_band}. "
+            f"Recommendation: Adjust {capacity_band} antenna tilt/azimuth to better align with "
+            f"{coverage_band} coverage, or increase {capacity_band} transmit power to extend footprint."
         )
 
 
 def detect_ca_imbalance(
     hulls_gdf: gpd.GeoDataFrame,
-    params: Optional[CAImbalanceParams] = None,
+    params: CAImbalanceParams,
     site_environments: Optional[Dict[str, str]] = None,
 ) -> pd.DataFrame:
     """
@@ -401,12 +504,18 @@ def detect_ca_imbalance(
 
     Args:
         hulls_gdf: GeoDataFrame with cell hulls (cell_name, geometry, band)
-        params: Optional detection parameters
+        params: Detection parameters (required - use CAImbalanceParams.from_config())
         site_environments: Optional dict mapping site_id to environment
 
     Returns:
         DataFrame with CA imbalance results
+
+    Raises:
+        ValueError: If params is not provided (network-specific config required)
     """
+    if params is None:
+        raise ValueError("params is required - CA imbalance detection requires network-specific configuration")
+
     detector = CAImbalanceDetector(params)
     issues = detector.detect(hulls_gdf, site_environments)
 
