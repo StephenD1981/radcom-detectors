@@ -4,7 +4,9 @@ PCI Confusion & Collision Planner - Handover Relation Based PCI Analysis.
 This detector identifies PCI issues using directed handover relations:
 1. PCI Confusion: Serving cell has 2+ neighbors sharing the same PCI (measurement ambiguity)
 2. PCI Collision: Relevant cells share the same PCI (neighbors + optional 2-hop)
-3. Blacklist Suggestions: Identifies dead or low-activity relations to remove
+3. Mod 3 Conflict: Same PCI mod 3 causes PSS interference (3GPP TS 36.211 Section 6.11)
+4. Mod 30 Conflict: Same PCI mod 30 causes RS interference (3GPP TS 36.211 Section 6.10)
+5. Blacklist Suggestions: Identifies dead or low-activity relations to remove
 
 Key Features:
 - Traffic-weighted severity (based on actual HO volumes)
@@ -12,6 +14,8 @@ Key Features:
 - Conservative auto-blacklisting (dead both ways only)
 - Distance-based collision filtering (default: 30 km radius)
 - 2-hop collision detection for comprehensive analysis
+- PCI range validation per 3GPP (LTE: 0-503, NR: 0-1007)
+- Per-band PCI domain tracking for mixed LTE/NR networks
 """
 
 from __future__ import annotations
@@ -26,9 +30,43 @@ from ran_optimizer.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
 
-# Constants
-LTE_PCI_MAX = 503
-NR_PCI_MAX = 1007
+# Constants per 3GPP TS 36.211 (LTE) and TS 38.211 (NR)
+LTE_PCI_MAX = 503   # LTE: 504 PCIs (0-503)
+NR_PCI_MAX = 1007   # NR: 1008 PCIs (0-1007)
+
+
+def get_pci_max_for_band(band: str) -> int:
+    """
+    Get maximum valid PCI for a specific band per 3GPP specifications.
+
+    Args:
+        band: Band identifier (e.g., 'L800', 'N78', 'B1')
+
+    Returns:
+        Maximum PCI value (503 for LTE, 1007 for NR)
+    """
+    band_upper = str(band).strip().upper()
+    # NR bands start with 'N' (e.g., N78, N260) or contain 'NR'
+    if band_upper.startswith('N') or 'NR' in band_upper:
+        return NR_PCI_MAX
+    return LTE_PCI_MAX
+
+
+def validate_pci_for_band(pci: int, band: str) -> bool:
+    """
+    Validate that PCI is within valid range for the band's technology.
+
+    Args:
+        pci: PCI value to validate
+        band: Band identifier
+
+    Returns:
+        True if PCI is valid, False otherwise
+    """
+    if pci < 0:
+        return False
+    pci_max = get_pci_max_for_band(band)
+    return pci <= pci_max
 
 
 def log1p_safe(x: float) -> float:
@@ -132,6 +170,17 @@ class PCIPlannerParams:
     low_activity_max_share: float = 0.001
     low_activity_max_single_dir: float = 5.0
 
+    # Mod 3/30 interference detection per 3GPP TS 36.211
+    # Mod 3: PSS (Primary Sync Signal) uses 3 sequences - same mod 3 causes cell search confusion
+    # Mod 30: RS (Reference Signal) uses 30 cyclic shifts - same mod 30 causes RSRP errors
+    detect_mod3_conflicts: bool = True   # PSS interference detection
+    detect_mod30_conflicts: bool = False  # RS interference (disabled by default, many hits)
+    mod3_severity_factor: float = 0.5    # Severity multiplier for mod 3 conflicts
+    mod30_severity_factor: float = 0.3   # Severity multiplier for mod 30 conflicts
+
+    # PCI validation
+    validate_pci_range: bool = True      # Validate PCI within 3GPP range per band
+
     @classmethod
     def from_config(cls, config_path: Optional[str] = None) -> 'PCIPlannerParams':
         """Load parameters from config file or use defaults."""
@@ -163,6 +212,11 @@ class PCIPlannerParams:
                 low_activity_max_act=params.get('low_activity_max_act', 5.0),
                 low_activity_max_share=params.get('low_activity_max_share', 0.001),
                 low_activity_max_single_dir=params.get('low_activity_max_single_dir', 5.0),
+                detect_mod3_conflicts=params.get('detect_mod3_conflicts', True),
+                detect_mod30_conflicts=params.get('detect_mod30_conflicts', False),
+                mod3_severity_factor=params.get('mod3_severity_factor', 0.5),
+                mod30_severity_factor=params.get('mod30_severity_factor', 0.3),
+                validate_pci_range=params.get('validate_pci_range', True),
             )
         except Exception as e:
             logger.warning(f"Failed to load config: {e}. Using defaults.")
@@ -290,7 +344,7 @@ class PCIPlanner:
                 link_df["to_cell_name"].astype(str)
             ))
             self.cosector_gid, self.cosector_members = build_union_find_groups(cosector_pairs)
-            logger.info(f"Found {len(self.cosector_members)} co-sector groups")
+            logger.info("cosector_groups_found", count=len(self.cosector_members))
         else:
             self.cosector_gid, self.cosector_members = {}, {}
 
@@ -301,6 +355,53 @@ class PCIPlanner:
         df["weight"] = pd.to_numeric(df["weight"], errors="coerce").fillna(0.0)
         df["pci"] = pd.to_numeric(df["pci"], errors="coerce").fillna(-1).astype(int)
         df["to_pci"] = pd.to_numeric(df["to_pci"], errors="coerce").fillna(-1).astype(int)
+
+        # Validate PCI ranges per 3GPP standards (per-band validation)
+        if self.params.validate_pci_range:
+            initial_count = len(df)
+
+            # Validate serving cell PCI
+            df["_pci_max"] = df["band"].apply(get_pci_max_for_band)
+            invalid_serving_pci = (df["pci"] < 0) | (df["pci"] > df["_pci_max"])
+
+            # Validate neighbor cell PCI
+            df["_to_pci_max"] = df["to_band"].apply(get_pci_max_for_band)
+            invalid_neighbor_pci = (df["to_pci"] < 0) | (df["to_pci"] > df["_to_pci_max"])
+
+            invalid_pci_mask = invalid_serving_pci | invalid_neighbor_pci
+
+            if invalid_pci_mask.any():
+                invalid_count = invalid_pci_mask.sum()
+                # Log examples of invalid PCIs
+                invalid_examples = df[invalid_pci_mask].head(5)
+                for _, row in invalid_examples.iterrows():
+                    if row["pci"] < 0 or row["pci"] > row["_pci_max"]:
+                        logger.warning(
+                            "invalid_serving_pci",
+                            cell=row["cell_name"],
+                            pci=row["pci"],
+                            band=row["band"],
+                            max_valid=row["_pci_max"],
+                        )
+                    if row["to_pci"] < 0 or row["to_pci"] > row["_to_pci_max"]:
+                        logger.warning(
+                            "invalid_neighbor_pci",
+                            cell=row["to_cell_name"],
+                            pci=row["to_pci"],
+                            band=row["to_band"],
+                            max_valid=row["_to_pci_max"],
+                        )
+
+                df = df[~invalid_pci_mask].copy()
+                logger.warning(
+                    "pci_validation_filtered",
+                    invalid_rows=invalid_count,
+                    remaining_rows=len(df),
+                    percent_filtered=round(100 * invalid_count / initial_count, 2) if initial_count > 0 else 0,
+                )
+
+            # Clean up temporary columns
+            df = df.drop(columns=["_pci_max", "_to_pci_max"])
 
         self.df = df
 
@@ -489,43 +590,92 @@ class PCIPlanner:
         if not df_result.empty:
             df_result = df_result.sort_values(["severity_act_sum_excl_max"], ascending=False)
 
-        logger.info(f"pci_confusions_detected", count=len(df_result))
+        logger.info("pci_confusions_detected", count=len(df_result))
         return df_result
 
     def detect_collisions(self) -> pd.DataFrame:
         """
-        Detect PCI collisions: relevant cell pairs sharing the same PCI on the same band.
+        Detect PCI collisions and interference: relevant cell pairs with PCI conflicts.
+
+        Detects three types of PCI issues per 3GPP TS 36.211:
+        1. Exact collision: Same PCI on same band (most severe)
+        2. Mod 3 conflict: Same PCI mod 3 causes PSS (Primary Sync Signal) interference
+        3. Mod 30 conflict: Same PCI mod 30 causes RS (Reference Signal) interference
 
         Returns:
-            DataFrame with columns: cell_a, cell_b, pci, band, collision_type, pair_weight
-            collision_type: "1-hop" for direct neighbors, "2-hop" for indirect neighbors
+            DataFrame with columns: cell_a, cell_b, pci_a, pci_b, band, conflict_type,
+            hop_type, pair_weight, severity
         """
         rows = []
+        check_mod3 = self.params.detect_mod3_conflicts
+        check_mod30 = self.params.detect_mod30_conflicts
+
         for (a, b), w in self.pair_w.items():
             pa = self.cell_pci.get(a, -1)
             pb = self.cell_pci.get(b, -2)
             band_a = self.band_of.get(a, "")
             band_b = self.band_of.get(b, "")
-            # Collision only valid when both cells on same band
-            if pa >= 0 and pa == pb and band_a and band_b and band_a == band_b:
-                # Determine if this is a 1-hop (direct neighbor) or 2-hop collision
-                is_direct = b in self.nbrs_out.get(a, set()) or a in self.nbrs_out.get(b, set())
-                collision_type = "1-hop" if is_direct else "2-hop"
+
+            # Skip invalid PCIs or different bands
+            if pa < 0 or pb < 0:
+                continue
+            if not band_a or not band_b or band_a != band_b:
+                continue
+
+            # Determine hop type (1-hop or 2-hop)
+            is_direct = b in self.nbrs_out.get(a, set()) or a in self.nbrs_out.get(b, set())
+            hop_type = "1-hop" if is_direct else "2-hop"
+
+            conflict_type = None
+            severity_factor = 1.0
+
+            # Check for exact collision (highest priority)
+            if pa == pb:
+                conflict_type = "exact"
+                severity_factor = 1.0
+            # Check for mod 3 conflict (PSS interference) per TS 36.211 Section 6.11
+            elif check_mod3 and (pa % 3 == pb % 3):
+                conflict_type = "mod3"
+                severity_factor = self.params.mod3_severity_factor
+            # Check for mod 30 conflict (RS interference) per TS 36.211 Section 6.10
+            elif check_mod30 and (pa % 30 == pb % 30):
+                conflict_type = "mod30"
+                severity_factor = self.params.mod30_severity_factor
+
+            if conflict_type:
+                # Calculate severity: weight * factor, with 2-hop having lower severity
+                hop_factor = 1.0 if is_direct else 0.5
+                severity = w * severity_factor * hop_factor
 
                 rows.append({
                     "cell_a": a,
                     "cell_b": b,
-                    "pci": pa,
+                    "pci_a": pa,
+                    "pci_b": pb,
                     "band": band_a,
-                    "collision_type": collision_type,
-                    "pair_weight": w
+                    "conflict_type": conflict_type,
+                    "hop_type": hop_type,
+                    "pair_weight": w,
+                    "severity": severity,
                 })
 
         df_result = pd.DataFrame(rows)
         if not df_result.empty:
-            df_result = df_result.sort_values(["pair_weight"], ascending=False)
+            df_result = df_result.sort_values(["severity"], ascending=False)
 
-        logger.info(f"pci_collisions_detected", count=len(df_result))
+        # Log counts by conflict type
+        if not df_result.empty:
+            counts = df_result["conflict_type"].value_counts().to_dict()
+        else:
+            counts = {}
+
+        logger.info(
+            "pci_collisions_detected",
+            total=len(df_result),
+            exact=counts.get("exact", 0),
+            mod3=counts.get("mod3", 0),
+            mod30=counts.get("mod30", 0),
+        )
         return df_result
 
     def suggest_blacklists(self) -> Tuple[pd.DataFrame, Set[Tuple[str, str]]]:
@@ -666,12 +816,17 @@ class PCIPlanner:
         self._recompute_shares()
         self._build_collision_pairs()
 
-        logger.info(f"Applied {len(edges)} blacklists, total blacklisted: {len(self.blacklisted)}")
+        logger.info("blacklists_applied", count=len(edges), total_blacklisted=len(self.blacklisted))
 
     def get_summary_stats(self) -> Dict[str, Any]:
         """Get summary statistics about the network and detected issues."""
         confusions = self.detect_confusions()
         collisions = self.detect_collisions()
+
+        # Break down collisions by conflict type
+        collision_by_type = {}
+        if not collisions.empty:
+            collision_by_type = collisions["conflict_type"].value_counts().to_dict()
 
         return {
             "total_cells": len(self.cells),
@@ -679,9 +834,14 @@ class PCIPlanner:
             "blacklisted_relations": len(self.blacklisted),
             "confusion_count": len(confusions),
             "collision_count": len(collisions),
+            "collision_exact": collision_by_type.get("exact", 0),
+            "collision_mod3": collision_by_type.get("mod3", 0),
+            "collision_mod30": collision_by_type.get("mod30", 0),
             "cosector_groups": len(self.cosector_members) if self.params.couple_cosectors else 0,
             "collision_radius_km": self.max_collision_radius_m / 1000.0,
             "pci_domain": f"0-{self.pci_max}",
+            "mod3_detection_enabled": self.params.detect_mod3_conflicts,
+            "mod30_detection_enabled": self.params.detect_mod30_conflicts,
         }
 
 
