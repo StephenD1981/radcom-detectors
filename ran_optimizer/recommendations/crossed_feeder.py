@@ -90,16 +90,34 @@ def is_in_beam(azimuth: float, target_angle: float, half_width: float) -> bool:
 # Configuration
 # -----------------------------
 
+# Band-specific maximum radius thresholds (meters)
+# Different bands have different propagation characteristics
+BAND_MAX_RADIUS_M = {
+    'L700': 32000,
+    'L800': 30000,
+    'L900': 28000,
+    'L1800': 25000,
+    'L2100': 20000,
+    'L2600': 15000,
+    'N78': 10000,
+    'N258': 2000,
+}
+DEFAULT_MAX_RADIUS_M = 32000  # Default for unknown bands
+
+
 @dataclass
 class CrossedFeederParams:
     """Parameters for crossed feeder detection."""
-    max_radius_m: float = 30000.0
+    max_radius_m: float = 32000.0  # Default, overridden by band-specific values
     min_distance_m: float = 500.0
     hbw_cap_deg: float = 60.0  # cap the "half-width" used for in-beam test
     percentile: float = 0.95
     min_hbw_deg: float = 1.0
     max_hbw_deg: float = 179.0  # exclude broken/omni-like hbw >= 180
     top_k_relations_per_cell: int = 5
+
+    # In-beam expansion factor (1.5x 3dB beamwidth for softer boundary)
+    beamwidth_expansion_factor: float = 1.5
 
     # Scoring
     use_strength_col: str = "cell_perc_weight"  # fallback to weight if missing
@@ -112,9 +130,16 @@ class CrossedFeederParams:
     cosectored_min_strength: float = 10.0
     cosectored_diff_thresh: float = -10.0
 
-    # Classification thresholds
-    high_threshold_all_feeders: int = 3  # >=3 flagged = all feeders swapped
-    high_threshold_two_feeders: int = 2  # ==2 flagged = 2 feeders swapped
+    # Classification thresholds (ratio-based for multi-sector sites)
+    high_ratio_threshold: float = 0.8  # >=80% of sectors flagged = high potential
+    medium_ratio_threshold: float = 0.5  # >=50% of sectors flagged = medium potential
+
+    # Data quality thresholds
+    max_data_drop_ratio: float = 0.5  # Warn if >50% of data dropped
+    max_detection_rate: float = 0.20  # Warn if >20% of cells flagged
+
+    # Band-specific radius overrides (loaded from config)
+    band_max_radius_m: Optional[Dict[str, float]] = None
 
     @classmethod
     def from_config(cls, config_path: Optional[str] = None) -> 'CrossedFeederParams':
@@ -137,13 +162,14 @@ class CrossedFeederParams:
             params = config.get('default', config)
 
             return cls(
-                max_radius_m=params.get('max_radius_m', 30000.0),
+                max_radius_m=params.get('max_radius_m', 32000.0),
                 min_distance_m=params.get('min_distance_m', 500.0),
                 hbw_cap_deg=params.get('hbw_cap_deg', 60.0),
                 percentile=params.get('percentile', 0.95),
                 min_hbw_deg=params.get('min_hbw_deg', 1.0),
                 max_hbw_deg=params.get('max_hbw_deg', 179.0),
                 top_k_relations_per_cell=params.get('top_k_relations_per_cell', 5),
+                beamwidth_expansion_factor=params.get('beamwidth_expansion_factor', 1.5),
                 use_strength_col=params.get('use_strength_col', 'cell_perc_weight'),
                 distance_weighting=params.get('distance_weighting', True),
                 angle_weighting=params.get('angle_weighting', True),
@@ -151,8 +177,11 @@ class CrossedFeederParams:
                 cosectored_strength_col=params.get('cosectored_strength_col', 'weight'),
                 cosectored_min_strength=params.get('cosectored_min_strength', 10.0),
                 cosectored_diff_thresh=params.get('cosectored_diff_thresh', -10.0),
-                high_threshold_all_feeders=params.get('high_threshold_all_feeders', 3),
-                high_threshold_two_feeders=params.get('high_threshold_two_feeders', 2),
+                high_ratio_threshold=params.get('high_ratio_threshold', 0.8),
+                medium_ratio_threshold=params.get('medium_ratio_threshold', 0.5),
+                max_data_drop_ratio=params.get('max_data_drop_ratio', 0.5),
+                max_detection_rate=params.get('max_detection_rate', 0.20),
+                band_max_radius_m=params.get('band_max_radius_m', None),
             )
         except Exception as e:
             logger.warning(f"Failed to load config: {e}. Using defaults.")
@@ -287,12 +316,28 @@ class CrossedFeederDetector:
             cosec = self._cosectored_cross_band_anomalies(relations_df, gis_df)
             results['cosectored_anomalies'] = cosec
 
-        # Log summary
+        # Log summary and detection rate sanity check
         flagged_cells = int(cell_scores["flagged"].sum()) if "flagged" in cell_scores.columns else 0
+        total_cells = len(cell_scores)
+        detection_rate = flagged_cells / total_cells if total_cells > 0 else 0
+
+        # Sanity check: warn if detection rate is unusually high
+        if detection_rate > self.params.max_detection_rate:
+            logger.warning(
+                "high_detection_rate_warning",
+                flagged_cells=flagged_cells,
+                total_cells=total_cells,
+                detection_rate=round(detection_rate, 3),
+                threshold=self.params.max_detection_rate,
+                message=f"Unusually high detection rate ({detection_rate:.1%}) - review thresholds or data quality"
+            )
+
         logger.info(
             "Crossed feeder detection complete",
             relations_scored=len(rel_scores),
             flagged_cells=flagged_cells,
+            total_cells=total_cells,
+            detection_rate=round(detection_rate, 3),
         )
 
         return results
@@ -355,11 +400,42 @@ class CrossedFeederDetector:
         if dropped > 0:
             logger.warning(f"Dropped {dropped} relations due to missing GIS geometry")
 
+            # Data quality check: warn if too much data dropped
+            drop_ratio = dropped / before if before > 0 else 0
+            if drop_ratio > cfg.max_data_drop_ratio:
+                logger.error(
+                    "data_quality_warning",
+                    dropped=dropped,
+                    total=before,
+                    drop_ratio=round(drop_ratio, 2),
+                    threshold=cfg.max_data_drop_ratio,
+                    message=f"High data drop rate ({drop_ratio:.1%}) - check GIS data quality"
+                )
+
         # Beam sanity filter
         df = df[(df["hbw"] >= cfg.min_hbw_deg) & (df["hbw"] <= cfg.max_hbw_deg)].copy()
 
-        # Distance filter (meters)
-        df = df[(df["distance"] <= cfg.max_radius_m) & (df["distance"] >= cfg.min_distance_m)].copy()
+        # Apply band-specific distance filter
+        # Get band-specific max radius from config or use defaults
+        band_radii = cfg.band_max_radius_m if cfg.band_max_radius_m else BAND_MAX_RADIUS_M
+
+        def get_max_radius_for_band(band: str) -> float:
+            """Get max radius for a specific band."""
+            band_upper = str(band).upper()
+            if band_upper in band_radii:
+                return band_radii[band_upper]
+            # Try partial match (e.g., 'L800' matches '800')
+            for key, val in band_radii.items():
+                if key in band_upper or band_upper in key:
+                    return val
+            return DEFAULT_MAX_RADIUS_M
+
+        # Apply band-specific max radius
+        df["band_max_radius"] = df["band"].apply(get_max_radius_for_band)
+        df = df[
+            (df["distance"] <= df["band_max_radius"]) &
+            (df["distance"] >= cfg.min_distance_m)
+        ].copy()
 
         # Primary detection uses INTER-SITE relations
         df = df[df["intra_site"] == "n"].copy()
@@ -373,8 +449,9 @@ class CrossedFeederDetector:
             df["to_lat"].values, df["to_lon"].values
         )
 
-        # In-beam test (vectorized)
-        df["half_width_deg"] = df["hbw"].clip(upper=cfg.hbw_cap_deg)
+        # In-beam test (vectorized) with expansion factor for softer boundary
+        # Use 1.5x the 3dB beamwidth to account for RF energy beyond main lobe
+        df["half_width_deg"] = (df["hbw"] * cfg.beamwidth_expansion_factor).clip(upper=cfg.hbw_cap_deg)
         df["angle_diff_deg"] = circ_diff_deg_vec(df["bearing"].values, df["angle_to_neighbor"].values)
         df["in_beam"] = df["angle_diff_deg"] <= df["half_width_deg"]
 
@@ -426,15 +503,21 @@ class CrossedFeederDetector:
         """Aggregate relation scores into per-cell and per-site summaries."""
         cfg = self.params
 
-        # Per-cell score
+        # Per-cell score with additional metrics for confidence calculation
         cell = (
             rel_scores.groupby(["cell_name", "site", "band"], as_index=False)
             .agg(
                 cell_score=("score", "sum"),
                 out_of_beam_relations=("score", lambda s: int((s > 0).sum())),
                 total_relations=("score", "size"),
+                max_angle_diff=("angle_diff_deg", "max"),
+                avg_angle_diff=("angle_diff_deg", "mean"),
+                max_out_of_beam_score=("score", "max"),
             )
         )
+
+        # Calculate out-of-beam ratio
+        cell["out_of_beam_ratio"] = cell["out_of_beam_relations"] / cell["total_relations"].replace(0, 1)
 
         # Percentile threshold per band
         cell["flagged"] = False
@@ -448,6 +531,35 @@ class CrossedFeederDetector:
             idx = cell["band"] == b
             cell.loc[idx, "threshold"] = thr
             cell.loc[idx, "flagged"] = cell.loc[idx, "cell_score"] >= thr
+
+        # Calculate confidence score (0-100%)
+        # Based on: score strength, number of out-of-beam relations, angle deviation consistency
+        cell["confidence"] = 0.0
+        flagged_mask = cell["flagged"]
+
+        if flagged_mask.any():
+            # Normalize cell_score to 0-1 within flagged cells
+            max_score = cell.loc[flagged_mask, "cell_score"].max()
+            if max_score > 0:
+                score_factor = (cell.loc[flagged_mask, "cell_score"] / max_score).clip(0, 1)
+            else:
+                score_factor = 0.0
+
+            # Out-of-beam ratio factor (more out-of-beam = higher confidence)
+            oob_factor = cell.loc[flagged_mask, "out_of_beam_ratio"].clip(0, 1)
+
+            # Angle deviation factor (larger deviations = higher confidence)
+            # Normalize by 180 degrees (max possible deviation)
+            angle_factor = (cell.loc[flagged_mask, "avg_angle_diff"] / 180.0).clip(0, 1)
+
+            # Weighted confidence: 40% score, 30% out-of-beam ratio, 30% angle deviation
+            cell.loc[flagged_mask, "confidence"] = (
+                0.40 * score_factor +
+                0.30 * oob_factor +
+                0.30 * angle_factor
+            ) * 100
+
+            cell["confidence"] = cell["confidence"].round(1)
 
         # Attach top-K suspicious relations per cell
         topk = (
@@ -473,23 +585,37 @@ class CrossedFeederDetector:
             cell.groupby(["site", "band"], as_index=False)
             .agg(
                 flagged_cells=("flagged", "sum"),
-                cells=("cell_name", "nunique"),
+                total_sectors=("cell_name", "nunique"),
                 sum_cell_score=("cell_score", "sum"),
                 max_cell_score=("cell_score", "max"),
+                avg_out_of_beam_ratio=("out_of_beam_relations", lambda x: x.mean()),
             )
         )
 
-        def classify(n: int) -> str:
-            if n >= cfg.high_threshold_all_feeders:
-                return f"High potential: all feeders swapped (>={cfg.high_threshold_all_feeders} flagged sectors)"
-            if n >= cfg.high_threshold_two_feeders:
-                return f"High potential: {n} feeders swapped ({n} flagged sectors)"
-            if n == 1:
-                return "Low potential: single sector flagged"
-            return "No strong evidence"
+        # Ratio-based classification for multi-sector sites
+        site["flagged_ratio"] = site["flagged_cells"] / site["total_sectors"].replace(0, 1)
 
-        site["classification"] = site["flagged_cells"].apply(lambda x: classify(int(x)))
-        site = site.sort_values(["flagged_cells", "max_cell_score"], ascending=[False, False])
+        def classify(row) -> str:
+            flagged = int(row["flagged_cells"])
+            total = int(row["total_sectors"])
+            ratio = row["flagged_ratio"]
+
+            if flagged == 0:
+                return "No evidence"
+            if ratio >= cfg.high_ratio_threshold:
+                return f"High potential: {flagged}/{total} sectors flagged ({ratio:.0%})"
+            if ratio >= cfg.medium_ratio_threshold:
+                return f"Medium potential: {flagged}/{total} sectors flagged ({ratio:.0%})"
+            if flagged >= 2:
+                return f"Medium potential: {flagged} sectors flagged"
+            return f"Low potential: {flagged} sector flagged"
+
+        # Handle empty site DataFrame
+        if len(site) > 0:
+            site["classification"] = site.apply(classify, axis=1)
+            site = site.sort_values(["flagged_ratio", "flagged_cells", "max_cell_score"], ascending=[False, False, False])
+        else:
+            site["classification"] = ""
 
         cell = cell.sort_values(["flagged", "cell_score"], ascending=[False, False])
         return cell, site
