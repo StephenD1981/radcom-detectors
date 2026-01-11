@@ -153,7 +153,7 @@ class TestCrossedFeederParams:
         """Default parameters should be set correctly."""
         params = CrossedFeederParams()
         assert params.swap_angle_tolerance_deg == 30.0
-        assert params.min_out_of_beam_ratio == 0.3
+        assert params.min_out_of_beam_ratio == 0.5  # 50% threshold
         assert params.min_out_of_beam_weight == 5.0
         assert params.beamwidth_expansion_factor == 1.5
 
@@ -323,6 +323,8 @@ class TestSwapPatternDetection:
             min_out_of_beam_ratio=0.3,
             min_out_of_beam_weight=5.0,
             swap_angle_tolerance_deg=30.0,
+            min_total_relations=1,  # Lower for unit testing
+            min_out_of_beam_relations=1,  # Lower for unit testing
         )
         detector = CrossedFeederDetector(params)
         result = detector.detect(relations_df, swap_scenario_gis)
@@ -347,6 +349,8 @@ class TestSwapPatternDetection:
         params = CrossedFeederParams(
             min_out_of_beam_ratio=0.3,
             min_out_of_beam_weight=5.0,
+            min_total_relations=1,  # Lower for unit testing
+            min_out_of_beam_relations=1,  # Lower for unit testing
         )
         detector = CrossedFeederDetector(params)
         result = detector.detect(relations_df, swap_scenario_gis)
@@ -371,6 +375,8 @@ class TestSwapPatternDetection:
             min_out_of_beam_ratio=0.3,
             min_out_of_beam_weight=5.0,
             swap_angle_tolerance_deg=30.0,
+            min_total_relations=1,  # Lower for unit testing
+            min_out_of_beam_relations=1,  # Lower for unit testing
         )
         detector = CrossedFeederDetector(params)
         result = detector.detect(relations_df, swap_scenario_gis)
@@ -399,7 +405,11 @@ class TestSiteSummary:
             {"cell_name": "B1", "to_cell_name": "EXT1", "distance": 10000, "band": "L800", "to_band": "L800", "intra_site": "n", "intra_cell": "n", "weight": 50},
         ])
 
-        detector = CrossedFeederDetector()
+        params = CrossedFeederParams(
+            min_total_relations=1,  # Lower for unit testing
+            min_out_of_beam_relations=1,  # Lower for unit testing
+        )
+        detector = CrossedFeederDetector(params)
         result = detector.detect(relations_df, gis_df)
 
         site = result['sites'][result['sites']['site'] == 'SITE1']

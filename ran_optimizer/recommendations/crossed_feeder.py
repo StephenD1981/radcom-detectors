@@ -163,8 +163,12 @@ class CrossedFeederParams:
 
     # Swap detection thresholds
     swap_angle_tolerance_deg: float = 30.0  # How close traffic direction must be to another cell's azimuth
-    min_out_of_beam_ratio: float = 0.3  # Minimum ratio of out-of-beam traffic to be considered anomalous
+    min_out_of_beam_ratio: float = 0.5  # Minimum ratio of out-of-beam traffic to be considered anomalous (50%)
     min_out_of_beam_weight: float = 5.0  # Minimum total out-of-beam weight to be considered
+
+    # Minimum relation count thresholds (for data confidence)
+    min_total_relations: int = 5  # Need at least N relations to have confidence
+    min_out_of_beam_relations: int = 3  # Need at least N out-of-beam relations to flag
 
     # Data quality thresholds
     max_data_drop_ratio: float = 0.5
@@ -203,8 +207,10 @@ class CrossedFeederParams:
                 beamwidth_expansion_factor=params.get('beamwidth_expansion_factor', 1.5),
                 use_strength_col=params.get('use_strength_col', 'cell_perc_weight'),
                 swap_angle_tolerance_deg=params.get('swap_angle_tolerance_deg', 30.0),
-                min_out_of_beam_ratio=params.get('min_out_of_beam_ratio', 0.3),
+                min_out_of_beam_ratio=params.get('min_out_of_beam_ratio', 0.5),
                 min_out_of_beam_weight=params.get('min_out_of_beam_weight', 5.0),
+                min_total_relations=params.get('min_total_relations', 5),
+                min_out_of_beam_relations=params.get('min_out_of_beam_relations', 3),
                 max_data_drop_ratio=params.get('max_data_drop_ratio', 0.5),
                 max_detection_rate=params.get('max_detection_rate', 0.20),
                 top_k_relations_per_cell=params.get('top_k_relations_per_cell', 5),
@@ -259,6 +265,8 @@ class CrossedFeederDetector:
             "Crossed Feeder detector initialized",
             swap_tolerance_deg=self.params.swap_angle_tolerance_deg,
             min_out_of_beam_ratio=self.params.min_out_of_beam_ratio,
+            min_total_relations=self.params.min_total_relations,
+            min_out_of_beam_relations=self.params.min_out_of_beam_relations,
         )
 
     def detect(
@@ -387,6 +395,9 @@ class CrossedFeederDetector:
             df[col] = pd.to_numeric(df[col], errors="coerce")
 
         df["distance"] = df["distance"].fillna(0.0)
+
+        # Normalize bearing to [0, 360) range
+        df["bearing"] = df["bearing"] % 360.0
 
         # Drop rows missing essential geometry
         before = len(df)
@@ -525,9 +536,12 @@ class CrossedFeederDetector:
             n_cells = len(group)
 
             # Get cells with significant out-of-beam traffic
+            # Must meet ALL thresholds: ratio, weight, AND relation counts
             anomalous = group[
                 (group["out_of_beam_ratio"] >= cfg.min_out_of_beam_ratio) &
-                (group["out_of_beam_weight"] >= cfg.min_out_of_beam_weight)
+                (group["out_of_beam_weight"] >= cfg.min_out_of_beam_weight) &
+                (group["total_relations"] >= cfg.min_total_relations) &
+                (group["out_of_beam_relations"] >= cfg.min_out_of_beam_relations)
             ]
 
             n_anomalous = len(anomalous)
@@ -633,6 +647,9 @@ class CrossedFeederDetector:
             "band": cell["band"],
             "bearing": cell["bearing"],
             "hbw": cell["hbw"],
+            "total_relations": cell["total_relations"],
+            "in_beam_relations": cell["total_relations"] - cell["out_of_beam_relations"],
+            "out_of_beam_relations": cell["out_of_beam_relations"],
             "total_weight": cell["total_weight"],
             "in_beam_weight": cell["in_beam_weight"],
             "out_of_beam_weight": cell["out_of_beam_weight"],
