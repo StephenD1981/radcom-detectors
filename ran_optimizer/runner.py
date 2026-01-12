@@ -573,9 +573,31 @@ def run_pci_planner(
     # Detect collisions
     collisions = planner.detect_collisions()
     if len(collisions) > 0:
-        output_file = output_dir / 'pci_collisions.csv'
+        # Add intra_site flag based on cell names (first 5 chars = site)
+        collisions['site_a'] = collisions['cell_a'].str[:5]
+        collisions['site_b'] = collisions['cell_b'].str[:5]
+        collisions['intra_site'] = collisions['site_a'] == collisions['site_b']
+
+        # Save full results
+        output_file = output_dir / 'pci_collisions_all.csv'
         collisions.to_csv(output_file, index=False)
-        logger.info("PCI collisions saved", path=str(output_file), count=len(collisions))
+        logger.info("PCI collisions (all) saved", path=str(output_file), count=len(collisions))
+
+        # Filter based on config: exact collisions always included, mod3 depends on include_mod3_inter_site
+        if params.include_mod3_inter_site:
+            # Include all exact + all mod3 (inter and intra site)
+            filtered_collisions = collisions.copy()
+            filter_desc = "all (exact + mod3)"
+        else:
+            # Include exact (all sites) + only intra-site mod3
+            filtered_collisions = collisions[
+                (collisions['conflict_type'] == 'exact') |
+                ((collisions['conflict_type'] == 'mod3') & (collisions['intra_site'] == True))
+            ].copy()
+            filter_desc = "exact + intra-site mod3"
+        output_file = output_dir / 'pci_collisions.csv'
+        filtered_collisions.to_csv(output_file, index=False)
+        logger.info(f"PCI collisions ({filter_desc}) saved", path=str(output_file), count=len(filtered_collisions))
 
     # Suggest blacklists
     blacklist_df, auto_apply = planner.suggest_blacklists()
@@ -638,9 +660,22 @@ def run_pci_conflict(
         # Convert list of dicts to DataFrame
         if results_list and len(results_list) > 0:
             results = pd.DataFrame(results_list)
-            output_file = output_dir / 'pci_conflicts.csv'
+
+            # Save all results (including mod3)
+            output_file = output_dir / 'pci_conflicts_all.csv'
             results.to_csv(output_file, index=False)
-            logger.info("PCI conflict results saved", path=str(output_file), count=len(results))
+            logger.info("PCI conflicts (all) saved", path=str(output_file), count=len(results))
+
+            # Filter to exact/collision only for main output (exclude mod3)
+            if 'conflict_type' in results.columns:
+                exact_conflicts = results[results['conflict_type'] == 'collision'].copy()
+                output_file = output_dir / 'pci_conflicts.csv'
+                exact_conflicts.to_csv(output_file, index=False)
+                logger.info("PCI conflicts (exact only) saved", path=str(output_file), count=len(exact_conflicts))
+            else:
+                output_file = output_dir / 'pci_conflicts.csv'
+                results.to_csv(output_file, index=False)
+                logger.info("PCI conflict results saved", path=str(output_file), count=len(results))
         else:
             results = pd.DataFrame()
             logger.info("No PCI conflicts detected")
@@ -790,14 +825,16 @@ def run_crossed_feeder(
 
     # Log summary by confidence level
     if len(cells_df) > 0 and 'confidence_level' in cells_df.columns:
-        high = len(cells_df[cells_df['confidence_level'] == 'HIGH'])
-        medium = len(cells_df[cells_df['confidence_level'] == 'MEDIUM'])
-        low = len(cells_df[cells_df['confidence_level'] == 'LOW'])
+        high_swap = len(cells_df[cells_df['confidence_level'] == 'HIGH_POTENTIAL_SWAP'])
+        possible_swap = len(cells_df[cells_df['confidence_level'] == 'POSSIBLE_SWAP'])
+        single_anomaly = len(cells_df[cells_df['confidence_level'] == 'SINGLE_ANOMALY'])
+        repan = len(cells_df[cells_df['confidence_level'] == 'REPAN'])
         logger.info(
             "Crossed feeder detection summary",
-            high_confidence=high,
-            medium_confidence=medium,
-            low_confidence=low,
+            high_potential_swap=high_swap,
+            possible_swap=possible_swap,
+            single_anomaly=single_anomaly,
+            repan=repan,
             swap_pairs=len(swap_pairs_df),
         )
 
@@ -1108,12 +1145,20 @@ def run_all(
     logger.info("=" * 80)
     logger.info("EXECUTION COMPLETE")
     logger.info("=" * 80)
+    # Count per-band results properly
+    no_coverage_per_band = results.get('no_coverage_per_band', {})
+    no_coverage_total = sum(len(gdf) for gdf in no_coverage_per_band.values()) if no_coverage_per_band else 0
+    low_coverage_dict = results.get('low_coverage', {})
+    low_coverage_total = sum(len(gdf) for gdf in low_coverage_dict.values()) if low_coverage_dict else 0
+
     logger.info("Summary",
                 elapsed_seconds=elapsed.total_seconds(),
                 overshooting_count=len(results.get('overshooting', [])),
                 undershooting_count=len(results.get('undershooting', [])),
-                no_coverage_clusters=len(results.get('no_coverage', [])),
-                low_coverage_bands=len(results.get('low_coverage', {})),
+                no_coverage_clusters=no_coverage_total,
+                no_coverage_bands=len(no_coverage_per_band),
+                low_coverage_clusters=low_coverage_total,
+                low_coverage_bands=len(low_coverage_dict),
                 interference_clusters=len(results.get('interference', [])),
                 pci_confusions=len(results.get('confusions', [])),
                 pci_collisions=len(results.get('collisions', [])),

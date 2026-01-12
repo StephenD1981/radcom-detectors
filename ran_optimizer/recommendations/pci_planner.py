@@ -181,6 +181,9 @@ class PCIPlannerParams:
     # PCI validation
     validate_pci_range: bool = True      # Validate PCI within 3GPP range per band
 
+    # Output filtering
+    include_mod3_inter_site: bool = False  # If True, include inter-site mod3 in filtered output
+
     @classmethod
     def from_config(cls, config_path: Optional[str] = None) -> 'PCIPlannerParams':
         """Load parameters from config file or use defaults."""
@@ -217,6 +220,7 @@ class PCIPlannerParams:
                 mod3_severity_factor=params.get('mod3_severity_factor', 0.5),
                 mod30_severity_factor=params.get('mod30_severity_factor', 0.3),
                 validate_pci_range=params.get('validate_pci_range', True),
+                include_mod3_inter_site=params.get('include_mod3_inter_site', False),
             )
         except Exception as e:
             logger.warning(f"Failed to load config: {e}. Using defaults.")

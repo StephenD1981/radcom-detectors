@@ -323,15 +323,17 @@ class CrossedFeederDetector:
         site_summary = self._build_site_summary(cell_results)
 
         # Log results
-        high_conf = len(cell_results[cell_results['confidence_level'] == 'HIGH'])
-        medium_conf = len(cell_results[cell_results['confidence_level'] == 'MEDIUM'])
-        low_conf = len(cell_results[cell_results['confidence_level'] == 'LOW'])
+        high_swap = len(cell_results[cell_results['confidence_level'] == 'HIGH_POTENTIAL_SWAP'])
+        possible_swap = len(cell_results[cell_results['confidence_level'] == 'POSSIBLE_SWAP'])
+        single_anomaly = len(cell_results[cell_results['confidence_level'] == 'SINGLE_ANOMALY'])
+        repan = len(cell_results[cell_results['confidence_level'] == 'REPAN'])
 
         logger.info(
             "Crossed feeder detection complete",
-            high_confidence=high_conf,
-            medium_confidence=medium_conf,
-            low_confidence=low_conf,
+            high_potential_swap=high_swap,
+            possible_swap=possible_swap,
+            single_anomaly=single_anomaly,
+            repan_candidates=repan,
             swap_pairs=len(swap_pairs),
         )
 
@@ -531,11 +533,24 @@ class CrossedFeederDetector:
         results = []
         swap_pairs = []
 
+        # Count cells per site+band from GIS (actual cell count, not just those with relations)
+        site_band_cell_count = gis.groupby(["site", "band"]).size().to_dict()
+
         # Process each site+band group
         for (site, band), group in cell_metrics.groupby(["site", "band"]):
             n_cells = len(group)
+            # Get actual cell count from GIS for this site+band
+            n_cells_on_band = site_band_cell_count.get((site, band), n_cells)
 
-            # Get cells with significant out-of-beam traffic
+            # For swap detection: use looser thresholds (ratio >= 0.5, any weight)
+            # because the reciprocal swap pattern itself is strong evidence
+            swap_candidates = group[
+                (group["out_of_beam_ratio"] >= 0.5) &
+                (group["total_relations"] >= 3) &
+                (group["out_of_beam_relations"] >= 2)
+            ]
+
+            # For MEDIUM/LOW flagging: use stricter thresholds
             # Must meet ALL thresholds: ratio, weight, AND relation counts
             anomalous = group[
                 (group["out_of_beam_ratio"] >= cfg.min_out_of_beam_ratio) &
@@ -545,22 +560,33 @@ class CrossedFeederDetector:
             ]
 
             n_anomalous = len(anomalous)
+            n_swap_candidates = len(swap_candidates)
 
-            if n_anomalous == 0:
-                # No anomalies - all cells are fine
+            # Handle single-cell-on-band case: can't be crossed feeders (nothing to swap with)
+            # But flag as antenna repan candidates if significant out-of-beam traffic
+            if n_cells_on_band == 1:
                 for _, cell in group.iterrows():
-                    results.append(self._build_cell_result(cell, "NONE", None, "No out-of-beam anomaly detected"))
+                    cell_name = cell["cell_name"]
+                    if cell_name in anomalous["cell_name"].values:
+                        # Significant out-of-beam but only 1 cell on band - repan candidate
+                        results.append(self._build_cell_result(
+                            cell, "REPAN", None,
+                            "Single cell on band with out-of-beam traffic. Cannot be crossed feeder. Review antenna azimuth/pan."
+                        ))
+                    else:
+                        results.append(self._build_cell_result(cell, "NONE", None, "No out-of-beam anomaly detected"))
                 continue
 
-            # Check for swap patterns between anomalous cells
+            # Check for swap patterns using looser thresholds (swap_candidates)
+            # The reciprocal swap pattern itself is strong evidence
             detected_swaps = set()
             cell_swap_partners = {}
 
-            for i, cell_a in anomalous.iterrows():
+            for i, cell_a in swap_candidates.iterrows():
                 if pd.isna(cell_a["dominant_traffic_direction"]):
                     continue
 
-                for j, cell_b in anomalous.iterrows():
+                for j, cell_b in swap_candidates.iterrows():
                     if i >= j:  # Avoid duplicate pairs
                         continue
                     if pd.isna(cell_b["dominant_traffic_direction"]):
@@ -598,23 +624,23 @@ class CrossedFeederDetector:
                 cell_name = cell["cell_name"]
 
                 if cell_name in cell_swap_partners:
-                    # HIGH confidence: part of a detected swap pair
+                    # HIGH_POTENTIAL_SWAP: part of a detected swap pair
                     partner = cell_swap_partners[cell_name]
                     results.append(self._build_cell_result(
-                        cell, "HIGH", partner,
+                        cell, "HIGH_POTENTIAL_SWAP", partner,
                         f"Reciprocal swap pattern detected with {partner}. Check feeder connections."
                     ))
                 elif cell_name in anomalous["cell_name"].values:
                     if n_anomalous >= 2:
-                        # MEDIUM confidence: multiple anomalies but no clean swap
+                        # POSSIBLE_SWAP: multiple anomalies but no clean swap
                         results.append(self._build_cell_result(
-                            cell, "MEDIUM", None,
+                            cell, "POSSIBLE_SWAP", None,
                             f"Out-of-beam anomaly at site with {n_anomalous} anomalous cells. Investigate feeder routing."
                         ))
                     else:
-                        # LOW confidence: single cell anomaly
+                        # SINGLE_ANOMALY: single cell anomaly
                         results.append(self._build_cell_result(
-                            cell, "LOW", None,
+                            cell, "SINGLE_ANOMALY", None,
                             "Single cell out-of-beam anomaly. Review azimuth configuration or terrain effects."
                         ))
                 else:
@@ -625,7 +651,7 @@ class CrossedFeederDetector:
         swap_pairs_df = pd.DataFrame(swap_pairs)
 
         # Sort results
-        confidence_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "NONE": 3}
+        confidence_order = {"HIGH_POTENTIAL_SWAP": 0, "POSSIBLE_SWAP": 1, "SINGLE_ANOMALY": 2, "REPAN": 3, "NONE": 4}
         if len(results_df) > 0:
             results_df["_sort"] = results_df["confidence_level"].map(confidence_order)
             results_df = results_df.sort_values(["_sort", "out_of_beam_ratio"], ascending=[True, False])
@@ -659,7 +685,7 @@ class CrossedFeederDetector:
             "swap_partner": swap_partner,
             "recommendation": recommendation,
             "top_suspicious_relations": cell["top_suspicious_relations"],
-            "flagged": confidence_level in ("HIGH", "MEDIUM", "LOW"),
+            "flagged": confidence_level in ("HIGH_POTENTIAL_SWAP", "POSSIBLE_SWAP", "SINGLE_ANOMALY", "REPAN"),
         }
 
     def _build_site_summary(self, cell_results: pd.DataFrame) -> pd.DataFrame:
