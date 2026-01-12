@@ -6,9 +6,11 @@ This module contains the core detection algorithm with multiple stages:
 filtering, clustering, dominance detection, spatial validation, and scoring.
 """
 
+import copy
 import time
-from dataclasses import dataclass
-from typing import Tuple, Optional, List
+from dataclasses import dataclass, fields
+from datetime import datetime
+from typing import Optional, List
 
 import numpy as np
 import pandas as pd
@@ -24,11 +26,15 @@ from ran_optimizer.utils.geohash import kring, decode as decode_geohash
 
 logger = get_logger(__name__)
 
-# Geographic constant for approximate area calculation fallback
-KM_PER_DEGREE_LAT = 111.32
+# Geographic constants
+KM_PER_DEGREE_LAT = 111.32  # Approximate km per degree latitude
+EARTH_RADIUS_KM = 6371.0  # Earth radius in kilometers
 
-# Memory safeguard: maximum records per band to prevent OOM
+# Memory safeguard: maximum records per band to prevent OOM (default, can be overridden via params)
 MAX_RECORDS_PER_BAND = 5_000_000
+
+# Geometry constants
+POINT_BUFFER_DEGREES = 0.001  # Small buffer to create polygon from point/line (~111m at equator)
 
 # Band-specific interference thresholds (dB)
 # Different frequency bands have different propagation characteristics:
@@ -278,7 +284,7 @@ def count_present_in_kring(gh: str, k: int, present: set) -> int:
 class InterferenceDetector:
     """Detects high interference cells using geohash-based spatial analysis."""
 
-    def __init__(self, params: Optional[InterferenceParams] = None):
+    def __init__(self, params: Optional[InterferenceParams] = None) -> None:
         """
         Initialize the Interference Detector.
 
@@ -286,32 +292,8 @@ class InterferenceDetector:
             params: Detection parameters (uses defaults if None)
         """
         self.params = params or InterferenceParams()
-        # Store original params for idempotent environment overrides (Fix #6)
-        self._original_params = InterferenceParams(
-            min_filtered_cells_per_grid=self.params.min_filtered_cells_per_grid,
-            min_cell_event_count=self.params.min_cell_event_count,
-            perc_grid_events=self.params.perc_grid_events,
-            dominant_perc_grid_events=self.params.dominant_perc_grid_events,
-            dominance_diff=self.params.dominance_diff,
-            max_rsrp_diff=self.params.max_rsrp_diff,
-            sinr_threshold_db=self.params.sinr_threshold_db,
-            k=self.params.k,
-            perc_interference=self.params.perc_interference,
-            clustering_algo=self.params.clustering_algo,
-            fixed_width=self.params.fixed_width,
-            dynamic_width=self.params.dynamic_width,
-            rsrp_min_quantile=self.params.rsrp_min_quantile,
-            rsrp_max_quantile=self.params.rsrp_max_quantile,
-            perceived_multiplier=self.params.perceived_multiplier,
-            hdbscan_min_cluster_size=self.params.hdbscan_min_cluster_size,
-            alpha_shape_alpha=self.params.alpha_shape_alpha,
-            max_alphashape_points=self.params.max_alphashape_points,
-            environment_overrides=self.params.environment_overrides,
-            expected_geohash_precision=self.params.expected_geohash_precision,
-            geohash_precision_warning=self.params.geohash_precision_warning,
-            max_records_per_band=self.params.max_records_per_band,
-            max_data_age_days=self.params.max_data_age_days,
-        )
+        # Store original params for idempotent environment overrides using deep copy
+        self._original_params = copy.deepcopy(self.params)
 
         logger.info(
             "interference_detector_initialized",
@@ -322,20 +304,31 @@ class InterferenceDetector:
 
     def _reset_to_original_params(self) -> None:
         """Reset params to original values before applying new environment overrides."""
-        for field in ['min_filtered_cells_per_grid', 'min_cell_event_count', 'perc_grid_events',
-                      'dominant_perc_grid_events', 'dominance_diff', 'max_rsrp_diff',
-                      'sinr_threshold_db', 'k', 'perc_interference', 'clustering_algo',
-                      'fixed_width', 'dynamic_width', 'rsrp_min_quantile', 'rsrp_max_quantile',
-                      'perceived_multiplier', 'hdbscan_min_cluster_size', 'alpha_shape_alpha',
-                      'max_alphashape_points']:
-            setattr(self.params, field, getattr(self._original_params, field))
+        # Use dataclasses.fields() to iterate all fields dynamically
+        for field in fields(self.params):
+            setattr(self.params, field.name, getattr(self._original_params, field.name))
 
     def _apply_environment_overrides(self, environment: Optional[str]) -> None:
-        """Apply environment-specific parameter overrides (idempotent - Fix #6)."""
+        """
+        Apply environment-specific parameter overrides (idempotent).
+
+        Args:
+            environment: Environment type ('urban', 'suburban', 'rural') or None
+        """
         # Always reset to original params first for idempotency
         self._reset_to_original_params()
 
         if environment is None or self.params.environment_overrides is None:
+            return
+
+        # Validate environment is known
+        valid_environments = self.params.environment_overrides.keys()
+        if environment not in valid_environments:
+            logger.warning(
+                "unknown_environment",
+                environment=environment,
+                valid_environments=list(valid_environments),
+            )
             return
 
         overrides = self.params.environment_overrides.get(environment)
@@ -552,8 +545,6 @@ class InterferenceDetector:
 
     def _validate_data_freshness(self, df: pd.DataFrame) -> None:
         """Validate data is not too old (Fix #10)."""
-        from datetime import datetime, timedelta
-
         timestamp_cols = ['timestamp', 'date', 'collection_date', 'created_at']
         ts_col = None
         for col in timestamp_cols:
@@ -962,7 +953,8 @@ class InterferenceDetector:
             return coords
 
         # Calculate grid dimensions to get approximately max_points cells
-        n_cells = int(np.sqrt(max_points))
+        # Guard against n_cells == 0 if max_points < 1
+        n_cells = max(1, int(np.sqrt(max_points)))
 
         # Get coordinate bounds
         lon_min, lon_max = coords[:, 0].min(), coords[:, 0].max()
@@ -1049,7 +1041,7 @@ class InterferenceDetector:
                 hull = gpd.GeoSeries(points).unary_union.convex_hull
                 # Handle case where convex_hull returns a point or line
                 if hull.geom_type in ('Point', 'MultiPoint', 'LineString'):
-                    return hull.buffer(0.001)  # Small buffer to create polygon
+                    return hull.buffer(POINT_BUFFER_DEGREES)  # Small buffer to create polygon
                 return hull
             except Exception as fallback_err:
                 logger.error(
@@ -1140,6 +1132,7 @@ class RootCauseParams:
     low_tilt_threshold_deg: float = 4.0  # Tilts below this are "low"
     high_tilt_threshold_deg: float = 10.0  # Tilts above this are "high"
     tilt_spread_threshold_deg: float = 3.0  # Spread indicating inconsistent tilts
+    min_tilt_for_range_calc_deg: float = 0.5  # Minimum tilt to avoid division by zero
 
     # Azimuth analysis
     azimuth_convergence_threshold_deg: float = 60.0  # Azimuths within this are "converging"
@@ -1154,6 +1147,17 @@ class RootCauseParams:
     # Recommendation thresholds
     min_tilt_increase_deg: float = 1.0  # Minimum recommended tilt increase
     max_tilt_increase_deg: float = 4.0  # Maximum recommended tilt increase
+
+    # Height-adjusted tilt analysis thresholds (Fix audit: make configurable)
+    overshoot_range_threshold_km: float = 2.0  # Effective range above this indicates overshoot
+    target_range_km: float = 1.5  # Target effective range for tilt recommendations
+    default_antenna_height_m: float = 30.0  # Default height when not specified
+
+    # Priority determination thresholds (Fix audit: make configurable)
+    high_priority_grid_threshold: int = 50  # Clusters with more grids are high priority
+    high_priority_cell_threshold: int = 6  # Clusters with more cells are high priority
+    medium_priority_grid_threshold: int = 20  # Clusters with more grids are medium priority
+    medium_priority_cell_threshold: int = 4  # Clusters with more cells are medium priority
 
 
 class InterferenceRootCauseAnalyzer:
@@ -1329,16 +1333,18 @@ class InterferenceRootCauseAnalyzer:
                 # Effective range ≈ height / tan(tilt) for small angles
                 if has_height:
                     height_adjusted_cells = []
+                    min_tilt = cfg.min_tilt_for_range_calc_deg
                     for cell in cell_configs:
                         height = cell.get('antenna_height', 0)
                         tilt = cell.get('total_tilt', 0)
-                        if height > 0 and tilt > 0:
+                        # Use minimum tilt threshold to avoid division by zero
+                        if height > 0 and tilt >= min_tilt:
                             # Calculate effective coverage distance (simplified model)
                             # Range in km ≈ height(m) / (tan(tilt) * 1000)
                             effective_range_km = height / (np.tan(np.radians(tilt)) * 1000)
                             cell['effective_range_km'] = round(effective_range_km, 2)
                             # Flag cells with large effective range (potential overshooters)
-                            if effective_range_km > 2.0:  # > 2km range indicates overshoot risk
+                            if effective_range_km > cfg.overshoot_range_threshold_km:
                                 height_adjusted_cells.append(cell)
 
                     if height_adjusted_cells:
@@ -1353,12 +1359,11 @@ class InterferenceRootCauseAnalyzer:
                         ]
                         # Add height-aware recommendations
                         for cell in height_adjusted_cells:
-                            height = cell.get('antenna_height', 30)  # default 30m
+                            height = cell.get('antenna_height', cfg.default_antenna_height_m)
                             current_tilt = cell.get('total_tilt', 0)
-                            # Calculate tilt needed for ~1.5km range
-                            target_range_km = 1.5
-                            suggested_tilt = np.degrees(np.arctan(height / (target_range_km * 1000)))
-                            if suggested_tilt > current_tilt + 1:  # Only recommend if > 1 degree increase
+                            # Calculate tilt needed for target range
+                            suggested_tilt = np.degrees(np.arctan(height / (cfg.target_range_km * 1000)))
+                            if suggested_tilt > current_tilt + cfg.min_tilt_increase_deg:
                                 recommendations.append({
                                     'action': 'increase_tilt',
                                     'cell': cell['cell_name'],
@@ -1371,13 +1376,13 @@ class InterferenceRootCauseAnalyzer:
                                     causes.append('tall_site_overshoot')
 
                 # Check for low tilt (causing overshoot) - standard analysis
-                low_tilt_cells = [c for c in cell_configs if c.get('total_tilt', 99) < cfg.low_tilt_threshold_deg]
+                low_tilt_cells = [c for c in cell_configs if c.get('total_tilt', float('inf')) < cfg.low_tilt_threshold_deg]
                 if low_tilt_cells:
                     causes.append('low_tilt')
                     details['low_tilt_cells'] = [c['cell_name'] for c in low_tilt_cells]
                     for cell in low_tilt_cells:
                         # Skip if already handled by height-adjusted analysis
-                        if has_height and cell.get('effective_range_km', 0) > 2.0:
+                        if has_height and cell.get('effective_range_km', 0) > cfg.overshoot_range_threshold_km:
                             continue
                         current = cell.get('total_tilt', 0)
                         suggested = min(current + 2, cfg.high_tilt_threshold_deg)
@@ -1483,13 +1488,12 @@ class InterferenceRootCauseAnalyzer:
     @staticmethod
     def _haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
         """Calculate haversine distance in kilometers."""
-        R = 6371  # Earth radius in km
         lat1, lon1, lat2, lon2 = map(np.radians, [lat1, lon1, lat2, lon2])
         dlat = lat2 - lat1
         dlon = lon2 - lon1
         a = np.sin(dlat/2)**2 + np.cos(lat1) * np.cos(lat2) * np.sin(dlon/2)**2
         c = 2 * np.arcsin(np.sqrt(a))
-        return R * c
+        return EARTH_RADIUS_KM * c
 
     def _determine_primary_cause(self, causes: List[str]) -> str:
         """Determine the primary root cause from a list of causes."""
@@ -1513,18 +1517,20 @@ class InterferenceRootCauseAnalyzer:
 
     def _determine_priority(self, causes: List[str], details: dict, cluster: pd.Series) -> str:
         """Determine recommendation priority based on analysis."""
+        cfg = self.params
+
         # High priority indicators (including tall_site_overshoot - Fix #8)
         high_priority_causes = ['low_tilt', 'very_close_proximity', 'tall_site_overshoot']
         if any(c in causes for c in high_priority_causes):
             return 'high'
 
-        # Consider cluster size (n_grids, n_cells)
+        # Consider cluster size (n_grids, n_cells) using configurable thresholds
         n_grids = cluster.get('n_grids', 0)
         n_cells = cluster.get('n_cells', 0)
 
-        if n_grids > 50 or n_cells > 6:
+        if n_grids > cfg.high_priority_grid_threshold or n_cells > cfg.high_priority_cell_threshold:
             return 'high'
-        elif n_grids > 20 or n_cells > 4:
+        elif n_grids > cfg.medium_priority_grid_threshold or n_cells > cfg.medium_priority_cell_threshold:
             return 'medium'
 
         # Medium priority for other actionable causes
