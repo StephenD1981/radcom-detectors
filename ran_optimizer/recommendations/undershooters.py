@@ -5,11 +5,11 @@ Identifies cells with insufficient coverage in areas with low interference,
 which are candidates for up-tilting to extend their reach.
 """
 from dataclasses import dataclass
-from typing import Optional, Tuple, Union
+from typing import List, Optional, Tuple, Union
 from pathlib import Path
+import math
 import pandas as pd
 import numpy as np
-import math
 
 from ran_optimizer.utils.logging_config import get_logger
 from ran_optimizer.utils.overshooting_config import (
@@ -19,6 +19,25 @@ from ran_optimizer.utils.overshooting_config import (
 )
 
 logger = get_logger(__name__)
+
+# Module-level constants
+ANTENNA_PATTERN_COEFF = 12.0  # 3GPP TR 36.814 parabolic antenna pattern coefficient
+
+# Environment constants
+DEFAULT_ENVIRONMENT = 'suburban'
+VALID_ENVIRONMENTS = ['urban', 'suburban', 'rural']
+
+# Severity category constants
+SEVERITY_CRITICAL = 'CRITICAL'
+SEVERITY_HIGH = 'HIGH'
+SEVERITY_MEDIUM = 'MEDIUM'
+SEVERITY_LOW = 'LOW'
+SEVERITY_MINIMAL = 'MINIMAL'
+SEVERITY_CATEGORIES = [SEVERITY_CRITICAL, SEVERITY_HIGH, SEVERITY_MEDIUM, SEVERITY_LOW]
+
+# Required columns for input validation
+GRID_REQUIRED_COLUMNS = ['cell_name', 'grid', 'avg_rsrp', 'distance_to_cell', 'event_count']
+GIS_REQUIRED_COLUMNS_MINIMAL = ['cell_name', 'latitude', 'longitude']
 
 
 @dataclass
@@ -69,6 +88,19 @@ class UndershooterParams:
     severity_threshold_high: float = 0.60
     severity_threshold_medium: float = 0.40
     severity_threshold_low: float = 0.20
+
+    def __post_init__(self):
+        """Validate parameters after initialization."""
+        # Validate severity weights sum to 1.0
+        weight_sum = (
+            self.severity_weight_coverage +
+            self.severity_weight_new_grids +
+            self.severity_weight_low_interference +
+            self.severity_weight_distance +
+            self.severity_weight_traffic
+        )
+        if not np.isclose(weight_sum, 1.0, atol=0.01):
+            raise ValueError(f"Severity weights must sum to 1.0, got {weight_sum:.3f}")
 
     @classmethod
     def from_config(
@@ -180,6 +212,10 @@ class UndershooterDetector:
     >>> undershooters = detector.detect(grid_df, gis_df)
     """
 
+    # Required GIS columns for merge operations
+    GIS_REQUIRED_COLUMNS = ['cell_name', 'latitude', 'longitude', 'bearing',
+                            'tilt_mech', 'tilt_elc', 'antenna_height']
+
     def __init__(self, params: UndershooterParams):
         """Initialize detector with parameters."""
         self.params = params
@@ -189,6 +225,71 @@ class UndershooterDetector:
             min_cell_event_count=params.min_cell_event_count,
             max_interference_percentage=params.max_interference_percentage
         )
+
+    def _validate_gis_columns(self, gis_df: pd.DataFrame) -> None:
+        """
+        Validate that required GIS columns exist before merge.
+
+        Raises:
+            ValueError: If required columns are missing from gis_df
+        """
+        missing_cols = set(self.GIS_REQUIRED_COLUMNS) - set(gis_df.columns)
+        if missing_cols:
+            raise ValueError(
+                f"gis_df missing required columns for merge: {sorted(missing_cols)}. "
+                f"Available columns: {sorted(gis_df.columns)}"
+            )
+
+    def _merge_with_gis(
+        self,
+        candidates: pd.DataFrame,
+        gis_df: pd.DataFrame,
+        context: str = "GIS merge"
+    ) -> pd.DataFrame:
+        """
+        Merge candidates with GIS data, with validation and data loss warning.
+
+        Args:
+            candidates: DataFrame with cell_name column
+            gis_df: GIS DataFrame with required columns
+            context: Description for logging (e.g., "Step 4" or "detect_with_grids")
+
+        Returns:
+            Merged DataFrame
+
+        Raises:
+            ValueError: If required columns are missing
+        """
+        # Early return for empty candidates
+        if len(candidates) == 0:
+            logger.info(f"{context}: No candidates to merge")
+            return candidates.copy()
+
+        # Validate columns exist
+        self._validate_gis_columns(gis_df)
+
+        rows_before = len(candidates)
+
+        # Perform inner merge
+        merged = candidates.merge(
+            gis_df[self.GIS_REQUIRED_COLUMNS],
+            on='cell_name',
+            how='inner'
+        )
+
+        rows_after = len(merged)
+        rows_lost = rows_before - rows_after
+
+        if rows_lost > 0:
+            logger.warning(
+                f"{context}: Inner merge dropped rows (candidates without GIS data)",
+                rows_before=rows_before,
+                rows_after=rows_after,
+                rows_lost=rows_lost,
+                pct_lost=round(rows_lost / rows_before * 100, 1) if rows_before > 0 else 0,
+            )
+
+        return merged
 
     def _sanitise_inputs(
         self,
@@ -203,13 +304,32 @@ class UndershooterDetector:
         - Rows with invalid coordinates
         - Rows with null/negative distance values (grid_df)
         - Rows with null RSRP values (grid_df)
+
+        Raises:
+            ValueError: If required columns are missing from input DataFrames
         """
+        # Validate required columns exist before processing
+        grid_required = ['cell_name', 'grid', 'avg_rsrp', 'distance_to_cell']
+        grid_missing = set(grid_required) - set(grid_df.columns)
+        if grid_missing:
+            raise ValueError(
+                f"grid_df missing required columns: {sorted(grid_missing)}. "
+                f"Available: {sorted(grid_df.columns)}"
+            )
+
+        gis_missing = set(GIS_REQUIRED_COLUMNS_MINIMAL) - set(gis_df.columns)
+        if gis_missing:
+            raise ValueError(
+                f"gis_df missing required columns: {sorted(gis_missing)}. "
+                f"Available: {sorted(gis_df.columns)}"
+            )
+
         # Sanitise grid_df
         grid_clean = grid_df.copy()
         initial_grid_rows = len(grid_clean)
 
         # Remove nulls in critical columns
-        grid_clean = grid_clean.dropna(subset=['cell_name', 'grid', 'avg_rsrp', 'distance_to_cell'])
+        grid_clean = grid_clean.dropna(subset=grid_required)
 
         # Remove invalid distances
         grid_clean = grid_clean[grid_clean['distance_to_cell'] > 0]
@@ -229,7 +349,7 @@ class UndershooterDetector:
         initial_gis_rows = len(gis_clean)
 
         # Remove nulls in critical columns
-        gis_clean = gis_clean.dropna(subset=['cell_name', 'latitude', 'longitude'])
+        gis_clean = gis_clean.dropna(subset=GIS_REQUIRED_COLUMNS_MINIMAL)
 
         # Ensure cell_name is string
         gis_clean['cell_name'] = gis_clean['cell_name'].astype(str)
@@ -321,14 +441,9 @@ class UndershooterDetector:
             logger.warning("No candidates passed traffic/interference filters")
             return pd.DataFrame()
 
-        # Step 4: Merge with GIS data
+        # Step 4: Merge with GIS data (with validation and data loss warning)
         logger.info("Step 4: Merging with cell GIS data")
-        candidates = candidates.merge(
-            gis_df[['cell_name', 'latitude', 'longitude', 'bearing',
-                   'tilt_mech', 'tilt_elc', 'antenna_height']],
-            on='cell_name',
-            how='inner'
-        )
+        candidates = self._merge_with_gis(candidates, gis_df, context="Step 4 (detect)")
 
         # Step 5: Calculate uptilt impact
         logger.info("Step 5: Calculating uptilt impact (1° and 2°)")
@@ -392,13 +507,8 @@ class UndershooterDetector:
             logger.warning("No candidates passed traffic/interference filters")
             return pd.DataFrame(), interference_grids_df
 
-        # Step 4: Merge with GIS data
-        candidates = candidates.merge(
-            gis_df[['cell_name', 'latitude', 'longitude', 'bearing',
-                   'tilt_mech', 'tilt_elc', 'antenna_height']],
-            on='cell_name',
-            how='inner'
-        )
+        # Step 4: Merge with GIS data (with validation and data loss warning)
+        candidates = self._merge_with_gis(candidates, gis_df, context="Step 4 (detect_with_grids)")
 
         # Step 5: Calculate uptilt impact
         candidates = self._calculate_uptilt_impact(candidates)
@@ -454,8 +564,8 @@ class UndershooterDetector:
 
         # Helper to get params for a cell
         def get_params(cell_name: str) -> UndershooterParams:
-            env = cell_env_map.get(str(cell_name), 'suburban')
-            return env_params.get(env, env_params['suburban'])
+            env = cell_env_map.get(str(cell_name), DEFAULT_ENVIRONMENT)
+            return env_params.get(env, env_params[DEFAULT_ENVIRONMENT])
 
         # Step 1: Calculate cell statistics
         cell_stats = grid_df.groupby('cell_name').agg({
@@ -464,17 +574,19 @@ class UndershooterDetector:
             'grid': 'count'
         }).reset_index()
         cell_stats.columns = ['cell_name', 'max_distance_m', 'total_traffic', 'total_grids']
+        # Ensure cell_name is string for consistent mapping
+        cell_stats['cell_name'] = cell_stats['cell_name'].astype(str)
 
         # Step 2: Filter by distance using per-cell thresholds (vectorized)
         # Build environment -> max_cell_distance lookup
         env_max_distance = {env: p.max_cell_distance for env, p in env_params.items()}
         # Map cell_name -> environment -> max_cell_distance
-        cell_envs = cell_stats['cell_name'].map(cell_env_map).fillna('suburban')
+        cell_envs = cell_stats['cell_name'].map(cell_env_map).fillna(DEFAULT_ENVIRONMENT)
         cell_max_distance = cell_envs.map(env_max_distance)
         candidates = cell_stats[cell_stats['max_distance_m'] <= cell_max_distance].copy()
 
         # Add environment to candidates
-        candidates['environment'] = candidates['cell_name'].map(cell_env_map).fillna('suburban')
+        candidates['environment'] = candidates['cell_name'].map(cell_env_map).fillna(DEFAULT_ENVIRONMENT)
 
         logger.info(
             "After distance filter (per-cell)",
@@ -532,13 +644,8 @@ class UndershooterDetector:
             logger.warning("No candidates passed traffic/interference filters")
             return pd.DataFrame()
 
-        # Step 5: Merge with GIS data
-        filtered = filtered.merge(
-            gis_df[['cell_name', 'latitude', 'longitude', 'bearing',
-                   'tilt_mech', 'tilt_elc', 'antenna_height']],
-            on='cell_name',
-            how='inner'
-        )
+        # Step 5: Merge with GIS data (with validation and data loss warning)
+        filtered = self._merge_with_gis(filtered, gis_df, context="Step 5 (detect_with_environments)")
 
         # Step 6: Calculate uptilt impact with environment-specific path loss exponents
         filtered = self._calculate_uptilt_impact_by_environment(
@@ -552,7 +659,7 @@ class UndershooterDetector:
 
         # Add environment metadata
         if len(undershooters) > 0:
-            undershooters['environment'] = undershooters['cell_name'].map(cell_env_map).fillna('suburban')
+            undershooters['environment'] = undershooters['cell_name'].map(cell_env_map).fillna(DEFAULT_ENVIRONMENT)
             undershooters['environment'] = undershooters['environment'].str.upper()
 
             # Merge with intersite distance if available
@@ -594,6 +701,16 @@ class UndershooterDetector:
             p90_rsrp = grid_df_temp.groupby('grid')['avg_rsrp'].quantile(rsrp_quantile).to_dict()
             grid_df_temp['p90_rsrp_in_grid'] = grid_df_temp['grid'].map(p90_rsrp)
 
+        # Warn about missing P90 RSRP values (data quality check)
+        nan_count = grid_df_temp['p90_rsrp_in_grid'].isna().sum()
+        if nan_count > 0:
+            logger.warning(
+                "Missing P90 RSRP for some grid entries in interference calculation",
+                nan_count=nan_count,
+                total_rows=len(grid_df_temp),
+                pct_missing=round(nan_count / len(grid_df_temp) * 100, 2),
+            )
+
         # Calculate RSRP diff and competing flag
         grid_df_temp['rsrp_diff'] = grid_df_temp['p90_rsrp_in_grid'] - grid_df_temp['avg_rsrp']
         grid_df_temp['is_competing'] = grid_df_temp['rsrp_diff'] <= self.params.interference_threshold_db
@@ -619,7 +736,7 @@ class UndershooterDetector:
         # Build environment -> max_cell_grid_count lookup
         env_max_grid_count = {env: p.max_cell_grid_count for env, p in env_params.items()}
         # Map cell_name -> environment -> max_cell_grid_count
-        grid_envs = candidate_grids['cell_name'].map(cell_env_map).fillna('suburban')
+        grid_envs = candidate_grids['cell_name'].map(cell_env_map).fillna(DEFAULT_ENVIRONMENT)
         grid_max_count = grid_envs.map(env_max_grid_count)
         candidate_grids['is_interfering'] = candidate_grids['competing_cells'] > grid_max_count
 
@@ -663,7 +780,7 @@ class UndershooterDetector:
         env_min_dist_1deg = {env: p.min_distance_gain_1deg_m for env, p in env_params.items()}
 
         # Map thresholds to each cell based on environment
-        cell_envs = candidates['cell_name'].map(cell_env_map).fillna('suburban')
+        cell_envs = candidates['cell_name'].map(cell_env_map).fillna(DEFAULT_ENVIRONMENT)
         min_cov_2deg = cell_envs.map(env_min_cov_2deg)
         min_dist_2deg = cell_envs.map(env_min_dist_2deg)
         min_cov_1deg = cell_envs.map(env_min_cov_1deg)
@@ -699,11 +816,13 @@ class UndershooterDetector:
             default=0.0
         )
 
-        # Add physical constraint note for cells that can't uptilt
+        # Add physical constraint note for cells that can't uptilt (vectorized)
         # These cells are undershooting but can't be fixed via tilt - may indicate physical build issue
         if 'uptilt_constraint' in candidates.columns:
-            candidates['physical_constraint_note'] = candidates['uptilt_constraint'].apply(
-                lambda x: "Cell at minimum tilt (0°) - investigate physical build" if x == 'MIN_TILT_REACHED' else None
+            candidates['physical_constraint_note'] = np.where(
+                candidates['uptilt_constraint'] == 'MIN_TILT_REACHED',
+                "Cell at minimum tilt (0 deg) - investigate physical build",
+                None
             )
         else:
             candidates['physical_constraint_note'] = None
@@ -769,6 +888,8 @@ class UndershooterDetector:
         }).reset_index()
 
         cell_stats.columns = ['cell_name', 'max_distance_m', 'total_traffic', 'total_grids']
+        # Ensure cell_name is string for consistent mapping
+        cell_stats['cell_name'] = cell_stats['cell_name'].astype(str)
 
         # Filter by distance
         candidates = cell_stats[
@@ -826,6 +947,16 @@ class UndershooterDetector:
             p90_rsrp_per_grid_band = grid_df_temp.groupby(['grid', 'band'])['avg_rsrp'].quantile(rsrp_quantile)
             grid_df_temp['p90_rsrp_in_grid'] = grid_df_temp.set_index(['grid', 'band']).index.map(p90_rsrp_per_grid_band)
 
+            # Data quality check: warn about missing P90 RSRP values
+            nan_count = grid_df_temp['p90_rsrp_in_grid'].isna().sum()
+            if nan_count > 0:
+                logger.warning(
+                    "Missing P90 RSRP for some grid entries",
+                    nan_count=nan_count,
+                    total_rows=len(grid_df_temp),
+                    pct_missing=round(nan_count / len(grid_df_temp) * 100, 2),
+                )
+
             # Step 2: Calculate RSRP difference from strongest in same band
             grid_df_temp['rsrp_diff'] = grid_df_temp['p90_rsrp_in_grid'] - grid_df_temp['avg_rsrp']
 
@@ -853,6 +984,16 @@ class UndershooterDetector:
             # Step 1: Find reference RSRP (configurable quantile) per grid
             p90_rsrp_per_grid = grid_df_temp.groupby('grid')['avg_rsrp'].quantile(rsrp_quantile).to_dict()
             grid_df_temp['p90_rsrp_in_grid'] = grid_df_temp['grid'].map(p90_rsrp_per_grid)
+
+            # Data quality check: warn about missing P90 RSRP values
+            nan_count = grid_df_temp['p90_rsrp_in_grid'].isna().sum()
+            if nan_count > 0:
+                logger.warning(
+                    "Missing P90 RSRP for some grid entries",
+                    nan_count=nan_count,
+                    total_rows=len(grid_df_temp),
+                    pct_missing=round(nan_count / len(grid_df_temp) * 100, 2),
+                )
 
             # Step 2: Calculate RSRP difference from strongest
             grid_df_temp['rsrp_diff'] = grid_df_temp['p90_rsrp_in_grid'] - grid_df_temp['avg_rsrp']
@@ -928,38 +1069,109 @@ class UndershooterDetector:
         return filtered
 
     def _calculate_uptilt_impact(self, candidates: pd.DataFrame) -> pd.DataFrame:
-        """Calculate predicted impact of 1° and 2° uptilt."""
-        # Calculate for 1 degree uptilt
-        uptilt_1deg = candidates.apply(
-            lambda row: self._estimate_distance_after_tilt(
-                d_max_m=row['max_distance_m'],
-                alpha_deg=row['tilt_elc'] + row['tilt_mech'],
-                h_m=row['antenna_height'],
-                delta_tilt_deg=-1.0  # negative = uptilt
-            ),
-            axis=1,
-            result_type='expand'
+        """Calculate predicted impact of 1° and 2° uptilt (vectorized)."""
+        # Pre-compute common values
+        d_max = candidates['max_distance_m'].values
+        alpha = (candidates['tilt_elc'] + candidates['tilt_mech']).values
+        h = candidates['antenna_height'].values
+
+        # Calculate for 1 degree uptilt (vectorized)
+        new_dist_1, cov_inc_1 = self._estimate_distance_after_tilt_vectorized(
+            d_max, alpha, h, delta_tilt_deg=-1.0
         )
+        candidates['new_distance_1deg_m'] = new_dist_1
+        candidates['coverage_increase_1deg_pct'] = cov_inc_1
 
-        candidates['new_distance_1deg_m'] = uptilt_1deg[0]
-        candidates['coverage_increase_1deg_pct'] = uptilt_1deg[1]
-
-        # Calculate for 2 degrees uptilt
-        uptilt_2deg = candidates.apply(
-            lambda row: self._estimate_distance_after_tilt(
-                d_max_m=row['max_distance_m'],
-                alpha_deg=row['tilt_elc'] + row['tilt_mech'],
-                h_m=row['antenna_height'],
-                delta_tilt_deg=-2.0  # negative = uptilt
-            ),
-            axis=1,
-            result_type='expand'
+        # Calculate for 2 degrees uptilt (vectorized)
+        new_dist_2, cov_inc_2 = self._estimate_distance_after_tilt_vectorized(
+            d_max, alpha, h, delta_tilt_deg=-2.0
         )
-
-        candidates['new_distance_2deg_m'] = uptilt_2deg[0]
-        candidates['coverage_increase_2deg_pct'] = uptilt_2deg[1]
+        candidates['new_distance_2deg_m'] = new_dist_2
+        candidates['coverage_increase_2deg_pct'] = cov_inc_2
 
         return candidates
+
+    def _estimate_distance_after_tilt_vectorized(
+        self,
+        d_max_m: np.ndarray,
+        alpha_deg: np.ndarray,
+        h_m: np.ndarray,
+        delta_tilt_deg: float
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Vectorized estimation of new max coverage distance after tilt change.
+
+        Parameters
+        ----------
+        d_max_m : np.ndarray
+            Current maximum serving distances (meters)
+        alpha_deg : np.ndarray
+            Current total downtilts (mechanical + electrical, degrees)
+        h_m : np.ndarray
+            Antenna heights above UE (meters)
+        delta_tilt_deg : float
+            Tilt change (negative for uptilt, positive for downtilt)
+
+        Returns
+        -------
+        Tuple[np.ndarray, np.ndarray]
+            - new_distance_m: Predicted new maximum distances
+            - increase_pct: Fractional increases (e.g., 0.15 = 15% increase)
+        """
+        # Initialize outputs with defaults
+        new_dist = d_max_m.copy()
+        increase_pct = np.zeros_like(d_max_m)
+
+        # Create mask for valid calculations
+        # Can't uptilt from 0° or negative tilt
+        valid_tilt = ~((alpha_deg <= 0) & (delta_tilt_deg < 0))
+        # Need positive distance and height
+        valid_geom = (d_max_m > 0) & (h_m > 0)
+        valid = valid_tilt & valid_geom
+
+        if not np.any(valid):
+            return new_dist, increase_pct
+
+        # Extract valid values for calculation
+        d_valid = d_max_m[valid]
+        alpha_valid = alpha_deg[valid]
+        h_valid = h_m[valid]
+
+        # Elevation angle from site to current edge user
+        theta_e_deg = np.degrees(np.arctan2(h_valid, d_valid))
+
+        # 3GPP vertical attenuation before and after tilt change
+        A_before = self._vertical_attenuation_vectorized(theta_e_deg, alpha_valid)
+        A_after = self._vertical_attenuation_vectorized(theta_e_deg, alpha_valid + delta_tilt_deg)
+
+        # Gain change at edge direction (dB)
+        deltaG_dB = -(A_after - A_before)
+
+        # Translate to distance using log-distance model
+        d_new = d_valid * (10.0 ** (deltaG_dB / (10.0 * self.params.path_loss_exponent)))
+
+        # For uptilt, don't allow decrease
+        d_new = np.maximum(d_new, d_valid)
+
+        # Calculate percentage increase
+        inc_pct = (d_new - d_valid) / d_valid
+
+        # Store results back
+        new_dist[valid] = d_new
+        increase_pct[valid] = inc_pct
+
+        return new_dist, increase_pct
+
+    def _vertical_attenuation_vectorized(
+        self,
+        theta_deg: np.ndarray,
+        alpha_deg: np.ndarray
+    ) -> np.ndarray:
+        """Vectorized 3GPP parabolic attenuation in vertical plane (dB)."""
+        return np.minimum(
+            ANTENNA_PATTERN_COEFF * (((theta_deg - alpha_deg) / self.params.hpbw_v_deg) ** 2),
+            self.params.sla_v_db
+        )
 
     def _calculate_uptilt_impact_by_environment(
         self,
@@ -968,7 +1180,7 @@ class UndershooterDetector:
         env_params: dict,
     ) -> pd.DataFrame:
         """
-        Calculate predicted impact of 1° and 2° uptilt using environment-specific path loss exponents.
+        Calculate predicted impact of 1° and 2° uptilt using environment-specific path loss exponents (vectorized).
 
         Args:
             candidates: DataFrame with cell info including tilt and antenna height
@@ -978,44 +1190,30 @@ class UndershooterDetector:
         Returns:
             DataFrame with uptilt impact columns added
         """
-        def get_path_loss_exponent(cell_name: str) -> float:
-            """Get path loss exponent for a cell based on its environment."""
-            env = cell_env_map.get(str(cell_name), 'suburban')
-            params = env_params.get(env, env_params['suburban'])
-            return params.path_loss_exponent
+        # Pre-compute common values
+        d_max = candidates['max_distance_m'].values
+        alpha = (candidates['tilt_elc'] + candidates['tilt_mech']).values
+        h = candidates['antenna_height'].values
 
-        # Calculate for 1 degree uptilt
-        uptilt_1deg = candidates.apply(
-            lambda row: self._estimate_distance_after_tilt_with_ple(
-                d_max_m=row['max_distance_m'],
-                alpha_deg=row['tilt_elc'] + row['tilt_mech'],
-                h_m=row['antenna_height'],
-                delta_tilt_deg=-1.0,  # negative = uptilt
-                path_loss_exponent=get_path_loss_exponent(row['cell_name'])
-            ),
-            axis=1,
-            result_type='expand'
+        # Build path loss exponent array for each cell (vectorized lookup)
+        env_ple_map = {env: p.path_loss_exponent for env, p in env_params.items()}
+        cell_envs = candidates['cell_name'].map(cell_env_map).fillna(DEFAULT_ENVIRONMENT)
+        ple_array = cell_envs.map(env_ple_map).values
+
+        # Calculate for 1 degree uptilt (vectorized)
+        new_dist_1, cov_inc_1, constraint = self._estimate_distance_after_tilt_vectorized_with_ple(
+            d_max, alpha, h, delta_tilt_deg=-1.0, path_loss_exponents=ple_array
         )
+        candidates['new_distance_1deg_m'] = new_dist_1
+        candidates['coverage_increase_1deg_pct'] = cov_inc_1
+        candidates['uptilt_constraint'] = constraint
 
-        candidates['new_distance_1deg_m'] = uptilt_1deg[0]
-        candidates['coverage_increase_1deg_pct'] = uptilt_1deg[1]
-        candidates['uptilt_constraint'] = uptilt_1deg[2]
-
-        # Calculate for 2 degrees uptilt
-        uptilt_2deg = candidates.apply(
-            lambda row: self._estimate_distance_after_tilt_with_ple(
-                d_max_m=row['max_distance_m'],
-                alpha_deg=row['tilt_elc'] + row['tilt_mech'],
-                h_m=row['antenna_height'],
-                delta_tilt_deg=-2.0,  # negative = uptilt
-                path_loss_exponent=get_path_loss_exponent(row['cell_name'])
-            ),
-            axis=1,
-            result_type='expand'
+        # Calculate for 2 degrees uptilt (vectorized)
+        new_dist_2, cov_inc_2, _ = self._estimate_distance_after_tilt_vectorized_with_ple(
+            d_max, alpha, h, delta_tilt_deg=-2.0, path_loss_exponents=ple_array
         )
-
-        candidates['new_distance_2deg_m'] = uptilt_2deg[0]
-        candidates['coverage_increase_2deg_pct'] = uptilt_2deg[1]
+        candidates['new_distance_2deg_m'] = new_dist_2
+        candidates['coverage_increase_2deg_pct'] = cov_inc_2
 
         logger.info(
             "Calculated uptilt impact with environment-specific path loss exponents",
@@ -1023,6 +1221,85 @@ class UndershooterDetector:
         )
 
         return candidates
+
+    def _estimate_distance_after_tilt_vectorized_with_ple(
+        self,
+        d_max_m: np.ndarray,
+        alpha_deg: np.ndarray,
+        h_m: np.ndarray,
+        delta_tilt_deg: float,
+        path_loss_exponents: np.ndarray
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        Vectorized estimation of new max coverage distance with per-cell path loss exponents.
+
+        Parameters
+        ----------
+        d_max_m : np.ndarray
+            Current maximum serving distances (meters)
+        alpha_deg : np.ndarray
+            Current total downtilts (mechanical + electrical, degrees)
+        h_m : np.ndarray
+            Antenna heights above UE (meters)
+        delta_tilt_deg : float
+            Tilt change (negative for uptilt, positive for downtilt)
+        path_loss_exponents : np.ndarray
+            Path loss exponents for each cell
+
+        Returns
+        -------
+        Tuple[np.ndarray, np.ndarray, np.ndarray]
+            - new_distance_m: Predicted new maximum distances
+            - increase_pct: Fractional increases
+            - constraints: Array of constraint strings (None where no constraint)
+        """
+        n = len(d_max_m)
+        new_dist = d_max_m.copy()
+        increase_pct = np.zeros(n)
+        constraints = np.array([None] * n, dtype=object)
+
+        # Create masks for different conditions
+        # Can't uptilt from 0° or negative tilt
+        at_min_tilt = (alpha_deg <= 0) & (delta_tilt_deg < 0)
+        constraints[at_min_tilt] = "MIN_TILT_REACHED"
+
+        # Need positive distance and height
+        valid_geom = (d_max_m > 0) & (h_m > 0)
+        valid = ~at_min_tilt & valid_geom
+
+        if not np.any(valid):
+            return new_dist, increase_pct, constraints
+
+        # Extract valid values for calculation
+        d_valid = d_max_m[valid]
+        alpha_valid = alpha_deg[valid]
+        h_valid = h_m[valid]
+        ple_valid = path_loss_exponents[valid]
+
+        # Elevation angle from site to current edge user
+        theta_e_deg = np.degrees(np.arctan2(h_valid, d_valid))
+
+        # 3GPP vertical attenuation before and after tilt change
+        A_before = self._vertical_attenuation_vectorized(theta_e_deg, alpha_valid)
+        A_after = self._vertical_attenuation_vectorized(theta_e_deg, alpha_valid + delta_tilt_deg)
+
+        # Gain change at edge direction (dB)
+        deltaG_dB = -(A_after - A_before)
+
+        # Translate to distance using log-distance model with per-cell PLE
+        d_new = d_valid * (10.0 ** (deltaG_dB / (10.0 * ple_valid)))
+
+        # For uptilt, don't allow decrease
+        d_new = np.maximum(d_new, d_valid)
+
+        # Calculate percentage increase
+        inc_pct = (d_new - d_valid) / d_valid
+
+        # Store results back
+        new_dist[valid] = d_new
+        increase_pct[valid] = inc_pct
+
+        return new_dist, increase_pct, constraints
 
     def _estimate_distance_after_tilt_with_ple(
         self,
@@ -1153,7 +1430,7 @@ class UndershooterDetector:
     def _vertical_attenuation(self, theta_deg: float, alpha_deg: float) -> float:
         """3GPP parabolic attenuation in vertical plane (dB)."""
         return min(
-            12.0 * (((theta_deg - alpha_deg) / self.params.hpbw_v_deg) ** 2),
+            ANTENNA_PATTERN_COEFF * (((theta_deg - alpha_deg) / self.params.hpbw_v_deg) ** 2),
             self.params.sla_v_db
         )
 
@@ -1220,7 +1497,7 @@ class UndershooterDetector:
         )
         undershooters['new_coverage_grids'] = (
             undershooters['total_grids'] * undershooters['coverage_increase_percentage']
-        ).round().astype(int)
+        ).round().astype(np.int64)
         undershooters['total_coverage_after_uptilt'] = (
             undershooters['current_coverage_grids'] + undershooters['new_coverage_grids']
         )
@@ -1257,8 +1534,9 @@ class UndershooterDetector:
                 - severity_category: CRITICAL/HIGH/MEDIUM/LOW/MINIMAL
         """
         if len(undershooters) == 0:
-            undershooters['severity_score'] = []
-            undershooters['severity_category'] = []
+            # Return empty DataFrame with correct columns and dtypes
+            undershooters['severity_score'] = pd.Series(dtype=float)
+            undershooters['severity_category'] = pd.Series(dtype=str)
             return undershooters
 
         # Calculate dataset statistics for normalization using percentiles (robust to outliers)
@@ -1324,8 +1602,9 @@ class UndershooterDetector:
             undershooters['severity_score'] >= self.params.severity_threshold_medium,
             undershooters['severity_score'] >= self.params.severity_threshold_low,
         ]
-        choices = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']
-        undershooters['severity_category'] = np.select(conditions, choices, default='MINIMAL')
+        undershooters['severity_category'] = np.select(
+            conditions, SEVERITY_CATEGORIES, default=SEVERITY_MINIMAL
+        )
 
         logger.info(
             "Undershooting severity scores calculated",
@@ -1475,7 +1754,7 @@ def detect_undershooting_with_environment_awareness(
         )
 
     # Create detector with default params (used for shared calculations)
-    detector = UndershooterDetector(env_params['suburban'])
+    detector = UndershooterDetector(env_params[DEFAULT_ENVIRONMENT])
 
     # Run detection ONCE with per-cell environment parameters
     undershooters = detector.detect_with_environments(
