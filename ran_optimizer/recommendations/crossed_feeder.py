@@ -14,8 +14,10 @@ A true crossed feeder shows a SWAP PATTERN:
 
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -88,17 +90,28 @@ def is_in_beam(azimuth: float, target_angle: float, half_width: float) -> bool:
 def weighted_circular_mean(angles: np.ndarray, weights: np.ndarray) -> float:
     """
     Calculate weighted circular mean of angles in degrees.
-    Returns angle in [0, 360).
+    Returns angle in [0, 360), or NaN if inputs are invalid.
     """
-    if len(angles) == 0 or weights.sum() == 0:
+    if len(angles) == 0 or len(weights) == 0:
+        return np.nan
+
+    # Filter out NaN values from both arrays
+    valid_mask = ~np.isnan(angles) & ~np.isnan(weights)
+    if not valid_mask.any():
+        return np.nan
+
+    valid_angles = angles[valid_mask]
+    valid_weights = weights[valid_mask]
+
+    if valid_weights.sum() == 0:
         return np.nan
 
     # Convert to radians
-    rad = np.radians(angles)
+    rad = np.radians(valid_angles)
 
     # Weighted sum of unit vectors
-    x = np.sum(weights * np.cos(rad))
-    y = np.sum(weights * np.sin(rad))
+    x = np.sum(valid_weights * np.cos(rad))
+    y = np.sum(valid_weights * np.sin(rad))
 
     # Convert back to degrees
     mean_rad = np.arctan2(y, x)
@@ -170,6 +183,11 @@ class CrossedFeederParams:
     min_total_relations: int = 5  # Need at least N relations to have confidence
     min_out_of_beam_relations: int = 3  # Need at least N out-of-beam relations to flag
 
+    # Swap candidate thresholds (looser thresholds for initial swap detection)
+    swap_candidate_min_oob_ratio: float = 0.5  # Min out-of-beam ratio for swap candidates
+    swap_candidate_min_relations: int = 3  # Min total relations for swap candidates
+    swap_candidate_min_oob_relations: int = 2  # Min out-of-beam relations for swap candidates
+
     # Data quality thresholds
     max_data_drop_ratio: float = 0.5
     max_detection_rate: float = 0.20
@@ -177,46 +195,79 @@ class CrossedFeederParams:
     # Output options
     top_k_relations_per_cell: int = 5
 
+    def __post_init__(self):
+        """Validate parameter ranges."""
+        if self.min_distance_m < 0:
+            raise ValueError("min_distance_m must be non-negative")
+        if self.max_radius_m <= 0:
+            raise ValueError("max_radius_m must be positive")
+        if not 0 <= self.min_out_of_beam_ratio <= 1:
+            raise ValueError("min_out_of_beam_ratio must be in [0, 1]")
+        if not 0 <= self.swap_candidate_min_oob_ratio <= 1:
+            raise ValueError("swap_candidate_min_oob_ratio must be in [0, 1]")
+        if self.swap_angle_tolerance_deg < 0 or self.swap_angle_tolerance_deg > 180:
+            raise ValueError("swap_angle_tolerance_deg must be in [0, 180]")
+        if self.min_total_relations < 1:
+            raise ValueError("min_total_relations must be at least 1")
+        if self.swap_candidate_min_relations < 1:
+            raise ValueError("swap_candidate_min_relations must be at least 1")
+        if not 0 < self.beamwidth_expansion_factor <= 3:
+            raise ValueError("beamwidth_expansion_factor must be in (0, 3]")
+
     @classmethod
     def from_config(cls, config_path: Optional[str] = None) -> 'CrossedFeederParams':
         """Load parameters from config file or use defaults."""
         if config_path is None:
             config_path = "config/crossed_feeder_params.json"
 
+        path = Path(config_path)
+        if not path.exists():
+            logger.warning(f"Config file not found: {config_path}. Using defaults.")
+            return cls()
+
         try:
-            import json
-            from pathlib import Path
-
-            path = Path(config_path)
-            if not path.exists():
-                logger.warning(f"Config file not found: {config_path}. Using defaults.")
-                return cls()
-
             with open(path, 'r') as f:
                 config = json.load(f)
+        except json.JSONDecodeError as e:
+            logger.warning(f"Invalid JSON in config file {config_path}: {e}. Using defaults.")
+            return cls()
+        except OSError as e:
+            logger.warning(f"Cannot read config file {config_path}: {e}. Using defaults.")
+            return cls()
 
-            params = config.get('default', config)
+        if not isinstance(config, dict):
+            logger.warning(f"Config file {config_path} does not contain a dict. Using defaults.")
+            return cls()
 
+        params = config.get('default', config)
+        if not isinstance(params, dict):
+            logger.warning(f"Config params is not a dict. Using defaults.")
+            return cls()
+
+        try:
             return cls(
-                max_radius_m=params.get('max_radius_m', 32000.0),
-                min_distance_m=params.get('min_distance_m', 500.0),
+                max_radius_m=float(params.get('max_radius_m', 32000.0)),
+                min_distance_m=float(params.get('min_distance_m', 500.0)),
                 band_max_radius_m=params.get('band_max_radius_m', None),
-                hbw_cap_deg=params.get('hbw_cap_deg', 60.0),
-                min_hbw_deg=params.get('min_hbw_deg', 1.0),
-                max_hbw_deg=params.get('max_hbw_deg', 179.0),
-                beamwidth_expansion_factor=params.get('beamwidth_expansion_factor', 1.5),
-                use_strength_col=params.get('use_strength_col', 'cell_perc_weight'),
-                swap_angle_tolerance_deg=params.get('swap_angle_tolerance_deg', 30.0),
-                min_out_of_beam_ratio=params.get('min_out_of_beam_ratio', 0.5),
-                min_out_of_beam_weight=params.get('min_out_of_beam_weight', 5.0),
-                min_total_relations=params.get('min_total_relations', 5),
-                min_out_of_beam_relations=params.get('min_out_of_beam_relations', 3),
-                max_data_drop_ratio=params.get('max_data_drop_ratio', 0.5),
-                max_detection_rate=params.get('max_detection_rate', 0.20),
-                top_k_relations_per_cell=params.get('top_k_relations_per_cell', 5),
+                hbw_cap_deg=float(params.get('hbw_cap_deg', 60.0)),
+                min_hbw_deg=float(params.get('min_hbw_deg', 1.0)),
+                max_hbw_deg=float(params.get('max_hbw_deg', 179.0)),
+                beamwidth_expansion_factor=float(params.get('beamwidth_expansion_factor', 1.5)),
+                use_strength_col=str(params.get('use_strength_col', 'cell_perc_weight')),
+                swap_angle_tolerance_deg=float(params.get('swap_angle_tolerance_deg', 30.0)),
+                min_out_of_beam_ratio=float(params.get('min_out_of_beam_ratio', 0.5)),
+                min_out_of_beam_weight=float(params.get('min_out_of_beam_weight', 5.0)),
+                min_total_relations=int(params.get('min_total_relations', 5)),
+                min_out_of_beam_relations=int(params.get('min_out_of_beam_relations', 3)),
+                swap_candidate_min_oob_ratio=float(params.get('swap_candidate_min_oob_ratio', 0.5)),
+                swap_candidate_min_relations=int(params.get('swap_candidate_min_relations', 3)),
+                swap_candidate_min_oob_relations=int(params.get('swap_candidate_min_oob_relations', 2)),
+                max_data_drop_ratio=float(params.get('max_data_drop_ratio', 0.5)),
+                max_detection_rate=float(params.get('max_detection_rate', 0.20)),
+                top_k_relations_per_cell=int(params.get('top_k_relations_per_cell', 5)),
             )
-        except Exception as e:
-            logger.warning(f"Failed to load config: {e}. Using defaults.")
+        except (TypeError, ValueError) as e:
+            logger.warning(f"Invalid config parameter type: {e}. Using defaults.")
             return cls()
 
 
@@ -398,8 +449,8 @@ class CrossedFeederDetector:
 
         df["distance"] = df["distance"].fillna(0.0)
 
-        # Normalize bearing to [0, 360) range
-        df["bearing"] = df["bearing"] % 360.0
+        # Normalize bearing to [0, 360) range with float precision rounding
+        df["bearing"] = (df["bearing"] % 360.0).round(6)
 
         # Drop rows missing essential geometry
         before = len(df)
@@ -542,12 +593,12 @@ class CrossedFeederDetector:
             # Get actual cell count from GIS for this site+band
             n_cells_on_band = site_band_cell_count.get((site, band), n_cells)
 
-            # For swap detection: use looser thresholds (ratio >= 0.5, any weight)
+            # For swap detection: use looser thresholds (configurable)
             # because the reciprocal swap pattern itself is strong evidence
             swap_candidates = group[
-                (group["out_of_beam_ratio"] >= 0.5) &
-                (group["total_relations"] >= 3) &
-                (group["out_of_beam_relations"] >= 2)
+                (group["out_of_beam_ratio"] >= cfg.swap_candidate_min_oob_ratio) &
+                (group["total_relations"] >= cfg.swap_candidate_min_relations) &
+                (group["out_of_beam_relations"] >= cfg.swap_candidate_min_oob_relations)
             ]
 
             # For MEDIUM/LOW flagging: use stricter thresholds
@@ -562,12 +613,15 @@ class CrossedFeederDetector:
             n_anomalous = len(anomalous)
             n_swap_candidates = len(swap_candidates)
 
+            # Pre-compute set for O(1) lookups instead of O(n) array search
+            anomalous_cells = set(anomalous["cell_name"])
+
             # Handle single-cell-on-band case: can't be crossed feeders (nothing to swap with)
             # But flag as antenna repan candidates if significant out-of-beam traffic
             if n_cells_on_band == 1:
                 for _, cell in group.iterrows():
                     cell_name = cell["cell_name"]
-                    if cell_name in anomalous["cell_name"].values:
+                    if cell_name in anomalous_cells:
                         # Significant out-of-beam but only 1 cell on band - repan candidate
                         results.append(self._build_cell_result(
                             cell, "REPAN", None,
@@ -630,7 +684,7 @@ class CrossedFeederDetector:
                         cell, "HIGH_POTENTIAL_SWAP", partner,
                         f"Reciprocal swap pattern detected with {partner}. Check feeder connections."
                     ))
-                elif cell_name in anomalous["cell_name"].values:
+                elif cell_name in anomalous_cells:
                     if n_anomalous >= 2:
                         # POSSIBLE_SWAP: multiple anomalies but no clean swap
                         results.append(self._build_cell_result(
