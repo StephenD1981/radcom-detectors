@@ -241,6 +241,12 @@ class UndershooterDetector:
                 remaining_rows=len(gis_clean)
             )
 
+        # Join band from gis_df if not present in grid_df
+        if 'band' not in grid_clean.columns and 'band' in gis_clean.columns:
+            band_lookup = gis_clean[['cell_name', 'band']].drop_duplicates('cell_name')
+            grid_clean = grid_clean.merge(band_lookup, on='cell_name', how='left')
+            logger.info("Joined band from gis_df", bands_found=grid_clean['band'].nunique())
+
         return grid_clean, gis_clean
 
     def detect(
@@ -506,6 +512,22 @@ class UndershooterDetector:
             by_environment=filtered['environment'].value_counts().to_dict() if len(filtered) > 0 else {},
         )
 
+        # Warn about cells with traffic near their environment threshold - data may be less reliable
+        # We flag cells with traffic < 2x their minimum threshold
+        if len(filtered) > 0:
+            filtered_with_threshold = filtered.copy()
+            filtered_with_threshold['_min_threshold'] = filtered_with_threshold['environment'].map(env_min_traffic)
+            filtered_with_threshold['_near_threshold'] = (
+                filtered_with_threshold['total_traffic'] < 2 * filtered_with_threshold['_min_threshold']
+            )
+            low_traffic_cells = filtered_with_threshold[filtered_with_threshold['_near_threshold']]
+            if len(low_traffic_cells) > 0:
+                logger.warning(
+                    "Some candidates have traffic near minimum threshold - analysis may be less reliable",
+                    low_traffic_count=len(low_traffic_cells),
+                    cell_examples=low_traffic_cells[['cell_name', 'total_traffic', 'environment']].head(5).to_dict('records'),
+                )
+
         if len(filtered) == 0:
             logger.warning("No candidates passed traffic/interference filters")
             return pd.DataFrame()
@@ -565,9 +587,9 @@ class UndershooterDetector:
 
         # Calculate P90 RSRP per grid (band-aware if available)
         rsrp_quantile = self.params.rsrp_competition_quantile
-        if 'Band' in grid_df.columns:
-            p90_rsrp = grid_df_temp.groupby(['grid', 'Band'])['avg_rsrp'].quantile(rsrp_quantile)
-            grid_df_temp['p90_rsrp_in_grid'] = grid_df_temp.set_index(['grid', 'Band']).index.map(p90_rsrp)
+        if 'band' in grid_df.columns:
+            p90_rsrp = grid_df_temp.groupby(['grid', 'band'])['avg_rsrp'].quantile(rsrp_quantile)
+            grid_df_temp['p90_rsrp_in_grid'] = grid_df_temp.set_index(['grid', 'band']).index.map(p90_rsrp)
         else:
             p90_rsrp = grid_df_temp.groupby('grid')['avg_rsrp'].quantile(rsrp_quantile).to_dict()
             grid_df_temp['p90_rsrp_in_grid'] = grid_df_temp['grid'].map(p90_rsrp)
@@ -577,17 +599,17 @@ class UndershooterDetector:
         grid_df_temp['is_competing'] = grid_df_temp['rsrp_diff'] <= self.params.interference_threshold_db
 
         # Count competing cells per grid
-        if 'Band' in grid_df.columns:
-            competing_per_grid = grid_df_temp.groupby(['grid', 'Band'])['is_competing'].sum().reset_index()
-            competing_per_grid.columns = ['grid', 'Band', 'competing_cells']
+        if 'band' in grid_df.columns:
+            competing_per_grid = grid_df_temp.groupby(['grid', 'band'])['is_competing'].sum().reset_index()
+            competing_per_grid.columns = ['grid', 'band', 'competing_cells']
         else:
             competing_per_grid = grid_df_temp.groupby('grid')['is_competing'].sum().reset_index()
             competing_per_grid.columns = ['grid', 'competing_cells']
 
         # For each candidate cell, determine which of its grids are "interfering"
         # based on that cell's environment-specific max_cell_grid_count
-        if 'Band' in grid_df.columns:
-            candidate_grids = candidate_grids.merge(competing_per_grid, on=['grid', 'Band'], how='left')
+        if 'band' in grid_df.columns:
+            candidate_grids = candidate_grids.merge(competing_per_grid, on=['grid', 'band'], how='left')
         else:
             candidate_grids = candidate_grids.merge(competing_per_grid, on='grid', how='left')
 
@@ -799,10 +821,10 @@ class UndershooterDetector:
 
         # BAND-AWARE: Calculate competition per grid per band
         rsrp_quantile = self.params.rsrp_competition_quantile
-        if 'Band' in grid_df.columns:
+        if 'band' in grid_df.columns:
             # Step 1: Find reference RSRP (configurable quantile) per grid PER BAND
-            p90_rsrp_per_grid_band = grid_df_temp.groupby(['grid', 'Band'])['avg_rsrp'].quantile(rsrp_quantile)
-            grid_df_temp['p90_rsrp_in_grid'] = grid_df_temp.set_index(['grid', 'Band']).index.map(p90_rsrp_per_grid_band)
+            p90_rsrp_per_grid_band = grid_df_temp.groupby(['grid', 'band'])['avg_rsrp'].quantile(rsrp_quantile)
+            grid_df_temp['p90_rsrp_in_grid'] = grid_df_temp.set_index(['grid', 'band']).index.map(p90_rsrp_per_grid_band)
 
             # Step 2: Calculate RSRP difference from strongest in same band
             grid_df_temp['rsrp_diff'] = grid_df_temp['p90_rsrp_in_grid'] - grid_df_temp['avg_rsrp']
@@ -811,20 +833,20 @@ class UndershooterDetector:
             grid_df_temp['is_competing'] = grid_df_temp['rsrp_diff'] <= self.params.interference_threshold_db
 
             # Step 4: Count competing cells per grid PER BAND
-            competing_per_grid = grid_df_temp.groupby(['grid', 'Band'])['is_competing'].sum()
+            competing_per_grid = grid_df_temp.groupby(['grid', 'band'])['is_competing'].sum()
 
             # Step 5: Flag grids (per band) with excessive competition
             interfering_grids = competing_per_grid[competing_per_grid > self.params.max_cell_grid_count].index.tolist()
             interfering_grids_set = set(interfering_grids)
 
             # Step 6: Count interfering grids per candidate cell (must match both grid AND band)
-            candidate_grids['grid_band_key'] = list(zip(candidate_grids['grid'], candidate_grids['Band']))
+            candidate_grids['grid_band_key'] = list(zip(candidate_grids['grid'], candidate_grids['band']))
             candidate_grids['is_interfering'] = candidate_grids['grid_band_key'].isin(interfering_grids_set)
 
             logger.info(
                 "Band-aware interference calculation enabled",
-                unique_bands=grid_df_temp['Band'].nunique(),
-                bands_found=grid_df_temp['Band'].unique().tolist()[:10],
+                unique_bands=grid_df_temp['band'].nunique(),
+                bands_found=grid_df_temp['band'].unique().tolist()[:10],
             )
         else:
             # Fallback: band-agnostic calculation
@@ -876,7 +898,7 @@ class UndershooterDetector:
 
         logger.info(
             "Interference metrics calculated (RSRP-based)",
-            band_aware='Band' in grid_df.columns,
+            band_aware='band' in grid_df.columns,
             cells_with_interference=len(candidates[candidates['interference_percentage'] > 0]),
             avg_interference_pct=candidates['interference_percentage'].mean(),
             max_interference_pct=candidates['interference_percentage'].max(),
@@ -1044,7 +1066,8 @@ class UndershooterDetector:
             constraint = "MIN_TILT_REACHED"
             return d_max_m, 0.0, constraint
 
-        if d_max_m <= 0 or h_m < 0:
+        if d_max_m <= 0 or h_m <= 0:
+            # Invalid distance or height (height must be positive)
             return d_max_m, 0.0, constraint
 
         # Elevation angle from site to current edge user
@@ -1098,11 +1121,12 @@ class UndershooterDetector:
         increase_pct : float
             Fractional increase (e.g., 0.15 = 15% increase)
         """
-        if alpha_deg == 0 and delta_tilt_deg < 0:
-            # Cannot uptilt from 0 degrees
+        if alpha_deg <= 0 and delta_tilt_deg < 0:
+            # Cannot uptilt from 0 degrees or negative tilt
             return d_max_m, 0.0
 
-        if d_max_m <= 0 or h_m < 0:
+        if d_max_m <= 0 or h_m <= 0:
+            # Invalid distance or height (height must be positive)
             return d_max_m, 0.0
 
         # Elevation angle from site to current edge user
