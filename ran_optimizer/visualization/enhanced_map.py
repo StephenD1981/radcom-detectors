@@ -104,7 +104,8 @@ def save_grid_data_files(
 
     has_is_overshooting = 'is_overshooting' in grid_df.columns
     has_is_interfering = 'is_interfering' in grid_df.columns
-    has_band = 'Band' in grid_df.columns
+    band_col = 'band' if 'band' in grid_df.columns else ('Band' if 'Band' in grid_df.columns else None)
+    has_band = band_col is not None
 
     for cell_name, cell_grids in grid_df.groupby('cell_name'):
         grids_list = []
@@ -119,7 +120,7 @@ def save_grid_data_files(
             highlighted = cell_grids['is_interfering'].values
         else:
             highlighted = [False] * len(cell_grids)
-        bands = cell_grids['Band'].values if has_band else [0] * len(cell_grids)
+        bands = cell_grids[band_col].values if has_band else [0] * len(cell_grids)
 
         for i in range(len(cell_grids)):
             geohash = geohashes[i]
@@ -732,8 +733,8 @@ def _add_coverage_hulls_layers(
     # Merge band info from GIS data
     hulls_with_band = hulls_gdf.copy()
     if gis_df is not None:
-        gis_cell_name_col = 'CILAC' if 'CILAC' in gis_df.columns else 'cell_name'
-        gis_band_col = 'Band' if 'Band' in gis_df.columns else 'band'
+        gis_cell_name_col = 'cell_name' if 'cell_name' in gis_df.columns else 'CILAC'
+        gis_band_col = 'band' if 'band' in gis_df.columns else 'Band'
 
         if gis_band_col in gis_df.columns:
             band_map = gis_df[[gis_cell_name_col, gis_band_col]].drop_duplicates(gis_cell_name_col)
@@ -845,9 +846,9 @@ def _add_overshooting_layer(
     if gis_df is not None and len(df) > 0:
         df = df.copy()
         # Find the right columns in GIS data
-        gis_cell_name_col = next((c for c in ['CILAC', 'cell_name'] if c in gis_df.columns), 'cell_name')
-        gis_name_col = next((c for c in ['Name', 'name'] if c in gis_df.columns), None)
-        gis_band_col = next((c for c in ['Band', 'band'] if c in gis_df.columns), None)
+        gis_cell_name_col = next((c for c in ['cell_name', 'CILAC'] if c in gis_df.columns), 'cell_name')
+        gis_name_col = next((c for c in ['name', 'Name'] if c in gis_df.columns), None)
+        gis_band_col = next((c for c in ['band', 'Band'] if c in gis_df.columns), None)
         gis_azimuth_col = next((c for c in ['Bearing', 'bearing', 'azimuth_deg', 'azimuth'] if c in gis_df.columns), None)
 
         if gis_name_col or gis_band_col or gis_azimuth_col:
@@ -939,9 +940,9 @@ def _add_undershooting_layer(
         cell_name_col = 'cell_name' if 'cell_name' in gis_df.columns else 'CILAC'
         lat_col = 'latitude' if 'latitude' in gis_df.columns else 'Latitude'
         lon_col = 'longitude' if 'longitude' in gis_df.columns else 'Longitude'
-        az_col = next((c for c in ['azimuth_deg', 'azimuth', 'Bearing', 'bearing'] if c in gis_df.columns), None)
-        name_col = next((c for c in ['Name', 'name'] if c in gis_df.columns), None)
-        band_col = next((c for c in ['Band', 'band'] if c in gis_df.columns), None)
+        az_col = next((c for c in ['bearing', 'Bearing', 'azimuth_deg', 'azimuth'] if c in gis_df.columns), None)
+        name_col = next((c for c in ['name', 'Name'] if c in gis_df.columns), None)
+        band_col = next((c for c in ['band', 'Band'] if c in gis_df.columns), None)
 
         gis_cols = [cell_name_col]
         if lat_col in gis_df.columns:
@@ -1238,7 +1239,7 @@ def _add_low_coverage_layer(
                 'fillOpacity': 0.35,
             },
             popup=folium.Popup(popup_html, max_width=320),
-            tooltip=f"Low Coverage {band}MHz - {area:.2f} km²",
+            tooltip=f"Low Coverage {row_band} - {area:.2f} km²",
         ).add_to(layer)
 
     layer.add_to(m)
@@ -2379,16 +2380,20 @@ def _add_filter_panel(m: folium.Map, stats: dict, all_bands: Optional[list] = No
 
         <div style="margin-bottom: 12px;">
             <label style="font-weight: bold; display: block; margin-bottom: 4px;">Severity</label>
-            <select id="severityFilter" onchange="applyFilters()" style="width: 100%; padding: 4px;">
-                <option value="all">All Severities</option>
+            <div id="severityFilter" style="font-size: 11px;">
     """
 
     for sev in ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'MINIMAL']:
         if sev in severities:
-            html += f'<option value="{sev}">{sev}</option>'
+            color = {'CRITICAL': '#dc3545', 'HIGH': '#fd7e14', 'MEDIUM': '#ffc107', 'LOW': '#28a745', 'MINIMAL': '#6c757d'}.get(sev, '#666')
+            html += f'''
+                <label style="display: block; margin: 2px 0; cursor: pointer;">
+                    <input type="checkbox" class="severity-checkbox" value="{sev}" checked onchange="applyFilters()" style="margin-right: 4px;">
+                    <span style="color: {color}; font-weight: 500;">{sev}</span>
+                </label>'''
 
     html += """
-            </select>
+            </div>
         </div>
 
         <div style="margin-bottom: 12px;">
@@ -2441,7 +2446,11 @@ def _add_filter_javascript(m: folium.Map):
     js = f"""
     <script>
     function applyFilters() {{
-        var severity = document.getElementById('severityFilter').value.toUpperCase();
+        // Get selected severities from checkboxes
+        var selectedSeverities = [];
+        document.querySelectorAll('.severity-checkbox:checked').forEach(function(cb) {{
+            selectedSeverities.push(cb.value.toUpperCase());
+        }});
         var env = document.getElementById('envFilter').value.toUpperCase();
         var band = document.getElementById('bandFilter').value;
         var statusDiv = document.getElementById('filterStatus');
@@ -2469,10 +2478,10 @@ def _add_filter_javascript(m: folium.Map):
             total++;
             var show = true;
 
-            // Severity filter
-            if (severity !== 'ALL') {{
+            // Severity filter (multi-select checkboxes)
+            if (selectedSeverities.length > 0 && selectedSeverities.length < 5) {{
                 var sevMatch = contentStr.match(/>(CRITICAL|HIGH|MEDIUM|LOW|MINIMAL)</i);
-                if (sevMatch && sevMatch[1].toUpperCase() !== severity) {{
+                if (sevMatch && selectedSeverities.indexOf(sevMatch[1].toUpperCase()) === -1) {{
                     show = false;
                 }}
             }}
@@ -2531,7 +2540,7 @@ def _add_filter_javascript(m: folium.Map):
         // Filter recommendations table rows
         var tableHidden = 0;
         var tableTotal = 0;
-        console.log('Filter values: band=' + band + ', severity=' + severity + ', env=' + env);
+        console.log('Filter values: band=' + band + ', severities=' + selectedSeverities.join(',') + ', env=' + env);
         document.querySelectorAll('.rec-row').forEach(function(row) {{
             tableTotal++;
             var show = true;
@@ -2539,9 +2548,11 @@ def _add_filter_javascript(m: folium.Map):
             var rowBand = row.getAttribute('data-band') || '';
             var rowEnv = row.getAttribute('data-environment') || '';
 
-            // Severity filter
-            if (severity !== 'ALL' && rowSeverity && rowSeverity.toUpperCase() !== severity) {{
-                show = false;
+            // Severity filter (multi-select checkboxes)
+            if (selectedSeverities.length > 0 && selectedSeverities.length < 5 && rowSeverity) {{
+                if (selectedSeverities.indexOf(rowSeverity.toUpperCase()) === -1) {{
+                    show = false;
+                }}
             }}
 
             // Environment filter
@@ -2604,7 +2615,10 @@ def _add_filter_javascript(m: folium.Map):
     }}
 
     function resetFilters() {{
-        document.getElementById('severityFilter').value = 'all';
+        // Check all severity checkboxes
+        document.querySelectorAll('.severity-checkbox').forEach(function(cb) {{
+            cb.checked = true;
+        }});
         document.getElementById('envFilter').value = 'all';
         document.getElementById('bandFilter').value = 'all';
         applyFilters();

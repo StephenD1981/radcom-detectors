@@ -8,7 +8,6 @@ Algorithm based on legacy prototype code from tilt-optimisation-overshooters.ipy
 """
 import pandas as pd
 import numpy as np
-import math
 from typing import Tuple, Optional
 from dataclasses import dataclass
 
@@ -20,6 +19,10 @@ from ran_optimizer.utils.overshooting_config import (
 )
 
 logger = get_logger(__name__)
+
+# Module-level constants
+EARTH_RADIUS_M = 6371000.0  # Earth radius in meters for distance calculations
+ANTENNA_PATTERN_COEFF = 12.0  # 3GPP parabolic antenna pattern coefficient (TR 36.814)
 
 
 @dataclass
@@ -41,8 +44,12 @@ class OvershooterParams:
     # Step 3b: Relative distance criterion
     min_relative_reach: float = 0.7  # Cell must reach ≥70% as far as furthest competitor
 
+    # Step 3c: Azimuth filtering - only consider grids within main beam
+    max_azimuth_deviation_deg: float = 90.0  # Max angular deviation from cell bearing (±90° = in front of antenna)
+
     # Step 4: RSRP degradation
-    rsrp_degradation_db: float = 10.0  # Required RSRP degradation in dB from cell's max RSRP
+    rsrp_degradation_db: float = 10.0  # Required RSRP degradation in dB from cell's P85 RSRP
+    rsrp_reference_quantile: float = 0.85  # Quantile for reference RSRP (P85)
 
     # Step 5: Final thresholds
     min_overshooting_grids: int = 30  # Min bins to flag cell as overshooting
@@ -529,32 +536,53 @@ class OvershooterDetector:
         Returns:
             DataFrame of edge bins
         """
-        # Map each cell to its edge_traffic_percent
+        # Step 1: Apply azimuth filtering first - only consider grids within main beam
+        # grid_bearing_diff contains the angular difference between cell bearing and bearing to grid (0-180°)
+        bearing_col = 'grid_bearing_diff'
+        if bearing_col in grid_df.columns:
+            # Filter to grids within ±max_azimuth_deviation_deg of cell bearing
+            grid_in_beam = grid_df[
+                grid_df[bearing_col] <= self.params.max_azimuth_deviation_deg
+            ].copy()
+            filtered_by_azimuth = len(grid_df) - len(grid_in_beam)
+            logger.info(
+                "Azimuth filtering applied",
+                total_grids=len(grid_df),
+                grids_in_beam=len(grid_in_beam),
+                filtered_out=filtered_by_azimuth,
+                max_azimuth_deg=self.params.max_azimuth_deviation_deg,
+            )
+        else:
+            # No bearing column available - skip azimuth filtering
+            grid_in_beam = grid_df.copy()
+            logger.warning(
+                "No grid_bearing_diff column found - skipping azimuth filtering",
+                available_columns=list(grid_df.columns)[:10],
+            )
+
+        # Step 2: Map each cell to its edge_traffic_percent
         def get_edge_percent(cell_name):
             env = cell_env_map.get(cell_name, 'SUBURBAN')
             params = env_params.get(env.lower(), env_params.get('suburban'))
             return params.edge_traffic_percent
 
         # Get unique cells and their edge_traffic_percent
-        cells = grid_df['cell_name'].unique()
+        cells = grid_in_beam['cell_name'].unique()
         cell_edge_pct = {cell: get_edge_percent(cell) for cell in cells}
 
-        # Calculate edge threshold per cell using its environment's edge_traffic_percent
-        edge_thresholds = []
-        for cell_name, edge_pct in cell_edge_pct.items():
-            cell_data = grid_df[grid_df['cell_name'] == cell_name]
-            if len(cell_data) > 0:
-                threshold = cell_data['distance_m'].quantile(1 - edge_pct)
-                edge_thresholds.append({
-                    'cell_name': cell_name,
-                    'edge_distance_m': threshold,
-                    'edge_traffic_percent': edge_pct,
-                })
+        # Vectorized: Calculate edge threshold per cell using groupby
+        def calc_edge_threshold(group):
+            cell_name = group.name
+            edge_pct = cell_edge_pct.get(cell_name, 0.15)
+            return group.quantile(1 - edge_pct)
 
-        edge_threshold_df = pd.DataFrame(edge_thresholds)
+        edge_thresholds_series = grid_in_beam.groupby('cell_name')['distance_m'].apply(calc_edge_threshold)
+        edge_threshold_df = edge_thresholds_series.reset_index()
+        edge_threshold_df.columns = ['cell_name', 'edge_distance_m']
+        edge_threshold_df['edge_traffic_percent'] = edge_threshold_df['cell_name'].map(cell_edge_pct)
 
         # Merge threshold back to grid
-        grid_with_threshold = grid_df.merge(edge_threshold_df, on='cell_name', how='left')
+        grid_with_threshold = grid_in_beam.merge(edge_threshold_df, on='cell_name', how='left')
 
         # Filter to edge bins only (distance >= edge threshold)
         edge_bins = grid_with_threshold[
@@ -566,11 +594,12 @@ class OvershooterDetector:
         env_counts = edge_bins.groupby('_env').size().to_dict()
         edge_bins = edge_bins.drop(columns=['_env'])
 
+        # Fix: Use grid_in_beam (after azimuth filtering) as denominator
         logger.info(
             "Edge bins identified (per-cell environment thresholds)",
-            total_bins=len(grid_df),
+            total_bins=len(grid_in_beam),
             edge_bins=len(edge_bins),
-            edge_percentage=len(edge_bins) / len(grid_df) * 100 if len(grid_df) > 0 else 0,
+            edge_percentage=len(edge_bins) / len(grid_in_beam) * 100 if len(grid_in_beam) > 0 else 0,
             by_environment=env_counts,
         )
 
@@ -599,16 +628,26 @@ class OvershooterDetector:
             env = cell_env_map.get(cell_name, 'SUBURBAN')
             return env_params.get(env.lower(), env_params.get('suburban'))
 
+        # Pre-compute all parameter values per cell for vectorized filtering
+        unique_cells = cell_metrics['cell_name'].unique()
+        cell_params = {
+            cell: get_params(cell) for cell in unique_cells
+        }
+
+        # Build parameter lookup Series for vectorized operations
+        min_cell_distance_map = {c: p.min_cell_distance for c, p in cell_params.items()}
+        min_cell_count_map = {c: p.min_cell_count_in_grid for c, p in cell_params.items()}
+        max_pct_events_map = {c: p.max_percentage_grid_events for c, p in cell_params.items()}
+        min_relative_reach_map = {c: p.min_relative_reach for c, p in cell_params.items()}
+        min_overshooting_grids_map = {c: p.min_overshooting_grids for c, p in cell_params.items()}
+        pct_overshooting_grids_map = {c: p.percentage_overshooting_grids for c, p in cell_params.items()}
+
         # Add environment to cell_metrics for per-cell filtering
-        cell_metrics = cell_metrics.copy()
-        cell_metrics['environment'] = cell_metrics['cell_name'].map(cell_env_map)
+        cell_metrics = cell_metrics.assign(environment=cell_metrics['cell_name'].map(cell_env_map))
 
-        # Filter 1: Cell must serve traffic beyond its environment's min_cell_distance
-        def passes_distance_filter(row):
-            params = get_params(row['cell_name'])
-            return row['max_distance_m'] >= params.min_cell_distance
-
-        candidates = cell_metrics[cell_metrics.apply(passes_distance_filter, axis=1)].copy()
+        # Filter 1: Cell must serve traffic beyond its environment's min_cell_distance (vectorized)
+        cell_min_distance = cell_metrics['cell_name'].map(min_cell_distance_map)
+        candidates = cell_metrics[cell_metrics['max_distance_m'] >= cell_min_distance].copy()
         logger.info(
             "After distance filter (per-cell)",
             candidates=len(candidates),
@@ -625,16 +664,20 @@ class OvershooterDetector:
         # in each grid, not just cells with edge traffic.
         band_col = 'Band' if 'Band' in full_grid_df.columns else None
 
-        # Calculate P90 RSRP per grid from ALL cell measurements
+        # Calculate P90 RSRP per grid from ALL cell measurements (using merge for robustness)
         if band_col is not None:
-            p90_rsrp_per_grid = full_grid_df.groupby(['grid', band_col])['avg_rsrp'].quantile(0.9)
-            # Calculate on full grid
-            full_grid_analysis = full_grid_df.copy()
-            full_grid_analysis['p90_rsrp_in_grid'] = full_grid_analysis.set_index(['grid', band_col]).index.map(p90_rsrp_per_grid)
+            p90_rsrp_df = full_grid_df.groupby(['grid', band_col])['avg_rsrp'].quantile(0.9).reset_index()
+            p90_rsrp_df.columns = ['grid', band_col, 'p90_rsrp_in_grid']
+            full_grid_analysis = full_grid_df.merge(p90_rsrp_df, on=['grid', band_col], how='left')
         else:
-            p90_rsrp_per_grid = full_grid_df.groupby('grid')['avg_rsrp'].quantile(0.9).to_dict()
-            full_grid_analysis = full_grid_df.copy()
-            full_grid_analysis['p90_rsrp_in_grid'] = full_grid_analysis['grid'].map(p90_rsrp_per_grid)
+            p90_rsrp_df = full_grid_df.groupby('grid')['avg_rsrp'].quantile(0.9).reset_index()
+            p90_rsrp_df.columns = ['grid', 'p90_rsrp_in_grid']
+            full_grid_analysis = full_grid_df.merge(p90_rsrp_df, on='grid', how='left')
+
+        # Warn if missing P90 values
+        missing_p90 = full_grid_analysis['p90_rsrp_in_grid'].isna().sum()
+        if missing_p90 > 0:
+            logger.warning("Missing P90 RSRP values", missing_count=missing_p90)
 
         # Flag competing cells (using the most permissive interference_threshold_db)
         max_interference_threshold = max(
@@ -666,15 +709,14 @@ class OvershooterDetector:
         total_grid_traffic = edge_with_counts['grid_total_traffic'].replace(0, np.nan).fillna(1)
         edge_with_counts['cell_traffic_pct'] = edge_with_counts['event_count'] / total_grid_traffic
 
-        # Apply per-cell min_cell_count_in_grid and max_percentage_grid_events filters
-        def passes_competition_filter(row):
-            params = get_params(row['cell_name'])
-            return (
-                row['competing_cells'] >= params.min_cell_count_in_grid and
-                row['cell_traffic_pct'] <= params.max_percentage_grid_events
-            )
-
-        competition_bins = edge_with_counts[edge_with_counts.apply(passes_competition_filter, axis=1)].copy()
+        # Apply per-cell min_cell_count_in_grid and max_percentage_grid_events filters (vectorized)
+        cell_min_count = edge_with_counts['cell_name'].map(min_cell_count_map)
+        cell_max_pct = edge_with_counts['cell_name'].map(max_pct_events_map)
+        competition_mask = (
+            (edge_with_counts['competing_cells'] >= cell_min_count) &
+            (edge_with_counts['cell_traffic_pct'] <= cell_max_pct)
+        )
+        competition_bins = edge_with_counts[competition_mask].copy()
 
         logger.info(
             "RSRP-based competition filter applied (per-cell thresholds)",
@@ -699,11 +741,9 @@ class OvershooterDetector:
             competition_bins['distance_m'] / competition_bins['grid_max_distance']
         )
 
-        def passes_relative_reach(row):
-            params = get_params(row['cell_name'])
-            return row['relative_reach'] >= params.min_relative_reach
-
-        overshooting_bins = competition_bins[competition_bins.apply(passes_relative_reach, axis=1)].copy()
+        # Filter 3b: Relative reach (vectorized)
+        cell_min_reach = competition_bins['cell_name'].map(min_relative_reach_map)
+        overshooting_bins = competition_bins[competition_bins['relative_reach'] >= cell_min_reach].copy()
 
         logger.info(
             "After relative distance filter (per-cell)",
@@ -740,15 +780,14 @@ class OvershooterDetector:
         candidates['overshooting_grids'] = candidates['overshooting_grids'].fillna(0).astype(int)
         candidates['percentage_overshooting'] = candidates['overshooting_grids'] / candidates['total_grids']
 
-        # Filter 5: Final thresholds (per-cell)
-        def passes_final_threshold(row):
-            params = get_params(row['cell_name'])
-            return (
-                row['overshooting_grids'] >= params.min_overshooting_grids and
-                row['percentage_overshooting'] >= params.percentage_overshooting_grids
-            )
-
-        overshooters = candidates[candidates.apply(passes_final_threshold, axis=1)].copy()
+        # Filter 5: Final thresholds (per-cell, vectorized)
+        cell_min_grids = candidates['cell_name'].map(min_overshooting_grids_map)
+        cell_min_pct = candidates['cell_name'].map(pct_overshooting_grids_map)
+        final_mask = (
+            (candidates['overshooting_grids'] >= cell_min_grids) &
+            (candidates['percentage_overshooting'] >= cell_min_pct)
+        )
+        overshooters = candidates[final_mask].copy()
 
         # Log per-environment results
         if len(overshooters) > 0:
@@ -804,6 +843,15 @@ class OvershooterDetector:
         if grid_df['cell_name'].isna().any():
             null_count = grid_df['cell_name'].isna().sum()
             logger.warning(f"Grid data has {null_count} null cell_name values - these will be excluded")
+
+        # Validate numeric column data types
+        numeric_cols = ['avg_rsrp', 'event_count']
+        for col in numeric_cols:
+            if col in grid_df.columns and not pd.api.types.is_numeric_dtype(grid_df[col]):
+                raise ValueError(
+                    f"Column '{col}' must be numeric, got {grid_df[col].dtype}. "
+                    f"Available columns: {list(grid_df.columns)}"
+                )
 
     def _sanitise_inputs(
         self,
@@ -912,8 +960,7 @@ class OvershooterDetector:
         # Calculate distance using vectorized haversine
         grid_with_cell = grid_with_cell.copy()
 
-        # Vectorized haversine formula
-        EARTH_RADIUS_M = 6371000.0
+        # Vectorized haversine formula (uses module-level EARTH_RADIUS_M)
         lat1 = np.radians(grid_with_cell['latitude_cell'].values)
         lon1 = np.radians(grid_with_cell['longitude_cell'].values)
         lat2 = np.radians(grid_with_cell['Latitude_grid'].values)
@@ -941,19 +988,44 @@ class OvershooterDetector:
         Identify grid bins at the edge of each cell's coverage.
 
         Edge bins are those beyond edge_traffic_percent quantile of
-        distance distribution for each cell.
+        distance distribution for each cell, AND within the cell's main beam
+        (azimuth filtering).
         """
-        # Calculate distance quantile per cell
+        # Step 1: Apply azimuth filtering first - only consider grids within main beam
+        # grid_bearing_diff contains the angular difference between cell bearing and bearing to grid (0-180°)
+        bearing_col = 'grid_bearing_diff'
+        if bearing_col in grid_df.columns:
+            # Filter to grids within ±max_azimuth_deviation_deg of cell bearing
+            grid_in_beam = grid_df[
+                grid_df[bearing_col] <= self.params.max_azimuth_deviation_deg
+            ].copy()
+            filtered_by_azimuth = len(grid_df) - len(grid_in_beam)
+            logger.info(
+                "Azimuth filtering applied",
+                total_grids=len(grid_df),
+                grids_in_beam=len(grid_in_beam),
+                filtered_out=filtered_by_azimuth,
+                max_azimuth_deg=self.params.max_azimuth_deviation_deg,
+            )
+        else:
+            # No bearing column available - skip azimuth filtering
+            grid_in_beam = grid_df.copy()
+            logger.warning(
+                "No grid_bearing_diff column found - skipping azimuth filtering",
+                available_columns=list(grid_df.columns)[:10],
+            )
+
+        # Step 2: Calculate distance quantile per cell (on azimuth-filtered grids)
         # Use (1 - edge_traffic_percent) to get the threshold above which "edge" bins lie
         # e.g., if edge_traffic_percent=0.15, we want the 85th percentile as the threshold
         # so that bins >= this threshold represent the furthest 15% of traffic
-        edge_threshold = grid_df.groupby('cell_name')['distance_m'].quantile(
+        edge_threshold = grid_in_beam.groupby('cell_name')['distance_m'].quantile(
             1 - self.params.edge_traffic_percent
         ).reset_index()
         edge_threshold.columns = ['cell_name', 'edge_distance_m']
 
         # Merge threshold back to grid
-        grid_with_threshold = grid_df.merge(edge_threshold, on='cell_name', how='left')
+        grid_with_threshold = grid_in_beam.merge(edge_threshold, on='cell_name', how='left')
 
         # Filter to edge bins only (distance >= edge threshold)
         edge_bins = grid_with_threshold[
@@ -963,8 +1035,9 @@ class OvershooterDetector:
         logger.info(
             "Edge bins identified",
             total_bins=len(grid_df),
+            grids_in_beam=len(grid_in_beam),
             edge_bins=len(edge_bins),
-            edge_percentage=len(edge_bins) / len(grid_df) * 100 if len(grid_df) > 0 else 0,
+            edge_percentage=len(edge_bins) / len(grid_in_beam) * 100 if len(grid_in_beam) > 0 else 0,
         )
 
         return edge_bins
@@ -986,10 +1059,18 @@ class OvershooterDetector:
                 - avg_edge_rsrp: Average RSRP in edge bins
         """
         # Overall cell metrics
+        # Use P85 (configurable) instead of max for reference RSRP - max is too aggressive
+        # and flags cells with normal RSRP degradation at distance
+        rsrp_ref_quantile = self.params.rsrp_reference_quantile
+
+        # Named function for quantile aggregation (more robust than lambda in agg)
+        def rsrp_quantile_agg(x):
+            return x.quantile(rsrp_ref_quantile)
+
         cell_overall = grid_df.groupby('cell_name').agg({
             'distance_m': 'max',
             'grid': 'nunique',
-            'avg_rsrp': 'max',  # Max RSRP across ALL grids (for degradation check)
+            'avg_rsrp': rsrp_quantile_agg,  # P85 RSRP (configurable)
         }).reset_index()
         cell_overall.columns = ['cell_name', 'max_distance_m', 'total_grids', 'cell_max_rsrp']
 
@@ -1060,16 +1141,24 @@ class OvershooterDetector:
 
         # RSRP-based competition counting (vectorized)
         # Step 1: Find reference RSRP per grid using configurable quantile (per band if available)
-        # Using quantile instead of max to be robust against outliers
+        # IMPORTANT: Use full_grid_df (not edge_bins) for reference RSRP to get representative values
+        # Using edge_bins creates artificially low reference RSRP leading to false positives
         rsrp_quantile = self.params.rsrp_competition_quantile
         if band_col is not None:
-            p90_rsrp_per_grid = edge_bins.groupby(['grid', band_col])['avg_rsrp'].quantile(rsrp_quantile)
-            grid_df = edge_bins.copy()
-            grid_df['p90_rsrp_in_grid'] = grid_df.set_index(['grid', band_col]).index.map(p90_rsrp_per_grid)
+            # Compute P90 RSRP from ALL cells serving each grid, not just edge bins (using merge)
+            p90_rsrp_df = full_grid_df.groupby(['grid', band_col])['avg_rsrp'].quantile(rsrp_quantile).reset_index()
+            p90_rsrp_df.columns = ['grid', band_col, 'p90_rsrp_in_grid']
+            grid_df = edge_bins.merge(p90_rsrp_df, on=['grid', band_col], how='left')
         else:
-            p90_rsrp_per_grid = edge_bins.groupby('grid')['avg_rsrp'].quantile(rsrp_quantile).to_dict()
-            grid_df = edge_bins.copy()
-            grid_df['p90_rsrp_in_grid'] = grid_df['grid'].map(p90_rsrp_per_grid)
+            # Compute P90 RSRP from ALL cells serving each grid, not just edge bins (using merge)
+            p90_rsrp_df = full_grid_df.groupby('grid')['avg_rsrp'].quantile(rsrp_quantile).reset_index()
+            p90_rsrp_df.columns = ['grid', 'p90_rsrp_in_grid']
+            grid_df = edge_bins.merge(p90_rsrp_df, on='grid', how='left')
+
+        # Warn if missing P90 values
+        missing_p90 = grid_df['p90_rsrp_in_grid'].isna().sum()
+        if missing_p90 > 0:
+            logger.warning("Missing P90 RSRP in edge bins", missing_count=missing_p90)
 
         # Step 2: Calculate RSRP difference and flag competing cells
         grid_df['rsrp_diff'] = grid_df['p90_rsrp_in_grid'] - grid_df['avg_rsrp']
@@ -1311,12 +1400,12 @@ class OvershooterDetector:
 
             # 3GPP vertical attenuation before downtilt
             A_before = np.minimum(
-                12.0 * (((theta_deg - alpha_deg) / HPBW_V_DEG) ** 2),
+                ANTENNA_PATTERN_COEFF * (((theta_deg - alpha_deg) / HPBW_V_DEG) ** 2),
                 SLA_V_DB
             )
             # 3GPP vertical attenuation after downtilt
             A_after = np.minimum(
-                12.0 * (((theta_deg - (alpha_deg + delta_tilt_deg)) / HPBW_V_DEG) ** 2),
+                ANTENNA_PATTERN_COEFF * (((theta_deg - (alpha_deg + delta_tilt_deg)) / HPBW_V_DEG) ** 2),
                 SLA_V_DB
             )
             # RSRP reduction = increase in attenuation (non-negative)
@@ -1342,7 +1431,8 @@ class OvershooterDetector:
             try:
                 cell_overshoot_bins = overshooting_bins_indexed.loc[[cell_id]].copy()
             except KeyError:
-                cell_overshoot_bins = pd.DataFrame()
+                # Preserve column structure for empty DataFrame
+                cell_overshoot_bins = pd.DataFrame(columns=overshooting_bins.columns)
 
             if len(cell_overshoot_bins) == 0:
                 # No overshooting bins, shouldn't happen but handle gracefully
@@ -1408,7 +1498,8 @@ class OvershooterDetector:
             try:
                 all_cell_grids = grid_with_distance_indexed.loc[[cell_id]].copy()
             except KeyError:
-                all_cell_grids = pd.DataFrame()
+                # Preserve column structure for empty DataFrame
+                all_cell_grids = pd.DataFrame(columns=grid_with_distance.columns)
 
             if len(all_cell_grids) > 0:
                 all_dist_arr = all_cell_grids['distance_m'].values
@@ -1524,7 +1615,7 @@ class OvershooterDetector:
             return d_max_m, 0.0
 
         # Elevation angle from site to current edge user (at horizon)
-        theta_e_deg = math.degrees(math.atan2(h_m, d_max_m))
+        theta_e_deg = np.degrees(np.arctan2(h_m, d_max_m))
 
         # 3GPP vertical attenuation before/after downtilt
         A_before = self._vertical_attenuation(theta_e_deg, alpha_deg, hpbw_v_deg, sla_v_db)
@@ -1564,7 +1655,7 @@ class OvershooterDetector:
             Attenuation in dB
         """
         return min(
-            12.0 * (((theta_deg - alpha_deg) / hpbw_v_deg) ** 2),
+            ANTENNA_PATTERN_COEFF * (((theta_deg - alpha_deg) / hpbw_v_deg) ** 2),
             sla_v_db
         )
 
@@ -1599,9 +1690,11 @@ class OvershooterDetector:
                 - severity_category: CRITICAL/HIGH/MEDIUM/LOW/MINIMAL
         """
         if len(overshooters) == 0:
-            overshooters['severity_score'] = []
-            overshooters['severity_category'] = []
-            return overshooters
+            # Return empty DataFrame with proper column dtypes
+            return overshooters.assign(
+                severity_score=pd.Series(dtype=float),
+                severity_category=pd.Series(dtype=str)
+            )
 
         # Calculate dataset statistics for normalization using percentiles (robust to outliers)
         bins_p5 = overshooters['overshooting_grids'].quantile(0.05)
