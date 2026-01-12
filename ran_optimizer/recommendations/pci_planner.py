@@ -34,6 +34,14 @@ logger = get_logger(__name__)
 LTE_PCI_MAX = 503   # LTE: 504 PCIs (0-503)
 NR_PCI_MAX = 1007   # NR: 1008 PCIs (0-1007)
 
+# Performance constants
+MAX_TWO_HOP_PAIRS = 1_000_000  # Memory safeguard for 2-hop pair generation
+SHARE_EPSILON = 1e-9  # Prevent division by zero in share calculation
+TWO_HOP_SEVERITY_FACTOR = 0.5  # Severity multiplier for 2-hop conflicts
+
+# Default configuration path
+DEFAULT_CONFIG_PATH = "config/pci_planner_params.json"
+
 
 def get_pci_max_for_band(band: str) -> int:
     """
@@ -99,6 +107,8 @@ def build_union_find_groups(pairs: List[Tuple[str, str]]) -> Tuple[Dict[str, int
     """
     Union-Find algorithm to create co-sector groups from cell pairs.
 
+    Uses iterative path compression to avoid recursion depth issues.
+
     Returns:
         - cell_to_gid: Maps each cell to its group ID
         - gid_to_members: Maps group ID to set of member cells
@@ -106,11 +116,19 @@ def build_union_find_groups(pairs: List[Tuple[str, str]]) -> Tuple[Dict[str, int
     parent: Dict[str, str] = {}
 
     def find(x: str) -> str:
+        """Find root with iterative path compression."""
         if x not in parent:
             parent[x] = x
-        if parent[x] != x:
-            parent[x] = find(parent[x])  # Path compression
-        return parent[x]
+        # Find root (iterative)
+        root = x
+        while parent[root] != root:
+            root = parent[root]
+        # Path compression (iterative) - point all nodes to root
+        while parent[x] != root:
+            next_x = parent[x]
+            parent[x] = root
+            x = next_x
+        return root
 
     def union(a: str, b: str) -> None:
         ra, rb = find(a), find(b)
@@ -187,16 +205,16 @@ class PCIPlannerParams:
     @classmethod
     def from_config(cls, config_path: Optional[str] = None) -> 'PCIPlannerParams':
         """Load parameters from config file or use defaults."""
+        import json
+        from pathlib import Path
+
         if config_path is None:
-            config_path = "config/pci_planner_params.json"
+            config_path = DEFAULT_CONFIG_PATH
 
         try:
-            import json
-            from pathlib import Path
-
             path = Path(config_path)
             if not path.exists():
-                logger.warning(f"Config file not found: {config_path}. Using defaults.")
+                logger.warning("config_file_not_found", path=config_path)
                 return cls()
 
             with open(path, 'r') as f:
@@ -205,25 +223,25 @@ class PCIPlannerParams:
             params = config.get('default', config)
 
             return cls(
-                couple_cosectors=params.get('couple_cosectors', False),
-                min_active_neighbors_after_blacklist=params.get('min_active_neighbors_after_blacklist', 2),
-                max_collision_radius_m=params.get('max_collision_radius_m', 30000.0),
-                two_hop_factor=params.get('two_hop_factor', 0.25),
-                confusion_alpha=params.get('confusion_alpha', 1.0),
-                collision_beta=params.get('collision_beta', 1.0),
-                pci_change_cost=params.get('pci_change_cost', 5.0),
-                low_activity_max_act=params.get('low_activity_max_act', 5.0),
-                low_activity_max_share=params.get('low_activity_max_share', 0.001),
-                low_activity_max_single_dir=params.get('low_activity_max_single_dir', 5.0),
-                detect_mod3_conflicts=params.get('detect_mod3_conflicts', True),
-                detect_mod30_conflicts=params.get('detect_mod30_conflicts', False),
-                mod3_severity_factor=params.get('mod3_severity_factor', 0.5),
-                mod30_severity_factor=params.get('mod30_severity_factor', 0.3),
-                validate_pci_range=params.get('validate_pci_range', True),
-                include_mod3_inter_site=params.get('include_mod3_inter_site', False),
+                couple_cosectors=bool(params.get('couple_cosectors', False)),
+                min_active_neighbors_after_blacklist=int(params.get('min_active_neighbors_after_blacklist', 2)),
+                max_collision_radius_m=float(params.get('max_collision_radius_m', 30000.0)),
+                two_hop_factor=float(params.get('two_hop_factor', 0.25)),
+                confusion_alpha=float(params.get('confusion_alpha', 1.0)),
+                collision_beta=float(params.get('collision_beta', 1.0)),
+                pci_change_cost=float(params.get('pci_change_cost', 5.0)),
+                low_activity_max_act=float(params.get('low_activity_max_act', 5.0)),
+                low_activity_max_share=float(params.get('low_activity_max_share', 0.001)),
+                low_activity_max_single_dir=float(params.get('low_activity_max_single_dir', 5.0)),
+                detect_mod3_conflicts=bool(params.get('detect_mod3_conflicts', True)),
+                detect_mod30_conflicts=bool(params.get('detect_mod30_conflicts', False)),
+                mod3_severity_factor=float(params.get('mod3_severity_factor', 0.5)),
+                mod30_severity_factor=float(params.get('mod30_severity_factor', 0.3)),
+                validate_pci_range=bool(params.get('validate_pci_range', True)),
+                include_mod3_inter_site=bool(params.get('include_mod3_inter_site', False)),
             )
-        except Exception as e:
-            logger.warning(f"Failed to load config: {e}. Using defaults.")
+        except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            logger.warning("config_load_failed", error=str(e), using="defaults")
             return cls()
 
 
@@ -420,15 +438,21 @@ class PCIPlanner:
         self.base_pci = self.cell_pci.copy()
         self.band_of = dict(zip(serving_first["cell_name"].astype(str), serving_first["band"].astype(str)))
 
-        # Add neighbor cell properties (only if not already present)
+        # Add neighbor cell properties (only if not already present) - vectorized
         neighbor_first = df.drop_duplicates("to_cell_name", keep="first")
-        for _, row in neighbor_first.iterrows():
-            n = str(row["to_cell_name"])
+        for n, pci, band in zip(
+            neighbor_first["to_cell_name"].astype(str),
+            neighbor_first["to_pci"].astype(int),
+            neighbor_first["to_band"].astype(str)
+        ):
             if n not in self.cell_pci:
-                self.cell_pci[n] = int(row["to_pci"])
-                self.base_pci[n] = int(row["to_pci"])
+                # Log warning for invalid PCIs (negative values from fillna(-1))
+                if pci < 0:
+                    logger.debug("neighbor_cell_invalid_pci", cell=n, pci=pci)
+                self.cell_pci[n] = pci
+                self.base_pci[n] = pci
             if n not in self.band_of:
-                self.band_of[n] = str(row["to_band"])
+                self.band_of[n] = band
 
         # Build out_ho using groupby (sum weights per edge)
         edge_weights = df.groupby(["cell_name", "to_cell_name"])["weight"].sum()
@@ -440,15 +464,23 @@ class PCIPlanner:
         for n, group in df.groupby("to_cell_name"):
             self.rev_nbrs[str(n)] = set(group["cell_name"].astype(str).unique())
 
-        # Build edge attributes (take first occurrence for intra_site and distance)
+        # Build edge attributes (take first occurrence for intra_site and distance) - vectorized
         edge_attrs = df.drop_duplicates(["cell_name", "to_cell_name"], keep="first")
         self.intra_site_edge = {
-            (str(row["cell_name"]), str(row["to_cell_name"])): row["intra_site"] == "y"
-            for _, row in edge_attrs.iterrows()
+            (str(s), str(n)): is_intra == "y"
+            for s, n, is_intra in zip(
+                edge_attrs["cell_name"],
+                edge_attrs["to_cell_name"],
+                edge_attrs["intra_site"]
+            )
         }
         self.distance_m = {
-            (str(row["cell_name"]), str(row["to_cell_name"])): float(row["distance"])
-            for _, row in edge_attrs.iterrows()
+            (str(s), str(n)): float(d)
+            for s, n, d in zip(
+                edge_attrs["cell_name"],
+                edge_attrs["to_cell_name"],
+                edge_attrs["distance"]
+            )
         }
 
         # Compute directed in_ho and act_ho
@@ -483,7 +515,7 @@ class PCIPlanner:
                 if (S, N) in self.blacklisted:
                     continue
                 act = self.act_ho.get((S, N), 0.0)
-                self.share[(S, N)] = act / (tot + 1e-9)
+                self.share[(S, N)] = act / tot if tot > 0 else 0.0
 
     def _build_collision_pairs(self) -> None:
         """
@@ -507,11 +539,17 @@ class PCIPlanner:
             base = log1p_safe(out + out_ba)
             w1[(a, b)] = max(w1.get((a, b), 0.0), base)
 
-        # 2-hop pairs (neighbors of neighbors)
+        # 2-hop pairs (neighbors of neighbors) with memory safeguard
         w2: Dict[Tuple[str, str], float] = {}
         if self.k2 > 0:
+            pairs_added = 0
+            limit_reached = False
             for i in self.cells:
+                if limit_reached:
+                    break
                 for k in self.nbrs_out.get(i, set()):
+                    if limit_reached:
+                        break
                     if (i, k) in self.blacklisted:
                         continue
                     if self.distance_m.get((i, k), 0.0) > self.max_collision_radius_m:
@@ -534,6 +572,17 @@ class PCIPlanner:
 
                         # Create undirected 2-hop pair
                         a, b = (i, j) if i < j else (j, i)
+                        if (a, b) not in w2:
+                            pairs_added += 1
+                            # Memory safeguard: limit 2-hop pairs
+                            if pairs_added > MAX_TWO_HOP_PAIRS:
+                                logger.warning(
+                                    "two_hop_pairs_limit_reached",
+                                    limit=MAX_TWO_HOP_PAIRS,
+                                    message="Truncating 2-hop pair generation to prevent memory exhaustion"
+                                )
+                                limit_reached = True
+                                break
                         w2[(a, b)] = w2.get((a, b), 0.0) + self.k2 * min(w_ik, w_kj)
 
         # Combine 1-hop and 2-hop weights
@@ -648,7 +697,7 @@ class PCIPlanner:
 
             if conflict_type:
                 # Calculate severity: weight * factor, with 2-hop having lower severity
-                hop_factor = 1.0 if is_direct else 0.5
+                hop_factor = 1.0 if is_direct else TWO_HOP_SEVERITY_FACTOR
                 severity = w * severity_factor * hop_factor
 
                 rows.append({

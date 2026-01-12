@@ -29,6 +29,13 @@ logger = get_logger(__name__)
 LTE_PCI_MAX = 503   # LTE: 504 PCIs (0-503), TS 36.211
 NR_PCI_MAX = 1007   # NR: 1008 PCIs (0-1007), TS 38.211
 
+# Performance thresholds
+PRE_PROJECT_MIN_CELLS = 100  # Minimum cells before pre-projection optimization kicks in
+
+# UTM EPSG base codes for coordinate transformations
+UTM_NORTH_EPSG_BASE = 32600  # EPSG base for northern hemisphere UTM zones
+UTM_SOUTH_EPSG_BASE = 32700  # EPSG base for southern hemisphere UTM zones
+
 # Technology prefixes for band identification
 TECH_PREFIXES = {
     'L': 'LTE',   # L700, L800, L1800, L2100, L2600
@@ -83,30 +90,31 @@ class PCIConflictParams:
     @classmethod
     def from_config(cls, config_path: Optional[str] = None) -> 'PCIConflictParams':
         """Load parameters from config file or use defaults."""
+        import json
+
         if config_path is None:
             return cls()
 
         try:
-            import json
             with open(config_path, 'r') as f:
                 config = json.load(f)
 
             return cls(
-                overlap_threshold=config.get('overlap_threshold', 0.10),
-                min_overlap_area_km2=config.get('min_overlap_area_km2', 0.0005),
+                overlap_threshold=float(config.get('overlap_threshold', 0.10)),
+                min_overlap_area_km2=float(config.get('min_overlap_area_km2', 0.0005)),
                 severity_thresholds=config.get('severity_thresholds', cls().severity_thresholds),
-                filter_same_site=config.get('filter_same_site', True),
-                site_id_column=config.get('site_id_column', 'site_id'),
-                check_mod3_conflicts=config.get('check_mod3_conflicts', True),
-                check_mod30_conflicts=config.get('check_mod30_conflicts', False),
-                mod3_overlap_threshold=config.get('mod3_overlap_threshold', 0.30),
-                mod30_overlap_threshold=config.get('mod30_overlap_threshold', 0.30),
-                pre_project_geometries=config.get('pre_project_geometries', True),
-                max_cells_per_batch=config.get('max_cells_per_batch', 5000),
-                log_progress_interval=config.get('log_progress_interval', 1000),
+                filter_same_site=bool(config.get('filter_same_site', True)),
+                site_id_column=str(config.get('site_id_column', 'site_id')),
+                check_mod3_conflicts=bool(config.get('check_mod3_conflicts', True)),
+                check_mod30_conflicts=bool(config.get('check_mod30_conflicts', False)),
+                mod3_overlap_threshold=float(config.get('mod3_overlap_threshold', 0.30)),
+                mod30_overlap_threshold=float(config.get('mod30_overlap_threshold', 0.30)),
+                pre_project_geometries=bool(config.get('pre_project_geometries', True)),
+                max_cells_per_batch=int(config.get('max_cells_per_batch', 5000)),
+                log_progress_interval=int(config.get('log_progress_interval', 1000)),
             )
-        except Exception as e:
-            logger.warning(f"Failed to load config: {e}. Using defaults.")
+        except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            logger.warning("config_load_failed", error=str(e), using="defaults")
             return cls()
 
 
@@ -210,7 +218,7 @@ class PCIConflictDetector:
         if missing_band_pci.any():
             dropped = missing_band_pci.sum()
             logger.warning(f"Dropping {dropped} cells with missing band or PCI")
-            valid_hulls = valid_hulls[~missing_band_pci].copy()
+            valid_hulls = valid_hulls[~missing_band_pci]
 
         if len(valid_hulls) == 0:
             return gpd.GeoDataFrame()
@@ -220,7 +228,7 @@ class PCIConflictDetector:
         if null_geom.any():
             dropped = null_geom.sum()
             logger.warning(f"Dropping {dropped} cells with null geometry")
-            valid_hulls = valid_hulls[~null_geom].copy()
+            valid_hulls = valid_hulls[~null_geom]
 
         if len(valid_hulls) == 0:
             return gpd.GeoDataFrame()
@@ -230,7 +238,7 @@ class PCIConflictDetector:
         if empty_geom.any():
             dropped = empty_geom.sum()
             logger.warning(f"Dropping {dropped} cells with empty geometry")
-            valid_hulls = valid_hulls[~empty_geom].copy()
+            valid_hulls = valid_hulls[~empty_geom]
 
         if len(valid_hulls) == 0:
             return gpd.GeoDataFrame()
@@ -245,7 +253,7 @@ class PCIConflictDetector:
                 f"Dropping {dropped} cells with invalid geometry type",
                 invalid_types=invalid_types,
             )
-            valid_hulls = valid_hulls[~invalid_type].copy()
+            valid_hulls = valid_hulls[~invalid_type]
 
         if len(valid_hulls) == 0:
             return gpd.GeoDataFrame()
@@ -259,7 +267,7 @@ class PCIConflictDetector:
                 f"Found {dup_count} duplicate cell names, keeping first occurrence",
                 sample_duplicates=dup_names,
             )
-            valid_hulls = valid_hulls[~duplicates].copy()
+            valid_hulls = valid_hulls[~duplicates]
 
         # Validate PCI range per band technology
         valid_hulls = self._validate_pci_range(valid_hulls)
@@ -342,7 +350,7 @@ class PCIConflictDetector:
         # Pre-project geometries for performance (avoid repeated CRS transforms)
         projected_hulls = None
         target_crs = None
-        if self.params.pre_project_geometries and len(band_hulls) > 100:
+        if self.params.pre_project_geometries and len(band_hulls) > PRE_PROJECT_MIN_CELLS:
             projected_hulls, target_crs = self._pre_project_band(band_hulls, band)
 
         conflicts = []
@@ -403,8 +411,8 @@ class PCIConflictDetector:
         else:
             centroid = band_hulls.unary_union.centroid
             utm_zone = int((centroid.x + 180) / 6) + 1
-            epsg_code = 32600 + utm_zone if centroid.y >= 0 else 32700 + utm_zone
-            target_crs = f'EPSG:{epsg_code}'
+            epsg_base = UTM_NORTH_EPSG_BASE if centroid.y >= 0 else UTM_SOUTH_EPSG_BASE
+            target_crs = f'EPSG:{epsg_base + utm_zone}'
 
         logger.info(f"Pre-projecting {len(band_hulls)} cells for band {band} to {target_crs}")
 
@@ -456,11 +464,12 @@ class PCIConflictDetector:
             # Use spatial indexing
             cells = group.reset_index(drop=True)
 
-            # Get corresponding projected cells if available
-            proj_cells = None
+            # Get corresponding projected cells if available, indexed by cell_name for safe lookup
+            proj_cells_by_name: Dict[str, pd.Series] = {}
             if projected_hulls is not None:
                 proj_group = projected_hulls[projected_hulls['_pci_group'] == group_val]
-                proj_cells = proj_group.reset_index(drop=True)
+                for _, proj_row in proj_group.iterrows():
+                    proj_cells_by_name[proj_row['cell_name']] = proj_row
 
             geoms = cells['geometry'].tolist()
             spatial_index = STRtree(geoms)
@@ -492,9 +501,9 @@ class PCIConflictDetector:
                     if exclude_exact_pci and cell1['pci'] == cell2['pci']:
                         continue
 
-                    # Get projected cells if available
-                    proj_cell1 = proj_cells.iloc[idx] if proj_cells is not None else None
-                    proj_cell2 = proj_cells.iloc[other_idx] if proj_cells is not None else None
+                    # Get projected cells by cell_name lookup (safe - avoids index mismatch)
+                    proj_cell1 = proj_cells_by_name.get(cell1['cell_name']) if proj_cells_by_name else None
+                    proj_cell2 = proj_cells_by_name.get(cell2['cell_name']) if proj_cells_by_name else None
 
                     # Calculate overlap with appropriate threshold
                     conflict_info = self._check_overlap(
@@ -585,8 +594,8 @@ class PCIConflictDetector:
                 midpoint_x = (geom1.centroid.x + geom2.centroid.x) / 2
                 midpoint_y = (geom1.centroid.y + geom2.centroid.y) / 2
                 utm_zone = int((midpoint_x + 180) / 6) + 1
-                epsg_code = 32600 + utm_zone if midpoint_y >= 0 else 32700 + utm_zone
-                target_crs = f'EPSG:{epsg_code}'
+                epsg_base = UTM_NORTH_EPSG_BASE if midpoint_y >= 0 else UTM_SOUTH_EPSG_BASE
+                target_crs = f'EPSG:{epsg_base + utm_zone}'
 
             # Transform to projected CRS for accurate area/distance calculations
             gdf1_proj = gdf1.to_crs(target_crs)
@@ -604,7 +613,16 @@ class PCIConflictDetector:
 
         # Calculate overlap percentage relative to smaller cell
         smaller_area_m2 = min(area1_m2, area2_m2)
-        overlap_pct = (overlap_area_m2 / smaller_area_m2) * 100 if smaller_area_m2 > 0 else 0
+        if smaller_area_m2 <= 0:
+            logger.debug(
+                "zero_area_geometry_detected",
+                cell1=cell1['cell_name'],
+                cell2=cell2['cell_name'],
+                area1_m2=area1_m2,
+                area2_m2=area2_m2,
+            )
+            return None
+        overlap_pct = (overlap_area_m2 / smaller_area_m2) * 100
 
         # Use provided threshold or default
         threshold = overlap_threshold if overlap_threshold is not None else self.params.overlap_threshold
