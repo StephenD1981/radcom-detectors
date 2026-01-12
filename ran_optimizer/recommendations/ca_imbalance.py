@@ -13,15 +13,39 @@ around cell sites. This makes them accurate representations of real-world covera
 based on customer device measurements.
 """
 
+import json
+import re
+from pathlib import Path
+
 import geopandas as gpd
 import pandas as pd
-from datetime import datetime, timedelta
-from typing import List, Dict, Any, Optional
+from datetime import datetime
+from typing import List, Dict, Any, Optional, Set
 from dataclasses import dataclass, field
 
 from ran_optimizer.utils.logging_config import get_logger
 
 logger = get_logger(__name__)
+
+# Area conversion constant (m² to km²)
+SQ_METERS_TO_SQ_KM = 1_000_000
+
+# Valid 3GPP LTE bands (E-UTRA) - subset of commonly deployed bands
+VALID_LTE_BANDS: Set[str] = {
+    'L700', 'L800', 'L850', 'L900',  # Sub-1GHz (coverage)
+    'L1800', 'L1900', 'L2100', 'L2300', 'L2600',  # Mid-band (capacity)
+    'L3500', 'L3700',  # C-Band
+}
+
+# Valid 3GPP NR bands - subset of commonly deployed bands
+VALID_NR_BANDS: Set[str] = {
+    'N1', 'N3', 'N5', 'N7', 'N8', 'N20', 'N28',  # FR1 low/mid
+    'N38', 'N41', 'N77', 'N78', 'N79',  # FR1 mid/high
+    'N257', 'N258', 'N260', 'N261',  # FR2 mmWave
+}
+
+# All valid bands
+VALID_BANDS: Set[str] = VALID_LTE_BANDS | VALID_NR_BANDS
 
 
 @dataclass
@@ -31,6 +55,31 @@ class CAPairConfig:
     coverage_band: str  # e.g., 'L800'
     capacity_band: str  # e.g., 'L1800'
     coverage_threshold: float = 0.70  # 70% minimum coverage ratio
+
+    def __post_init__(self):
+        """Validate CA pair configuration."""
+        # Validate coverage and capacity bands are different
+        if self.coverage_band == self.capacity_band:
+            raise ValueError(
+                f"CA pair '{self.name}': coverage_band and capacity_band must be different "
+                f"(both are '{self.coverage_band}')"
+            )
+
+        # Validate bands are known 3GPP bands (warning only for flexibility)
+        if self.coverage_band not in VALID_BANDS:
+            logger.warning(
+                f"CA pair '{self.name}': coverage_band '{self.coverage_band}' not in known 3GPP bands"
+            )
+        if self.capacity_band not in VALID_BANDS:
+            logger.warning(
+                f"CA pair '{self.name}': capacity_band '{self.capacity_band}' not in known 3GPP bands"
+            )
+
+        # Validate coverage threshold
+        if not 0 < self.coverage_threshold <= 1.0:
+            raise ValueError(
+                f"CA pair '{self.name}': coverage_threshold must be in (0, 1], got {self.coverage_threshold}"
+            )
 
 
 @dataclass
@@ -58,6 +107,46 @@ class CAImbalanceParams:
     timestamp_column: str = 'data_timestamp'  # Column name for hull data timestamp
     max_data_age_days: int = 30  # Maximum age of hull data in days
     max_temporal_gap_days: int = 7  # Maximum gap between coverage and capacity hull timestamps
+    # Batch processing for large networks
+    max_site_sectors_per_batch: int = 5000  # Process in batches if > this many site-sectors
+    # Cell name parsing validation
+    min_parse_success_ratio: float = 0.5  # Fail if < 50% of cells parse successfully
+
+    def __post_init__(self):
+        """Validate parameter ranges."""
+        if not self.ca_pairs:
+            raise ValueError("ca_pairs cannot be empty")
+        if not self.cell_name_pattern:
+            raise ValueError("cell_name_pattern cannot be empty")
+
+        # Validate cell_name_pattern is valid regex with exactly 2 capture groups
+        try:
+            compiled_pattern = re.compile(self.cell_name_pattern)
+            if compiled_pattern.groups != 2:
+                raise ValueError(
+                    f"cell_name_pattern must have exactly 2 capture groups (site_id, sector), "
+                    f"got {compiled_pattern.groups}"
+                )
+        except re.error as e:
+            raise ValueError(f"cell_name_pattern is not a valid regex: {e}")
+
+        if self.min_sample_count < 1:
+            raise ValueError("min_sample_count must be at least 1")
+        if self.max_data_age_days < 1:
+            raise ValueError("max_data_age_days must be at least 1")
+        if self.max_temporal_gap_days < 1:
+            raise ValueError("max_temporal_gap_days must be at least 1")
+        if self.max_site_sectors_per_batch < 100:
+            raise ValueError("max_site_sectors_per_batch must be at least 100")
+        if not 0 < self.min_parse_success_ratio <= 1.0:
+            raise ValueError("min_parse_success_ratio must be in (0, 1]")
+
+        # Validate severity thresholds are in ascending order
+        thresholds = self.severity_thresholds
+        if thresholds.get('critical', 0) >= thresholds.get('high', 0):
+            raise ValueError("severity_thresholds: critical must be < high")
+        if thresholds.get('high', 0) >= thresholds.get('medium', 0):
+            raise ValueError("severity_thresholds: high must be < medium")
 
     @classmethod
     def from_config(cls, config_path: str) -> 'CAImbalanceParams':
@@ -71,13 +160,27 @@ class CAImbalanceParams:
 
         Raises:
             ValueError: If config_path is None or required fields are missing
+            FileNotFoundError: If config file does not exist
+            json.JSONDecodeError: If config file is not valid JSON
         """
         if config_path is None:
             raise ValueError("config_path is required - CA imbalance detection requires network-specific configuration")
 
-        import json
-        with open(config_path, 'r') as f:
-            config = json.load(f)
+        path = Path(config_path)
+        if not path.exists():
+            raise FileNotFoundError(f"Config file not found: {config_path}")
+
+        try:
+            with open(path, 'r') as f:
+                config = json.load(f)
+        except json.JSONDecodeError as e:
+            raise json.JSONDecodeError(
+                f"Invalid JSON in config file {config_path}: {e.msg}",
+                e.doc, e.pos
+            )
+
+        if not isinstance(config, dict):
+            raise ValueError(f"Config file {config_path} must contain a JSON object")
 
         # Require ca_pairs in config
         if 'ca_pairs' not in config or not config['ca_pairs']:
@@ -88,12 +191,19 @@ class CAImbalanceParams:
             raise ValueError("cell_name_pattern must be specified in config")
 
         ca_pairs = []
-        for pair_config in config['ca_pairs']:
+        for i, pair_config in enumerate(config['ca_pairs']):
+            if not isinstance(pair_config, dict):
+                raise ValueError(f"ca_pairs[{i}] must be an object")
+            required_keys = {'name', 'coverage_band', 'capacity_band'}
+            missing = required_keys - set(pair_config.keys())
+            if missing:
+                raise ValueError(f"ca_pairs[{i}] missing required keys: {missing}")
+
             ca_pairs.append(CAPairConfig(
-                name=pair_config['name'],
-                coverage_band=pair_config['coverage_band'],
-                capacity_band=pair_config['capacity_band'],
-                coverage_threshold=pair_config.get('coverage_threshold', 0.70)
+                name=str(pair_config['name']),
+                coverage_band=str(pair_config['coverage_band']),
+                capacity_band=str(pair_config['capacity_band']),
+                coverage_threshold=float(pair_config.get('coverage_threshold', 0.70))
             ))
 
         # Get default severity/environment thresholds
@@ -108,15 +218,17 @@ class CAImbalanceParams:
 
         return cls(
             ca_pairs=ca_pairs,
-            cell_name_pattern=config['cell_name_pattern'],
+            cell_name_pattern=str(config['cell_name_pattern']),
             severity_thresholds=config.get('severity_thresholds', default_severity),
             environment_thresholds=config.get('environment_thresholds', default_env),
-            use_environment_thresholds=config.get('use_environment_thresholds', False),
-            min_sample_count=config.get('min_sample_count', 100),
-            sample_count_column=config.get('sample_count_column', 'sample_count'),
-            timestamp_column=config.get('timestamp_column', 'data_timestamp'),
-            max_data_age_days=config.get('max_data_age_days', 30),
-            max_temporal_gap_days=config.get('max_temporal_gap_days', 7),
+            use_environment_thresholds=bool(config.get('use_environment_thresholds', False)),
+            min_sample_count=int(config.get('min_sample_count', 100)),
+            sample_count_column=str(config.get('sample_count_column', 'sample_count')),
+            timestamp_column=str(config.get('timestamp_column', 'data_timestamp')),
+            max_data_age_days=int(config.get('max_data_age_days', 30)),
+            max_temporal_gap_days=int(config.get('max_temporal_gap_days', 7)),
+            max_site_sectors_per_batch=int(config.get('max_site_sectors_per_batch', 5000)),
+            min_parse_success_ratio=float(config.get('min_parse_success_ratio', 0.5)),
         )
 
 
@@ -224,6 +336,16 @@ class CAImbalanceDetector:
         if len(hulls_gdf) == 0:
             raise ValueError("GeoDataFrame is empty after filtering invalid geometry types")
 
+        # Filter out zero-area geometries (degenerate polygons)
+        zero_area_mask = hulls_gdf['geometry'].area == 0
+        zero_area_count = zero_area_mask.sum()
+        if zero_area_count > 0:
+            logger.warning(f"Found {zero_area_count} zero-area geometries. These will be skipped.")
+            hulls_gdf = hulls_gdf[~zero_area_mask].copy()
+
+        if len(hulls_gdf) == 0:
+            raise ValueError("GeoDataFrame is empty after filtering zero-area geometries")
+
         # Check for sample count (data confidence) if column exists
         sample_col = self.params.sample_count_column
         if sample_col in hulls_gdf.columns:
@@ -309,18 +431,31 @@ class CAImbalanceDetector:
         # Log cells where parsing failed before filtering them out
         parse_failed_mask = valid_cells['site_sector'].isna()
         parse_failed_count = parse_failed_mask.sum()
+        total_cells = len(valid_cells)
+        parse_success_count = total_cells - parse_failed_count
+        parse_success_ratio = parse_success_count / total_cells if total_cells > 0 else 0
 
         if parse_failed_count > 0:
             failed_cell_names = valid_cells.loc[parse_failed_mask, 'cell_name'].head(10).tolist()
             logger.warning(
-                f"Failed to parse {parse_failed_count} cell names with pattern '{pattern}'",
+                f"Failed to parse {parse_failed_count}/{total_cells} cell names with pattern '{pattern}'",
                 sample_failed_cells=failed_cell_names,
+                parse_success_ratio=round(parse_success_ratio, 2),
+            )
+
+        # Fail if parse success rate is below threshold (indicates likely pattern misconfiguration)
+        min_ratio = self.params.min_parse_success_ratio
+        if parse_success_ratio < min_ratio:
+            raise ValueError(
+                f"Cell name pattern '{pattern}' only matched {parse_success_ratio:.1%} of cells "
+                f"(minimum required: {min_ratio:.0%}). Pattern may be misconfigured for this network. "
+                f"Sample failed cells: {failed_cell_names[:5]}"
             )
 
         # Filter out cells where parsing failed
         valid_cells = valid_cells[~parse_failed_mask].copy()
 
-        logger.info(f"Successfully parsed {len(valid_cells)} cell names")
+        logger.info(f"Successfully parsed {len(valid_cells)} cell names ({parse_success_ratio:.1%} success rate)")
 
         # Determine target CRS for accurate area calculations
         target_crs = self.target_crs
@@ -342,17 +477,31 @@ class CAImbalanceDetector:
         valid_cells_projected = valid_cells.to_crs(target_crs)
 
         # Calculate areas in km^2 using projected CRS
-        valid_cells_projected['area_km2'] = valid_cells_projected['geometry'].area / 1_000_000
+        valid_cells_projected['area_km2'] = valid_cells_projected['geometry'].area / SQ_METERS_TO_SQ_KM
 
         logger.info(f"Calculated areas using projected CRS ({target_crs})")
 
         # Group by site_sector to find pairs with both coverage and capacity bands
         site_sector_groups = valid_cells_projected.groupby('site_sector')
+        n_site_sectors = len(site_sector_groups)
+
+        # Warn for large networks (batch processing informational)
+        max_per_batch = self.params.max_site_sectors_per_batch
+        if n_site_sectors > max_per_batch:
+            logger.info(
+                f"Processing {n_site_sectors} site-sectors (large network mode)",
+                batch_size=max_per_batch,
+            )
 
         issues = []
         pairs_with_both_bands = 0
+        processed_count = 0
 
         for site_sector, group in site_sector_groups:
+            # Log progress for large networks
+            processed_count += 1
+            if n_site_sectors > max_per_batch and processed_count % max_per_batch == 0:
+                logger.info(f"Processed {processed_count}/{n_site_sectors} site-sectors...")
             bands_present = set(group['band'].unique())
 
             # Only check site/sectors that have BOTH coverage AND capacity bands
@@ -397,7 +546,7 @@ class CAImbalanceDetector:
             # CA requires UE to be in BOTH coverage and capacity cell footprints
             if coverage_geom.is_valid and capacity_geom.is_valid:
                 intersection = coverage_geom.intersection(capacity_geom)
-                intersection_area_km2 = intersection.area / 1_000_000 if not intersection.is_empty else 0
+                intersection_area_km2 = intersection.area / SQ_METERS_TO_SQ_KM if not intersection.is_empty else 0
             else:
                 logger.warning(f"Invalid geometry for {site_sector}, skipping intersection calculation")
                 intersection_area_km2 = 0
