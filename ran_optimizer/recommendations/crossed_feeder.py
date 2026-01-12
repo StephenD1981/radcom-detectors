@@ -697,9 +697,10 @@ class CrossedFeederDetector:
 
         for (site, band), group in cell_results.groupby(["site", "band"]):
             n_cells = len(group)
-            high_conf = len(group[group["confidence_level"] == "HIGH"])
-            medium_conf = len(group[group["confidence_level"] == "MEDIUM"])
-            low_conf = len(group[group["confidence_level"] == "LOW"])
+            # Map actual confidence levels to summary categories
+            high_conf = len(group[group["confidence_level"] == "HIGH_POTENTIAL_SWAP"])
+            medium_conf = len(group[group["confidence_level"].isin(["POSSIBLE_SWAP", "SINGLE_ANOMALY"])])
+            low_conf = len(group[group["confidence_level"] == "REPAN"])
 
             # Determine site-level classification
             if high_conf > 0:

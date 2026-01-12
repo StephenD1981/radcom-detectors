@@ -302,7 +302,7 @@ class TestSwapPatternDetection:
         result = detector.detect(relations_df, swap_scenario_gis)
 
         # Should not detect any high confidence issues
-        high_conf = result['cells'][result['cells']['confidence_level'] == 'HIGH']
+        high_conf = result['cells'][result['cells']['confidence_level'] == 'HIGH_POTENTIAL_SWAP']
         assert len(high_conf) == 0
         assert len(result['swap_pairs']) == 0
 
@@ -311,20 +311,26 @@ class TestSwapPatternDetection:
 
         Cell A (0°) has traffic toward 120° (Cell B's direction)
         Cell B (120°) has traffic toward 0° (Cell A's direction)
+
+        Note: swap_candidates requires total_relations >= 3 and out_of_beam_relations >= 2
         """
         relations_df = _create_test_relations([
-            # Cell A (0° azimuth) has strong traffic to SOUTHEAST (~120° direction)
+            # Cell A (0° azimuth) has strong traffic to SOUTHEAST (~120° direction) - all to same direction
             {"cell_name": "SITE1_A", "to_cell_name": "SOUTHEAST", "distance": 8000, "band": "L800", "to_band": "L800", "intra_site": "n", "intra_cell": "n", "weight": 50},
-            # Cell B (120° azimuth) has strong traffic to NORTH (~0° direction)
+            {"cell_name": "SITE1_A", "to_cell_name": "SOUTHEAST", "distance": 9000, "band": "L800", "to_band": "L800", "intra_site": "n", "intra_cell": "n", "weight": 40},
+            {"cell_name": "SITE1_A", "to_cell_name": "SOUTHEAST", "distance": 7000, "band": "L800", "to_band": "L800", "intra_site": "n", "intra_cell": "n", "weight": 30},
+            # Cell B (120° azimuth) has strong traffic to NORTH (~0° direction) - all to same direction
             {"cell_name": "SITE1_B", "to_cell_name": "NORTH", "distance": 10000, "band": "L800", "to_band": "L800", "intra_site": "n", "intra_cell": "n", "weight": 50},
+            {"cell_name": "SITE1_B", "to_cell_name": "NORTH", "distance": 9000, "band": "L800", "to_band": "L800", "intra_site": "n", "intra_cell": "n", "weight": 40},
+            {"cell_name": "SITE1_B", "to_cell_name": "NORTH", "distance": 8000, "band": "L800", "to_band": "L800", "intra_site": "n", "intra_cell": "n", "weight": 30},
         ])
 
         params = CrossedFeederParams(
             min_out_of_beam_ratio=0.3,
             min_out_of_beam_weight=5.0,
             swap_angle_tolerance_deg=30.0,
-            min_total_relations=1,  # Lower for unit testing
-            min_out_of_beam_relations=1,  # Lower for unit testing
+            min_total_relations=1,
+            min_out_of_beam_relations=1,
         )
         detector = CrossedFeederDetector(params)
         result = detector.detect(relations_df, swap_scenario_gis)
@@ -334,13 +340,13 @@ class TestSwapPatternDetection:
         swap = result['swap_pairs'].iloc[0]
         assert set([swap['cell_a'], swap['cell_b']]) == {'SITE1_A', 'SITE1_B'}
 
-        # Both cells should be HIGH confidence
-        high_conf = result['cells'][result['cells']['confidence_level'] == 'HIGH']
+        # Both cells should be HIGH_POTENTIAL_SWAP confidence
+        high_conf = result['cells'][result['cells']['confidence_level'] == 'HIGH_POTENTIAL_SWAP']
         assert len(high_conf) == 2
         assert set(high_conf['cell_name']) == {'SITE1_A', 'SITE1_B'}
 
     def test_single_anomaly_low_confidence(self, swap_scenario_gis):
-        """Single cell with out-of-beam traffic should be LOW confidence."""
+        """Single cell with out-of-beam traffic should be SINGLE_ANOMALY confidence."""
         # Only Cell A has anomalous traffic
         relations_df = _create_test_relations([
             {"cell_name": "SITE1_A", "to_cell_name": "SOUTHEAST", "distance": 8000, "band": "L800", "to_band": "L800", "intra_site": "n", "intra_cell": "n", "weight": 50},
@@ -355,14 +361,14 @@ class TestSwapPatternDetection:
         detector = CrossedFeederDetector(params)
         result = detector.detect(relations_df, swap_scenario_gis)
 
-        # Should be LOW confidence (single anomaly, no swap partner)
+        # Should be SINGLE_ANOMALY confidence (single anomaly, no swap partner)
         cell_a = result['cells'][result['cells']['cell_name'] == 'SITE1_A']
         assert len(cell_a) == 1
-        assert cell_a.iloc[0]['confidence_level'] == 'LOW'
+        assert cell_a.iloc[0]['confidence_level'] == 'SINGLE_ANOMALY'
         assert len(result['swap_pairs']) == 0
 
     def test_multiple_anomalies_no_swap_medium_confidence(self, swap_scenario_gis):
-        """Multiple anomalies without clean swap should be MEDIUM confidence."""
+        """Multiple anomalies without clean swap should be POSSIBLE_SWAP confidence."""
         # Cell A and B both have anomalous traffic but NOT toward each other's azimuths
         relations_df = _create_test_relations([
             # Cell A (0°) has traffic toward 240° (Cell C's direction, not B)
@@ -381,9 +387,9 @@ class TestSwapPatternDetection:
         detector = CrossedFeederDetector(params)
         result = detector.detect(relations_df, swap_scenario_gis)
 
-        # Both should be MEDIUM (multiple anomalies, but not a swap pattern)
-        medium_conf = result['cells'][result['cells']['confidence_level'] == 'MEDIUM']
-        assert len(medium_conf) == 2
+        # Both should be POSSIBLE_SWAP (multiple anomalies, but not a swap pattern)
+        possible_swap = result['cells'][result['cells']['confidence_level'] == 'POSSIBLE_SWAP']
+        assert len(possible_swap) == 2
         assert len(result['swap_pairs']) == 0
 
 
@@ -391,23 +397,31 @@ class TestSiteSummary:
     """Test site-level summary generation."""
 
     def test_site_severity_high(self):
-        """Site with swap pair should have HIGH severity."""
+        """Site with swap pair should have HIGH severity.
+
+        Note: swap_candidates requires total_relations >= 3 and out_of_beam_relations >= 2
+        """
         gis_df = _create_test_gis([
             {"cell_name": "A1", "site": "SITE1", "band": "L800", "bearing": 0, "hbw": 65, "latitude": 53.0, "longitude": -6.0},
             {"cell_name": "B1", "site": "SITE1", "band": "L800", "bearing": 120, "hbw": 65, "latitude": 53.0, "longitude": -6.0},
             {"cell_name": "EXT1", "site": "EXT", "band": "L800", "bearing": 180, "hbw": 65, "latitude": 53.1, "longitude": -6.0},
-            {"cell_name": "EXT2", "site": "EXT", "band": "L800", "bearing": 0, "hbw": 65, "latitude": 52.9, "longitude": -5.9},
+            {"cell_name": "EXT2", "site": "EXT2", "band": "L800", "bearing": 0, "hbw": 65, "latitude": 52.9, "longitude": -5.9},
         ])
 
         relations_df = _create_test_relations([
-            # Swap pattern
+            # Swap pattern - A1 (0° azimuth) has traffic toward EXT2 (~135° direction, toward B1's azimuth)
             {"cell_name": "A1", "to_cell_name": "EXT2", "distance": 8000, "band": "L800", "to_band": "L800", "intra_site": "n", "intra_cell": "n", "weight": 50},
+            {"cell_name": "A1", "to_cell_name": "EXT2", "distance": 9000, "band": "L800", "to_band": "L800", "intra_site": "n", "intra_cell": "n", "weight": 40},
+            {"cell_name": "A1", "to_cell_name": "EXT2", "distance": 7000, "band": "L800", "to_band": "L800", "intra_site": "n", "intra_cell": "n", "weight": 30},
+            # B1 (120° azimuth) has traffic toward EXT1 (~0° direction, toward A1's azimuth)
             {"cell_name": "B1", "to_cell_name": "EXT1", "distance": 10000, "band": "L800", "to_band": "L800", "intra_site": "n", "intra_cell": "n", "weight": 50},
+            {"cell_name": "B1", "to_cell_name": "EXT1", "distance": 9000, "band": "L800", "to_band": "L800", "intra_site": "n", "intra_cell": "n", "weight": 40},
+            {"cell_name": "B1", "to_cell_name": "EXT1", "distance": 8000, "band": "L800", "to_band": "L800", "intra_site": "n", "intra_cell": "n", "weight": 30},
         ])
 
         params = CrossedFeederParams(
-            min_total_relations=1,  # Lower for unit testing
-            min_out_of_beam_relations=1,  # Lower for unit testing
+            min_total_relations=1,
+            min_out_of_beam_relations=1,
         )
         detector = CrossedFeederDetector(params)
         result = detector.detect(relations_df, gis_df)
