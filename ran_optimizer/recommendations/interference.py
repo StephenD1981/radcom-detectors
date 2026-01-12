@@ -30,6 +30,31 @@ KM_PER_DEGREE_LAT = 111.32
 # Memory safeguard: maximum records per band to prevent OOM
 MAX_RECORDS_PER_BAND = 5_000_000
 
+# Band-specific interference thresholds (dB)
+# Different frequency bands have different propagation characteristics:
+# - Sub-1GHz: Better propagation, wider coverage, more natural overlap
+# - Mid-band: Higher path loss, tighter cells
+# - C-band/mmWave: Even higher path loss, very tight cells
+BAND_INTERFERENCE_THRESHOLDS = {
+    # LTE sub-1GHz bands (coverage layer) - wider coverage, more natural overlap
+    'L700': {'max_rsrp_diff': 6.0, 'dominance_diff': 6.0},
+    'L800': {'max_rsrp_diff': 6.0, 'dominance_diff': 6.0},
+    # LTE mid-band (capacity layer) - tighter cells
+    'L1800': {'max_rsrp_diff': 5.0, 'dominance_diff': 5.0},
+    'L2100': {'max_rsrp_diff': 5.0, 'dominance_diff': 5.0},
+    'L2600': {'max_rsrp_diff': 5.0, 'dominance_diff': 5.0},
+    # 5G NR high-band (C-band) - even tighter cells
+    'L3500': {'max_rsrp_diff': 4.0, 'dominance_diff': 4.0},
+    'L3700': {'max_rsrp_diff': 4.0, 'dominance_diff': 4.0},
+    # 5G NR sub-6GHz (same as LTE equivalents for NR refarming)
+    'N1': {'max_rsrp_diff': 5.0, 'dominance_diff': 5.0},
+    'N3': {'max_rsrp_diff': 5.0, 'dominance_diff': 5.0},
+    'N7': {'max_rsrp_diff': 5.0, 'dominance_diff': 5.0},
+    'N28': {'max_rsrp_diff': 6.0, 'dominance_diff': 6.0},
+    'N78': {'max_rsrp_diff': 4.0, 'dominance_diff': 4.0},
+    'N77': {'max_rsrp_diff': 4.0, 'dominance_diff': 4.0},
+}
+
 
 # -----------------------------
 # Configuration
@@ -77,6 +102,17 @@ class InterferenceParams:
     # Environment-specific threshold overrides
     environment_overrides: Optional[dict] = None
 
+    # Geohash precision validation (Fix #5)
+    # Precision 6: ~1.2km x 0.6km, Precision 7: ~153m x 153m, Precision 8: ~38m x 19m
+    expected_geohash_precision: Optional[int] = 7
+    geohash_precision_warning: bool = True  # Warn if precision doesn't match expected
+
+    # Memory safeguard: maximum records per band (Fix #11 - now configurable)
+    max_records_per_band: int = 5_000_000
+
+    # Data freshness validation (Fix #10)
+    max_data_age_days: Optional[int] = 7  # Warn if data older than this, None to disable
+
     @classmethod
     def from_config(cls, config_path: Optional[str] = None) -> 'InterferenceParams':
         """Load parameters from config file or use defaults."""
@@ -89,7 +125,7 @@ class InterferenceParams:
 
             path = Path(config_path)
             if not path.exists():
-                logger.warning(f"Config file not found: {config_path}. Using defaults.")
+                logger.warning("config_file_not_found", path=config_path, using_defaults=True)
                 return cls()
 
             with open(path, 'r') as f:
@@ -101,6 +137,9 @@ class InterferenceParams:
             rsrp_quantiles = params.get('rsrp_quantiles', {})
 
             polygon_params = params.get('polygon_clustering', {})
+
+            # Validation params
+            validation_params = params.get('validation', {})
 
             return cls(
                 min_filtered_cells_per_grid=params.get('min_filtered_cells_per_grid', 4),
@@ -122,9 +161,13 @@ class InterferenceParams:
                 alpha_shape_alpha=polygon_params.get('alpha_shape_alpha'),
                 max_alphashape_points=polygon_params.get('max_alphashape_points', 2000),
                 environment_overrides=config.get('environment_overrides'),
+                expected_geohash_precision=validation_params.get('expected_geohash_precision', 7),
+                geohash_precision_warning=validation_params.get('geohash_precision_warning', True),
+                max_records_per_band=validation_params.get('max_records_per_band', 5_000_000),
+                max_data_age_days=validation_params.get('max_data_age_days', 7),
             )
         except Exception as e:
-            logger.warning(f"Failed to load config: {e}. Using defaults.")
+            logger.warning("config_load_failed", error=str(e), using_defaults=True)
             return cls()
 
 
@@ -243,22 +286,65 @@ class InterferenceDetector:
             params: Detection parameters (uses defaults if None)
         """
         self.params = params or InterferenceParams()
+        # Store original params for idempotent environment overrides (Fix #6)
+        self._original_params = InterferenceParams(
+            min_filtered_cells_per_grid=self.params.min_filtered_cells_per_grid,
+            min_cell_event_count=self.params.min_cell_event_count,
+            perc_grid_events=self.params.perc_grid_events,
+            dominant_perc_grid_events=self.params.dominant_perc_grid_events,
+            dominance_diff=self.params.dominance_diff,
+            max_rsrp_diff=self.params.max_rsrp_diff,
+            sinr_threshold_db=self.params.sinr_threshold_db,
+            k=self.params.k,
+            perc_interference=self.params.perc_interference,
+            clustering_algo=self.params.clustering_algo,
+            fixed_width=self.params.fixed_width,
+            dynamic_width=self.params.dynamic_width,
+            rsrp_min_quantile=self.params.rsrp_min_quantile,
+            rsrp_max_quantile=self.params.rsrp_max_quantile,
+            perceived_multiplier=self.params.perceived_multiplier,
+            hdbscan_min_cluster_size=self.params.hdbscan_min_cluster_size,
+            alpha_shape_alpha=self.params.alpha_shape_alpha,
+            max_alphashape_points=self.params.max_alphashape_points,
+            environment_overrides=self.params.environment_overrides,
+            expected_geohash_precision=self.params.expected_geohash_precision,
+            geohash_precision_warning=self.params.geohash_precision_warning,
+            max_records_per_band=self.params.max_records_per_band,
+            max_data_age_days=self.params.max_data_age_days,
+        )
 
         logger.info(
-            "Interference detector initialized",
+            "interference_detector_initialized",
             min_filtered_cells=self.params.min_filtered_cells_per_grid,
             max_rsrp_diff=self.params.max_rsrp_diff,
             k=self.params.k,
         )
 
+    def _reset_to_original_params(self) -> None:
+        """Reset params to original values before applying new environment overrides."""
+        for field in ['min_filtered_cells_per_grid', 'min_cell_event_count', 'perc_grid_events',
+                      'dominant_perc_grid_events', 'dominance_diff', 'max_rsrp_diff',
+                      'sinr_threshold_db', 'k', 'perc_interference', 'clustering_algo',
+                      'fixed_width', 'dynamic_width', 'rsrp_min_quantile', 'rsrp_max_quantile',
+                      'perceived_multiplier', 'hdbscan_min_cluster_size', 'alpha_shape_alpha',
+                      'max_alphashape_points']:
+            setattr(self.params, field, getattr(self._original_params, field))
+
     def _apply_environment_overrides(self, environment: Optional[str]) -> None:
-        """Apply environment-specific parameter overrides."""
+        """Apply environment-specific parameter overrides (idempotent - Fix #6)."""
+        # Always reset to original params first for idempotency
+        self._reset_to_original_params()
+
         if environment is None or self.params.environment_overrides is None:
             return
 
         overrides = self.params.environment_overrides.get(environment)
         if overrides:
-            logger.info(f"Applying {environment} environment overrides: {overrides}")
+            logger.info(
+                "applying_environment_overrides",
+                environment=environment,
+                overrides=overrides,
+            )
             for key, value in overrides.items():
                 if hasattr(self.params, key):
                     setattr(self.params, key, value)
@@ -312,28 +398,31 @@ class InterferenceDetector:
         # Check if SINR data is available for validation
         has_sinr = 'avg_sinr' in df.columns
         if has_sinr:
-            logger.info("SINR data available - will apply SINR validation filter")
+            logger.info("sinr_data_available", action="will_apply_sinr_validation_filter")
 
         # Log validated input details
         logger.info(
-            f"Validated input: {df['band'].nunique()} bands, {df['cell_name'].nunique()} cells"
+            "input_validated",
+            bands=df['band'].nunique(),
+            cells=df['cell_name'].nunique(),
         )
 
         # Process each band and collect interference grids
         all_grids = []
         total_records = 0
+        max_records = self.params.max_records_per_band  # Fix #11: use configurable limit
 
         for band in df['band'].unique():
             band_data_size = len(df[df['band'] == band])
-            if band_data_size > MAX_RECORDS_PER_BAND:
+            if band_data_size > max_records:
                 logger.error(
                     "band_exceeds_max_records",
                     band=band,
                     records=band_data_size,
-                    max_allowed=MAX_RECORDS_PER_BAND
+                    max_allowed=max_records,
                 )
                 raise ValueError(
-                    f"Band {band} has {band_data_size:,} records, exceeding limit of {MAX_RECORDS_PER_BAND:,}"
+                    f"Band {band} has {band_data_size:,} records, exceeding limit of {max_records:,}"
                 )
 
             grids = self._process_band(df, band, data_type)
@@ -342,16 +431,16 @@ class InterferenceDetector:
                 total_records += len(grids)
 
                 # Check accumulated size
-                if total_records > MAX_RECORDS_PER_BAND:
+                if total_records > max_records:
                     logger.warning(
                         "accumulated_grids_exceeds_limit",
                         total_records=total_records,
-                        max_allowed=MAX_RECORDS_PER_BAND
+                        max_allowed=max_records,
                     )
 
         # Handle empty result
         if not all_grids:
-            logger.info("No interference patterns found")
+            logger.info("no_interference_patterns_found")
             return gpd.GeoDataFrame(
                 columns=['cluster_id', 'band', 'n_grids', 'n_cells', 'cells',
                         'centroid_lat', 'centroid_lon', 'area_km2', 'avg_rsrp', 'geometry'],
@@ -411,13 +500,93 @@ class InterferenceDetector:
         null_counts = df[required_columns].isnull().sum()
         if null_counts.any():
             null_report = null_counts[null_counts > 0].to_dict()
-            logger.warning(f"Found null values: {null_report}. Rows will be dropped.")
+            logger.warning("null_values_found", null_counts=null_report, action="dropping_rows")
             df = df.dropna(subset=required_columns)
 
             if df.empty:
                 raise ValueError("All rows contain null values in required columns")
 
+        # Validate geohash precision (Fix #5)
+        if self.params.geohash_precision_warning and self.params.expected_geohash_precision:
+            self._validate_geohash_precision(df)
+
+        # Validate data freshness (Fix #10)
+        if self.params.max_data_age_days is not None:
+            self._validate_data_freshness(df)
+
         return df
+
+    def _validate_geohash_precision(self, df: pd.DataFrame) -> None:
+        """Validate geohash precision matches expected value (Fix #5)."""
+        sample_grids = df['grid'].dropna().head(100)
+        if sample_grids.empty:
+            return
+
+        precisions = sample_grids.str.len().unique()
+        expected = self.params.expected_geohash_precision
+
+        if len(precisions) > 1:
+            logger.warning(
+                "mixed_geohash_precision",
+                precisions_found=list(precisions),
+                expected_precision=expected,
+                recommendation="Ensure consistent geohash precision across dataset",
+            )
+        elif len(precisions) == 1 and precisions[0] != expected:
+            actual = int(precisions[0])
+            # Provide context on resolution difference
+            resolution_info = {
+                5: "~4.9km x 4.9km",
+                6: "~1.2km x 0.6km",
+                7: "~153m x 153m",
+                8: "~38m x 19m",
+                9: "~4.8m x 4.8m",
+            }
+            logger.warning(
+                "geohash_precision_mismatch",
+                expected_precision=expected,
+                actual_precision=actual,
+                expected_resolution=resolution_info.get(expected, "unknown"),
+                actual_resolution=resolution_info.get(actual, "unknown"),
+            )
+
+    def _validate_data_freshness(self, df: pd.DataFrame) -> None:
+        """Validate data is not too old (Fix #10)."""
+        from datetime import datetime, timedelta
+
+        timestamp_cols = ['timestamp', 'date', 'collection_date', 'created_at']
+        ts_col = None
+        for col in timestamp_cols:
+            if col in df.columns:
+                ts_col = col
+                break
+
+        if ts_col is None:
+            # No timestamp column found, skip validation
+            return
+
+        try:
+            dates = pd.to_datetime(df[ts_col], errors='coerce')
+            valid_dates = dates.dropna()
+            if valid_dates.empty:
+                return
+
+            max_date = valid_dates.max()
+            min_date = valid_dates.min()
+            now = datetime.now()
+            age_days = (now - max_date).days
+
+            if age_days > self.params.max_data_age_days:
+                logger.warning(
+                    "data_freshness_warning",
+                    max_data_age_days=self.params.max_data_age_days,
+                    actual_age_days=age_days,
+                    newest_data=max_date.strftime("%Y-%m-%d"),
+                    oldest_data=min_date.strftime("%Y-%m-%d"),
+                    recommendation="Consider using more recent data for accurate interference detection",
+                )
+        except Exception as e:
+            logger.debug("data_freshness_check_failed", error=str(e))
 
     def _process_band(
         self,
@@ -432,7 +601,7 @@ class InterferenceDetector:
         """
         cfg = self.params
         band_start = time.time()
-        logger.info(f"Processing band: {band}")
+        logger.info("processing_band", band=band)
 
         grid_geo_data_diff = df[df.band == band].copy()
 
@@ -467,8 +636,11 @@ class InterferenceDetector:
         )
 
         # STEP 4: Filter cells within max_rsrp_diff of strongest cell
+        # Use band-specific threshold if available, otherwise fall back to config default
+        band_thresholds = BAND_INTERFERENCE_THRESHOLDS.get(band, {})
+        max_rsrp_diff = band_thresholds.get('max_rsrp_diff', cfg.max_rsrp_diff)
         grid_geo_data_diff = grid_geo_data_diff[
-            grid_geo_data_diff['rsrp_dist_max'] <= cfg.max_rsrp_diff
+            grid_geo_data_diff['rsrp_dist_max'] <= max_rsrp_diff
         ]
 
         # STEP 5: Cluster cells by RSRP similarity
@@ -516,7 +688,7 @@ class InterferenceDetector:
 
         # Handle empty result
         if len(grid_geo_data_geo_filtered) == 0:
-            logger.warning(f"No interference patterns found for band {band}")
+            logger.warning("no_interference_patterns_for_band", band=band)
             return pd.DataFrame()
 
         # Log band-level results
@@ -524,8 +696,9 @@ class InterferenceDetector:
         n_cells = grid_geo_data_geo_filtered['cell_name'].nunique()
 
         logger.info(
-            f"Band {band} completed",
-            elapsed_time=round(band_elapsed, 2),
+            "band_processing_completed",
+            band=band,
+            elapsed_time_s=round(band_elapsed, 2),
             interference_cells=n_cells,
         )
 
@@ -540,6 +713,10 @@ class InterferenceDetector:
     ) -> list:
         """Identify grids with dominant cells."""
         cfg = self.params
+
+        # Use band-specific threshold if available, otherwise fall back to config default
+        band_thresholds = BAND_INTERFERENCE_THRESHOLDS.get(band, {})
+        dominance_diff = band_thresholds.get('dominance_diff', cfg.dominance_diff)
 
         grid_geo_data_dominant = df[df.band == band].copy()
         grid_geo_data_dominant = grid_geo_data_dominant.merge(
@@ -566,16 +743,16 @@ class InterferenceDetector:
         if 'perc_grid_events' in grid_geo_data_dominant.columns:
             if data_type == 'perceived':
                 grid_geo_data_dominant = grid_geo_data_dominant[
-                    grid_geo_data_dominant['rsrp_diff_1_2'] >= cfg.dominance_diff
+                    grid_geo_data_dominant['rsrp_diff_1_2'] >= dominance_diff
                 ]
             else:
                 grid_geo_data_dominant = grid_geo_data_dominant[
                     (grid_geo_data_dominant.perc_grid_events >= cfg.dominant_perc_grid_events) &
-                    (grid_geo_data_dominant['rsrp_diff_1_2'] >= cfg.dominance_diff)
+                    (grid_geo_data_dominant['rsrp_diff_1_2'] >= dominance_diff)
                 ]
         else:
             grid_geo_data_dominant = grid_geo_data_dominant[
-                grid_geo_data_dominant['rsrp_diff_1_2'] >= cfg.dominance_diff
+                grid_geo_data_dominant['rsrp_diff_1_2'] >= dominance_diff
             ]
 
         return list(set(grid_geo_data_dominant.grid.to_list()))
@@ -648,7 +825,7 @@ class InterferenceDetector:
             band_grids = grids_df[grids_df['band'] == band].copy()
 
             if len(band_grids) < cfg.hdbscan_min_cluster_size:
-                logger.info(f"Band {band}: too few grids ({len(band_grids)}) for clustering")
+                logger.info("skipping_band_clustering", band=band, grids=len(band_grids), reason="too_few_grids")
                 continue
 
             # Decode geohashes to coordinates
@@ -670,6 +847,10 @@ class InterferenceDetector:
                 {'grid': gh, 'latitude': lat, 'longitude': lon}
                 for gh, (lat, lon) in coords_map.items()
             ])
+            # Drop existing lat/lon columns to avoid suffixes after merge
+            cols_to_drop = [c for c in ['latitude', 'longitude'] if c in band_grids.columns]
+            if cols_to_drop:
+                band_grids = band_grids.drop(columns=cols_to_drop)
             band_grids = band_grids.merge(coords_df, on='grid', how='left')
 
             # Cluster using HDBSCAN on unique coordinates
@@ -678,7 +859,7 @@ class InterferenceDetector:
 
             # Skip if too few points for clustering
             if len(coords) < cfg.hdbscan_min_cluster_size:
-                logger.info(f"Band {band}: only {len(coords)} unique coordinates, skipping clustering")
+                logger.info("skipping_band_clustering", band=band, unique_coords=len(coords), reason="too_few_coordinates")
                 continue
 
             coords_rad = np.radians(coords)
@@ -703,7 +884,7 @@ class InterferenceDetector:
             clustered = band_grids[band_grids['cluster_id'] >= 0].copy()
 
             if clustered.empty:
-                logger.info(f"Band {band}: no valid clusters found")
+                logger.info("no_valid_clusters_for_band", band=band)
                 continue
 
             # Create polygons for each cluster
@@ -742,7 +923,7 @@ class InterferenceDetector:
                 all_clusters.append(cluster_meta)
 
             n_clusters = clustered['cluster_id'].nunique()
-            logger.info(f"Band {band}: {n_clusters} interference clusters created")
+            logger.info("band_clusters_created", band=band, clusters=n_clusters)
 
         if not all_clusters:
             columns = ['cluster_id', 'band', 'n_grids', 'n_cells', 'cells',
@@ -758,8 +939,77 @@ class InterferenceDetector:
 
         gdf = gdf.sort_values(['band', 'n_grids'], ascending=[True, False]).reset_index(drop=True)
 
-        logger.info(f"Total interference clusters: {len(gdf)}")
+        logger.info("total_interference_clusters", count=len(gdf))
         return gdf
+
+    def _grid_based_subsample(self, coords: np.ndarray, max_points: int) -> np.ndarray:
+        """
+        Subsample coordinates using grid-based sampling (Fix #12).
+
+        This method preserves cluster boundaries better than random sampling by:
+        1. Dividing the coordinate space into a grid
+        2. Selecting one representative point from each grid cell
+        3. Prioritizing boundary points (extreme values in each direction)
+
+        Args:
+            coords: Array of (longitude, latitude) coordinates
+            max_points: Maximum number of points to return
+
+        Returns:
+            Subsampled coordinates array
+        """
+        if len(coords) <= max_points:
+            return coords
+
+        # Calculate grid dimensions to get approximately max_points cells
+        n_cells = int(np.sqrt(max_points))
+
+        # Get coordinate bounds
+        lon_min, lon_max = coords[:, 0].min(), coords[:, 0].max()
+        lat_min, lat_max = coords[:, 1].min(), coords[:, 1].max()
+
+        # Handle edge case where all points have same coordinate
+        lon_range = lon_max - lon_min
+        lat_range = lat_max - lat_min
+        if lon_range == 0:
+            lon_range = 0.0001
+        if lat_range == 0:
+            lat_range = 0.0001
+
+        # Calculate grid cell size
+        cell_width = lon_range / n_cells
+        cell_height = lat_range / n_cells
+
+        # Assign each point to a grid cell
+        cell_x = ((coords[:, 0] - lon_min) / cell_width).astype(int)
+        cell_y = ((coords[:, 1] - lat_min) / cell_height).astype(int)
+        cell_x = np.clip(cell_x, 0, n_cells - 1)
+        cell_y = np.clip(cell_y, 0, n_cells - 1)
+        cell_ids = cell_x * n_cells + cell_y
+
+        # Select one point per cell (first occurrence for determinism)
+        unique_cells, first_indices = np.unique(cell_ids, return_index=True)
+        selected_coords = coords[first_indices]
+
+        # If we have too few points, add boundary points
+        if len(selected_coords) < max_points:
+            # Add extreme points (boundary preservation)
+            boundary_indices = [
+                coords[:, 0].argmin(),  # westmost
+                coords[:, 0].argmax(),  # eastmost
+                coords[:, 1].argmin(),  # southmost
+                coords[:, 1].argmax(),  # northmost
+            ]
+            boundary_coords = coords[boundary_indices]
+            selected_coords = np.vstack([selected_coords, boundary_coords])
+            # Remove duplicates
+            selected_coords = np.unique(selected_coords, axis=0)
+
+        # If still too many, truncate
+        if len(selected_coords) > max_points:
+            selected_coords = selected_coords[:max_points]
+
+        return selected_coords
 
     def _create_alpha_shape(self, coords: np.ndarray) -> Optional[Polygon]:
         """
@@ -773,11 +1023,10 @@ class InterferenceDetector:
         """
         cfg = self.params
 
-        # Subsample if too many points (use seeded RNG for reproducibility)
+        # Subsample if too many points using grid-based sampling (Fix #12)
+        # Grid-based sampling preserves cluster boundaries better than random sampling
         if len(coords) > cfg.max_alphashape_points:
-            rng = np.random.default_rng(seed=42)
-            indices = rng.choice(len(coords), cfg.max_alphashape_points, replace=False)
-            coords = coords[indices]
+            coords = self._grid_based_subsample(coords, cfg.max_alphashape_points)
 
         try:
             if cfg.alpha_shape_alpha is None:
@@ -793,7 +1042,7 @@ class InterferenceDetector:
             return unary_union([shape]).buffer(0)
 
         except Exception as e:
-            logger.warning(f"Alpha shape creation failed: {e}")
+            logger.warning("alpha_shape_creation_failed", error=str(e), fallback="convex_hull")
             # Fallback to convex hull
             try:
                 points = [Point(lon, lat) for lon, lat in coords]
@@ -843,7 +1092,7 @@ class InterferenceDetector:
             return [round(a / 1_000_000, 3) for a in areas_m2]
 
         except Exception as e:
-            logger.warning(f"Batch area calculation failed: {e}. Using per-geometry fallback.")
+            logger.warning("batch_area_calculation_failed", error=str(e), fallback="per_geometry")
             return [self._calculate_area_km2(geom) for geom in gdf.geometry]
 
     def _calculate_area_km2(self, geometry) -> float:
@@ -871,7 +1120,7 @@ class InterferenceDetector:
             return round(area_m2 / 1_000_000, 3)
 
         except Exception as e:
-            logger.warning(f"Area calculation failed: {e}")
+            logger.warning("area_calculation_failed", error=str(e), fallback="approximation")
             # Fallback approximation
             return round(
                 geometry.area * KM_PER_DEGREE_LAT * KM_PER_DEGREE_LAT *
@@ -969,11 +1218,14 @@ class InterferenceRootCauseAnalyzer:
         has_tilt = 'tilt_elc' in gis_df.columns or 'tilt_mech' in gis_df.columns
         has_azimuth = 'bearing' in gis_df.columns
         has_power = 'tx_power' in gis_df.columns
+        has_height = 'antenna_height' in gis_df.columns  # Fix #8: height-adjusted tilt
 
         if not has_tilt:
-            logger.warning("GIS data missing tilt columns - tilt analysis will be limited")
+            logger.warning("gis_data_missing_tilt", impact="tilt_analysis_limited")
         if not has_azimuth:
-            logger.warning("GIS data missing bearing column - azimuth analysis disabled")
+            logger.warning("gis_data_missing_bearing", impact="azimuth_analysis_disabled")
+        if not has_height:
+            logger.info("gis_data_missing_antenna_height", impact="height_adjusted_tilt_disabled")
 
         # Index GIS data for fast lookup
         gis_indexed = gis_df.set_index('cell_name')
@@ -981,7 +1233,7 @@ class InterferenceRootCauseAnalyzer:
         # Analyze each cluster
         analyses = []
         for idx, cluster in interference_gdf.iterrows():
-            analysis = self._analyze_cluster(cluster, gis_indexed, has_tilt, has_azimuth, has_power)
+            analysis = self._analyze_cluster(cluster, gis_indexed, has_tilt, has_azimuth, has_power, has_height)
             analyses.append(analysis)
 
         # Add analysis columns to GeoDataFrame
@@ -1006,7 +1258,8 @@ class InterferenceRootCauseAnalyzer:
         gis_indexed: pd.DataFrame,
         has_tilt: bool,
         has_azimuth: bool,
-        has_power: bool
+        has_power: bool,
+        has_height: bool = False
     ) -> dict:
         """Analyze a single interference cluster."""
         cfg = self.params
@@ -1040,6 +1293,8 @@ class InterferenceRootCauseAnalyzer:
                     config['azimuth'] = cell_data.get('bearing', 0) or 0
                 if has_power:
                     config['tx_power'] = cell_data.get('tx_power', 0) or 0
+                if has_height:
+                    config['antenna_height'] = cell_data.get('antenna_height', 0) or 0
                 cell_configs.append(config)
 
         if not cell_configs:
@@ -1055,7 +1310,7 @@ class InterferenceRootCauseAnalyzer:
         causes = []
         recommendations = []
 
-        # 1. Tilt Analysis
+        # 1. Tilt Analysis (with height adjustment - Fix #8)
         if has_tilt:
             tilts = [c['total_tilt'] for c in cell_configs if 'total_tilt' in c]
             if tilts:
@@ -1069,12 +1324,61 @@ class InterferenceRootCauseAnalyzer:
                 details['max_tilt_deg'] = round(max_tilt, 1)
                 details['tilt_spread_deg'] = round(tilt_spread, 1)
 
-                # Check for low tilt (causing overshoot)
+                # Height-adjusted tilt analysis (Fix #8)
+                # Tall sites with low tilt cause more overshoot than shorter sites
+                # Effective range ≈ height / tan(tilt) for small angles
+                if has_height:
+                    height_adjusted_cells = []
+                    for cell in cell_configs:
+                        height = cell.get('antenna_height', 0)
+                        tilt = cell.get('total_tilt', 0)
+                        if height > 0 and tilt > 0:
+                            # Calculate effective coverage distance (simplified model)
+                            # Range in km ≈ height(m) / (tan(tilt) * 1000)
+                            effective_range_km = height / (np.tan(np.radians(tilt)) * 1000)
+                            cell['effective_range_km'] = round(effective_range_km, 2)
+                            # Flag cells with large effective range (potential overshooters)
+                            if effective_range_km > 2.0:  # > 2km range indicates overshoot risk
+                                height_adjusted_cells.append(cell)
+
+                    if height_adjusted_cells:
+                        details['height_adjusted_overshoot_cells'] = [
+                            {
+                                'cell': c['cell_name'],
+                                'height_m': c.get('antenna_height', 0),
+                                'tilt_deg': c.get('total_tilt', 0),
+                                'effective_range_km': c.get('effective_range_km', 0)
+                            }
+                            for c in height_adjusted_cells
+                        ]
+                        # Add height-aware recommendations
+                        for cell in height_adjusted_cells:
+                            height = cell.get('antenna_height', 30)  # default 30m
+                            current_tilt = cell.get('total_tilt', 0)
+                            # Calculate tilt needed for ~1.5km range
+                            target_range_km = 1.5
+                            suggested_tilt = np.degrees(np.arctan(height / (target_range_km * 1000)))
+                            if suggested_tilt > current_tilt + 1:  # Only recommend if > 1 degree increase
+                                recommendations.append({
+                                    'action': 'increase_tilt',
+                                    'cell': cell['cell_name'],
+                                    'current_tilt': round(current_tilt, 1),
+                                    'suggested_tilt': round(suggested_tilt, 1),
+                                    'antenna_height_m': height,
+                                    'reason': f'Tall site ({height}m) with low tilt causing ~{cell.get("effective_range_km", 0)}km overshoot'
+                                })
+                                if 'tall_site_overshoot' not in causes:
+                                    causes.append('tall_site_overshoot')
+
+                # Check for low tilt (causing overshoot) - standard analysis
                 low_tilt_cells = [c for c in cell_configs if c.get('total_tilt', 99) < cfg.low_tilt_threshold_deg]
                 if low_tilt_cells:
                     causes.append('low_tilt')
                     details['low_tilt_cells'] = [c['cell_name'] for c in low_tilt_cells]
                     for cell in low_tilt_cells:
+                        # Skip if already handled by height-adjusted analysis
+                        if has_height and cell.get('effective_range_km', 0) > 2.0:
+                            continue
                         current = cell.get('total_tilt', 0)
                         suggested = min(current + 2, cfg.high_tilt_threshold_deg)
                         recommendations.append({
@@ -1191,6 +1495,7 @@ class InterferenceRootCauseAnalyzer:
         """Determine the primary root cause from a list of causes."""
         # Priority order for root causes
         cause_priority = [
+            'tall_site_overshoot',  # Fix #8: height-aware overshoot detection
             'low_tilt',
             'very_close_proximity',
             'azimuth_convergence',
@@ -1208,8 +1513,8 @@ class InterferenceRootCauseAnalyzer:
 
     def _determine_priority(self, causes: List[str], details: dict, cluster: pd.Series) -> str:
         """Determine recommendation priority based on analysis."""
-        # High priority indicators
-        high_priority_causes = ['low_tilt', 'very_close_proximity']
+        # High priority indicators (including tall_site_overshoot - Fix #8)
+        high_priority_causes = ['low_tilt', 'very_close_proximity', 'tall_site_overshoot']
         if any(c in causes for c in high_priority_causes):
             return 'high'
 
