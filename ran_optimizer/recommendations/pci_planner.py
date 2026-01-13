@@ -24,6 +24,7 @@ import math
 from dataclasses import dataclass
 from typing import Dict, List, Tuple, Set, Optional, Any
 
+import numpy as np
 import pandas as pd
 
 from ran_optimizer.utils.logging_config import get_logger
@@ -37,7 +38,7 @@ NR_PCI_MAX = 1007   # NR: 1008 PCIs (0-1007)
 # Performance constants
 MAX_TWO_HOP_PAIRS = 1_000_000  # Memory safeguard for 2-hop pair generation
 SHARE_EPSILON = 1e-9  # Prevent division by zero in share calculation
-TWO_HOP_SEVERITY_FACTOR = 0.5  # Severity multiplier for 2-hop conflicts
+TWO_HOP_SEVERITY_FACTOR = 0.25  # Severity multiplier for 2-hop conflicts (lower priority than direct)
 
 # Default configuration path
 DEFAULT_CONFIG_PATH = "config/pci_planner_params.json"
@@ -202,6 +203,20 @@ class PCIPlannerParams:
     # Output filtering
     include_mod3_inter_site: bool = False  # If True, include inter-site mod3 in filtered output
 
+    # Severity thresholds (0-1 scale, matching other detectors)
+    severity_threshold_critical: float = 0.80
+    severity_threshold_high: float = 0.60
+    severity_threshold_medium: float = 0.40
+    severity_threshold_low: float = 0.20
+
+    # Intra-site severity adjustments (0-1 scale)
+    # MOD3/MOD30 intra-site: MORE severe because cells are co-located, UEs see both with strong signals
+    # EXACT intra-site: Slightly less severe because operators can manage internally
+    # Note: MOD3 already has mod3_severity_factor=0.5 applied to base severity
+    intra_site_bonus_mod3: float = 0.25    # MOD3 intra-site -> HIGH (co-located = severe interference)
+    intra_site_bonus_mod30: float = 0.15   # MOD30 intra-site -> MEDIUM (co-located but less severe)
+    intra_site_penalty_exact: float = 0.10 # EXACT intra-site -> still CRITICAL but slightly lower
+
     @classmethod
     def from_config(cls, config_path: Optional[str] = None) -> 'PCIPlannerParams':
         """Load parameters from config file or use defaults."""
@@ -239,6 +254,13 @@ class PCIPlannerParams:
                 mod30_severity_factor=float(params.get('mod30_severity_factor', 0.3)),
                 validate_pci_range=bool(params.get('validate_pci_range', True)),
                 include_mod3_inter_site=bool(params.get('include_mod3_inter_site', False)),
+                severity_threshold_critical=float(params.get('severity_threshold_critical', 0.80)),
+                severity_threshold_high=float(params.get('severity_threshold_high', 0.60)),
+                severity_threshold_medium=float(params.get('severity_threshold_medium', 0.40)),
+                severity_threshold_low=float(params.get('severity_threshold_low', 0.20)),
+                intra_site_bonus_mod3=float(params.get('intra_site_bonus_mod3', 0.25)),
+                intra_site_bonus_mod30=float(params.get('intra_site_bonus_mod30', 0.15)),
+                intra_site_penalty_exact=float(params.get('intra_site_penalty_exact', 0.10)),
             )
         except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
             logger.warning("config_load_failed", error=str(e), using="defaults")
@@ -641,10 +663,70 @@ class PCIPlanner:
 
         df_result = pd.DataFrame(rows)
         if not df_result.empty:
-            df_result = df_result.sort_values(["severity_act_sum_excl_max"], ascending=False)
+            # Normalize severity to 0-1 using percentile-based scaling
+            # Use 95th percentile as max to avoid outlier distortion
+            severity_col = df_result['severity_act_sum_excl_max']
+            severity_max = severity_col.quantile(0.95) if len(severity_col) > 1 else severity_col.max()
+            severity_max = max(severity_max, 1e-9)  # Prevent division by zero
+
+            df_result['severity_score'] = (severity_col / severity_max).clip(0, 1)
+
+            # Add group_size bonus: larger groups are more severe
+            # Each additional member above 2 adds 0.1 to severity (capped)
+            group_bonus = ((df_result['group_size'] - 2) * 0.1).clip(0, 0.3)
+            df_result['severity_score'] = (df_result['severity_score'] + group_bonus).clip(0, 1)
+
+            # Categorize severity using standard thresholds
+            conditions = [
+                df_result['severity_score'] >= self.params.severity_threshold_critical,
+                df_result['severity_score'] >= self.params.severity_threshold_high,
+                df_result['severity_score'] >= self.params.severity_threshold_medium,
+                df_result['severity_score'] >= self.params.severity_threshold_low,
+            ]
+            choices = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']
+            df_result['severity_category'] = np.select(conditions, choices, default='MINIMAL')
+
+            df_result = df_result.sort_values(["severity_score"], ascending=False)
 
         logger.info("pci_confusions_detected", count=len(df_result))
         return df_result
+
+    def _extract_site_id(self, cell_name: str) -> str:
+        """
+        Extract site ID from cell name using common naming conventions.
+
+        Common patterns:
+        - CK186K2 -> CK186 (site = prefix before sector/band indicator)
+        - SITE_CELL1 -> SITE
+        - ABC123L1 -> ABC123
+
+        This extracts the site portion by removing the last 2 characters
+        (typically sector number + band indicator or just sector).
+        """
+        if not cell_name or len(cell_name) < 3:
+            return cell_name
+        # Remove last 2 chars (sector + band indicator like K2, L1, H3)
+        return cell_name[:-2]
+
+    def _is_intra_site_pair(self, cell_a: str, cell_b: str) -> bool:
+        """
+        Determine if two cells are on the same site (intra-site).
+
+        Uses multiple methods:
+        1. Check if there's a direct intra_site edge between them
+        2. Check if there's a reverse intra_site edge
+        3. Fall back to site ID extraction from cell names
+        """
+        # Method 1: Check direct edge intra_site flag
+        if self.intra_site_edge.get((cell_a, cell_b), False):
+            return True
+        if self.intra_site_edge.get((cell_b, cell_a), False):
+            return True
+
+        # Method 2: Extract site IDs from cell names and compare
+        site_a = self._extract_site_id(cell_a)
+        site_b = self._extract_site_id(cell_b)
+        return site_a == site_b
 
     def detect_collisions(self) -> pd.DataFrame:
         """
@@ -655,9 +737,14 @@ class PCIPlanner:
         2. Mod 3 conflict: Same PCI mod 3 causes PSS (Primary Sync Signal) interference
         3. Mod 30 conflict: Same PCI mod 30 causes RS (Reference Signal) interference
 
+        Severity scoring considers:
+        - Conflict type: exact > mod3 > mod30
+        - Hop type: 1-hop > 2-hop (direct neighbors more severe)
+        - Site relationship: inter-site > intra-site (operators can manage intra-site internally)
+
         Returns:
             DataFrame with columns: cell_a, cell_b, pci_a, pci_b, band, conflict_type,
-            hop_type, pair_weight, severity
+            hop_type, pair_weight, severity, site_a, site_b, intra_site
         """
         rows = []
         check_mod3 = self.params.detect_mod3_conflicts
@@ -678,6 +765,11 @@ class PCIPlanner:
             # Determine hop type (1-hop or 2-hop)
             is_direct = b in self.nbrs_out.get(a, set()) or a in self.nbrs_out.get(b, set())
             hop_type = "1-hop" if is_direct else "2-hop"
+
+            # Determine if intra-site (same site) - important for severity
+            is_intra_site = self._is_intra_site_pair(a, b)
+            site_a = self._extract_site_id(a)
+            site_b = self._extract_site_id(b)
 
             conflict_type = None
             severity_factor = 1.0
@@ -710,17 +802,100 @@ class PCIPlanner:
                     "hop_type": hop_type,
                     "pair_weight": w,
                     "severity": severity,
+                    "site_a": site_a,
+                    "site_b": site_b,
+                    "intra_site": is_intra_site,
                 })
 
         df_result = pd.DataFrame(rows)
         if not df_result.empty:
-            df_result = df_result.sort_values(["severity"], ascending=False)
+            # === SEVERITY SCORING LOGIC ===
+            # Priority order for severity (highest to lowest):
+            # 1. EXACT inter-site 1-hop = CRITICAL (most severe)
+            # 2. EXACT intra-site 1-hop = CRITICAL (same PCI is always critical)
+            # 3. MOD3 intra-site 1-hop = HIGH/CRITICAL (cells co-located, UEs see both with strong signals)
+            # 4. MOD3 inter-site 1-hop = MEDIUM (cells are distant, less interference impact)
+            # 5. 2-hop collisions = lower than 1-hop equivalents
+            # 6. MOD30 = LOW/MINIMAL (least severe)
 
-        # Log counts by conflict type
+            # Base conflict type bonus (before site adjustment)
+            # Exact collisions are fundamentally more severe than mod conflicts
+            conflict_base_bonus = df_result['conflict_type'].map({
+                'exact': 0.35,   # Exact collision base bonus (increased)
+                'mod3': 0.05,    # Mod 3 lower base - site adjustment will differentiate
+                'mod30': 0.0,    # Mod 30 no bonus
+            }).fillna(0.0)
+
+            # Apply hop bonus based on conflict type
+            # 1-hop is more severe, but 2-hop EXACT collisions still need reasonable priority
+            # 2-hop MOD conflicts can be lower priority (already reflected in base severity)
+            def calculate_hop_bonus(row):
+                if row['hop_type'] == '1-hop':
+                    return 0.15
+                elif row['hop_type'] == '2-hop' and row['conflict_type'] == 'exact':
+                    # 2-hop EXACT still significant - give partial bonus
+                    return 0.10
+                else:
+                    # 2-hop MOD conflicts - no bonus
+                    return 0.0
+
+            hop_bonus = df_result.apply(calculate_hop_bonus, axis=1)
+
+            # Apply intra-site adjustment: can be BONUS (positive) or PENALTY (negative)
+            # MOD3/MOD30 intra-site: BONUS because cells are co-located, causing severe interference
+            # EXACT intra-site: Small PENALTY because operators can manage (but still critical)
+            intra_site_adjustment = df_result.apply(
+                lambda row: self._calculate_intra_site_adjustment(
+                    row['conflict_type'],
+                    row['intra_site']
+                ),
+                axis=1
+            )
+
+            # Calculate structural score with bonuses and adjustments
+            # This determines the baseline severity based on conflict characteristics
+            structural_score = conflict_base_bonus + hop_bonus + intra_site_adjustment
+
+            # Now normalize the base severity (traffic-weighted) to 0-1 scale
+            # Use 95th percentile as max to avoid outlier distortion
+            severity_col = df_result['severity']
+            severity_max = severity_col.quantile(0.95) if len(severity_col) > 1 else severity_col.max()
+            severity_max = max(severity_max, 1e-9)  # Prevent division by zero
+
+            # Normalized traffic weight contribution (0 to 0.35 scale)
+            # Traffic is less important than structural factors for severity category
+            traffic_score = (severity_col / severity_max).clip(0, 1) * 0.35
+
+            # Final score = structural component (determines category) + traffic (fine-tuning)
+            # Structural scores by scenario:
+            # - EXACT inter-site 1-hop: 0.35 + 0.15 + 0.0 = 0.50 base (+ up to 0.35 traffic = 0.85 CRITICAL)
+            # - EXACT intra-site 1-hop: 0.35 + 0.15 - 0.10 = 0.40 base (+ up to 0.35 traffic = 0.75 CRITICAL)
+            # - MOD3 intra-site 1-hop: 0.05 + 0.15 + 0.25 = 0.45 base (+ up to 0.35 traffic = 0.80 CRITICAL/HIGH)
+            # - MOD3 inter-site 1-hop: 0.05 + 0.15 + 0.0 = 0.20 base (+ up to 0.35 traffic = 0.55 MEDIUM)
+            # - MOD3 inter-site 2-hop: 0.05 + 0.0 + 0.0 = 0.05 base (+ up to 0.35 traffic = 0.40 MEDIUM/LOW)
+            df_result['severity_score'] = (structural_score + traffic_score).clip(0, 1)
+
+            # Categorize severity using standard thresholds
+            conditions = [
+                df_result['severity_score'] >= self.params.severity_threshold_critical,
+                df_result['severity_score'] >= self.params.severity_threshold_high,
+                df_result['severity_score'] >= self.params.severity_threshold_medium,
+                df_result['severity_score'] >= self.params.severity_threshold_low,
+            ]
+            choices = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']
+            df_result['severity_category'] = np.select(conditions, choices, default='MINIMAL')
+
+            df_result = df_result.sort_values(["severity_score"], ascending=False)
+
+        # Log counts by conflict type and site relationship
         if not df_result.empty:
             counts = df_result["conflict_type"].value_counts().to_dict()
+            intra_counts = df_result[df_result["intra_site"]]["conflict_type"].value_counts().to_dict()
+            inter_counts = df_result[~df_result["intra_site"]]["conflict_type"].value_counts().to_dict()
         else:
             counts = {}
+            intra_counts = {}
+            inter_counts = {}
 
         logger.info(
             "pci_collisions_detected",
@@ -728,8 +903,39 @@ class PCIPlanner:
             exact=counts.get("exact", 0),
             mod3=counts.get("mod3", 0),
             mod30=counts.get("mod30", 0),
+            intra_site_mod3=intra_counts.get("mod3", 0),
+            inter_site_mod3=inter_counts.get("mod3", 0),
         )
         return df_result
+
+    def _calculate_intra_site_adjustment(self, conflict_type: str, is_intra_site: bool) -> float:
+        """
+        Calculate severity adjustment for intra-site vs inter-site collisions.
+
+        Returns positive value (BONUS) or negative value (PENALTY):
+        - MOD3/MOD30 intra-site: BONUS (positive) because cells are co-located,
+          UEs see both with strong signals causing severe interference
+        - EXACT intra-site: Small PENALTY (negative) because operators can
+          manage their own site, but still critical
+        - Inter-site: No adjustment (0.0)
+
+        Adjustment amounts (configurable via PCIPlannerParams):
+        - MOD3 intra-site: default +0.25 bonus (HIGH/CRITICAL severity)
+        - MOD30 intra-site: default +0.15 bonus (MEDIUM severity)
+        - EXACT intra-site: default -0.10 penalty (still CRITICAL, slightly lower)
+        - Inter-site: 0.0 (no adjustment)
+        """
+        if not is_intra_site:
+            return 0.0
+
+        # Intra-site adjustments by conflict type (from configurable params)
+        # Positive = bonus (more severe), Negative = penalty (less severe)
+        adjustments = {
+            'mod3': self.params.intra_site_bonus_mod3,    # +0.25 BONUS
+            'mod30': self.params.intra_site_bonus_mod30,  # +0.15 BONUS
+            'exact': -self.params.intra_site_penalty_exact,  # -0.10 PENALTY
+        }
+        return adjustments.get(conflict_type, 0.0)
 
     def suggest_blacklists(self) -> Tuple[pd.DataFrame, Set[Tuple[str, str]]]:
         """

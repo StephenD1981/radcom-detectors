@@ -87,13 +87,19 @@ class CAImbalanceParams:
     """Parameters for CA imbalance detection."""
     ca_pairs: List[CAPairConfig]  # Must be provided via config
     cell_name_pattern: str  # Must be provided via config (e.g., r'(\w+)[A-Z]+(\d)')
-    severity_thresholds: Dict[str, float] = field(default_factory=lambda: {
+    # Coverage ratio thresholds (lower ratio = more severe)
+    coverage_ratio_thresholds: Dict[str, float] = field(default_factory=lambda: {
         'critical': 0.30,
         'high': 0.50,
         'medium': 0.60,
         'warning': 0.70,
         'low': 1.00
     })
+    # Severity score thresholds (0-1 scale, matching other detectors)
+    severity_threshold_critical: float = 0.80
+    severity_threshold_high: float = 0.60
+    severity_threshold_medium: float = 0.40
+    severity_threshold_low: float = 0.20
     environment_thresholds: Dict[str, Dict[str, float]] = field(default_factory=lambda: {
         'urban': {'coverage_threshold': 0.85},
         'suburban': {'coverage_threshold': 0.70},
@@ -141,12 +147,12 @@ class CAImbalanceParams:
         if not 0 < self.min_parse_success_ratio <= 1.0:
             raise ValueError("min_parse_success_ratio must be in (0, 1]")
 
-        # Validate severity thresholds are in ascending order
-        thresholds = self.severity_thresholds
+        # Validate coverage ratio thresholds are in ascending order
+        thresholds = self.coverage_ratio_thresholds
         if thresholds.get('critical', 0) >= thresholds.get('high', 0):
-            raise ValueError("severity_thresholds: critical must be < high")
+            raise ValueError("coverage_ratio_thresholds: critical must be < high")
         if thresholds.get('high', 0) >= thresholds.get('medium', 0):
-            raise ValueError("severity_thresholds: high must be < medium")
+            raise ValueError("coverage_ratio_thresholds: high must be < medium")
 
     @classmethod
     def from_config(cls, config_path: str) -> 'CAImbalanceParams':
@@ -206,8 +212,8 @@ class CAImbalanceParams:
                 coverage_threshold=float(pair_config.get('coverage_threshold', 0.70))
             ))
 
-        # Get default severity/environment thresholds
-        default_severity = {
+        # Get default coverage ratio/environment thresholds
+        default_coverage_ratio = {
             'critical': 0.30, 'high': 0.50, 'medium': 0.60, 'warning': 0.70, 'low': 1.00
         }
         default_env = {
@@ -219,7 +225,12 @@ class CAImbalanceParams:
         return cls(
             ca_pairs=ca_pairs,
             cell_name_pattern=str(config['cell_name_pattern']),
-            severity_thresholds=config.get('severity_thresholds', default_severity),
+            coverage_ratio_thresholds=config.get('coverage_ratio_thresholds',
+                config.get('severity_thresholds', default_coverage_ratio)),  # Backward compatible
+            severity_threshold_critical=float(config.get('severity_threshold_critical', 0.80)),
+            severity_threshold_high=float(config.get('severity_threshold_high', 0.60)),
+            severity_threshold_medium=float(config.get('severity_threshold_medium', 0.40)),
+            severity_threshold_low=float(config.get('severity_threshold_low', 0.20)),
             environment_thresholds=config.get('environment_thresholds', default_env),
             use_environment_thresholds=bool(config.get('use_environment_thresholds', False)),
             min_sample_count=int(config.get('min_sample_count', 100)),
@@ -565,13 +576,15 @@ class CAImbalanceDetector:
 
             # Check if capacity coverage is insufficient
             if coverage_ratio < effective_threshold:
+                severity_score, severity_category = self._calculate_severity(coverage_ratio)
                 issue = {
                     'detector': 'CA_IMBALANCE',
                     'ca_pair': ca_pair.name,
                     'coverage_band': ca_pair.coverage_band,
                     'capacity_band': ca_pair.capacity_band,
                     'issue_type': 'insufficient_capacity_coverage',
-                    'severity': self._calculate_severity(coverage_ratio),
+                    'severity_score': severity_score,
+                    'severity_category': severity_category,
                     'site_sector': site_sector,
                     'coverage_cell_name': coverage_cell['cell_name'],
                     'capacity_cell_name': capacity_cell['cell_name'],
@@ -604,20 +617,37 @@ class CAImbalanceDetector:
 
         return issues
 
-    def _calculate_severity(self, coverage_ratio: float) -> str:
-        """Calculate severity based on coverage ratio."""
-        thresholds = self.params.severity_thresholds
+    def _calculate_severity(self, coverage_ratio: float) -> tuple:
+        """
+        Calculate severity score (0-1) and category based on coverage ratio.
 
-        if coverage_ratio < thresholds.get('critical', 0.30):
-            return 'critical'
-        elif coverage_ratio < thresholds.get('high', 0.50):
-            return 'high'
-        elif coverage_ratio < thresholds.get('medium', 0.60):
-            return 'medium'
-        elif coverage_ratio < thresholds.get('warning', 0.70):
-            return 'warning'
+        Lower coverage ratio = more severe (inverted from coverage_ratio).
+
+        Args:
+            coverage_ratio: Capacity/coverage overlap ratio (0-1)
+
+        Returns:
+            Tuple of (severity_score: float, severity_category: str)
+            - severity_score: 0-1 normalized score (higher = more severe)
+            - severity_category: UPPERCASE category (CRITICAL/HIGH/MEDIUM/LOW/MINIMAL)
+        """
+        # Calculate severity_score (inverted: lower coverage = higher severity)
+        # Clip to reasonable bounds: 0% coverage = 1.0 severity, 100% coverage = 0.0 severity
+        severity_score = round(max(0.0, min(1.0, 1.0 - coverage_ratio)), 4)
+
+        # Determine severity category using standardized thresholds
+        if severity_score >= self.params.severity_threshold_critical:
+            severity_category = 'CRITICAL'
+        elif severity_score >= self.params.severity_threshold_high:
+            severity_category = 'HIGH'
+        elif severity_score >= self.params.severity_threshold_medium:
+            severity_category = 'MEDIUM'
+        elif severity_score >= self.params.severity_threshold_low:
+            severity_category = 'LOW'
         else:
-            return 'low'
+            severity_category = 'MINIMAL'
+
+        return severity_score, severity_category
 
     def _generate_recommendation(
         self,

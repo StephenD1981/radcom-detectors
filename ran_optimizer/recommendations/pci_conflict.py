@@ -86,6 +86,11 @@ class PCIConflictParams:
     pre_project_geometries: bool = True  # Pre-project all geometries per band (recommended for >1k cells)
     max_cells_per_batch: int = 5000  # Process in batches if more cells than this
     log_progress_interval: int = 1000  # Log progress every N cell pairs checked
+    # Normalized severity thresholds (0-1 scale, matching other detectors)
+    severity_threshold_critical: float = 0.80
+    severity_threshold_high: float = 0.60
+    severity_threshold_medium: float = 0.40
+    severity_threshold_low: float = 0.20
 
     @classmethod
     def from_config(cls, config_path: Optional[str] = None) -> 'PCIConflictParams':
@@ -112,6 +117,10 @@ class PCIConflictParams:
                 pre_project_geometries=bool(config.get('pre_project_geometries', True)),
                 max_cells_per_batch=int(config.get('max_cells_per_batch', 5000)),
                 log_progress_interval=int(config.get('log_progress_interval', 1000)),
+                severity_threshold_critical=float(config.get('severity_threshold_critical', 0.80)),
+                severity_threshold_high=float(config.get('severity_threshold_high', 0.60)),
+                severity_threshold_medium=float(config.get('severity_threshold_medium', 0.40)),
+                severity_threshold_low=float(config.get('severity_threshold_low', 0.20)),
             )
         except (FileNotFoundError, json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
             logger.warning("config_load_failed", error=str(e), using="defaults")
@@ -661,7 +670,7 @@ class PCIConflictDetector:
             )
 
         # Determine severity (mod conflicts are generally less severe than exact)
-        severity = self._calculate_severity(overlap_pct, distance_km, conflict_type)
+        severity_score, severity_category = self._calculate_severity(overlap_pct, distance_km, conflict_type)
 
         return {
             'detector': detector_type,
@@ -674,7 +683,8 @@ class PCIConflictDetector:
             'overlap_percentage': round(overlap_pct, 2),
             'overlap_area_km2': round(overlap_area_km2, 6),
             'distance_km': round(distance_km, 2),
-            'severity': severity,
+            'severity_score': round(severity_score, 4),
+            'severity_category': severity_category,
             'recommendation': self._generate_recommendation(
                 cell1['cell_name'],
                 cell2['cell_name'],
@@ -686,44 +696,59 @@ class PCIConflictDetector:
 
     def _calculate_severity(
         self, overlap_pct: float, distance_km: float, conflict_type: str = 'exact'
-    ) -> str:
+    ) -> tuple:
         """
         Calculate conflict severity based on overlap, distance, and conflict type.
 
         Args:
-            overlap_pct: Overlap percentage
+            overlap_pct: Overlap percentage (0-100)
             distance_km: Distance between cells in km
             conflict_type: 'exact', 'mod3', or 'mod30'
 
         Returns:
-            Severity level: 'critical', 'high', 'medium', 'low'
+            Tuple of (severity_score: float 0-1, severity_category: str UPPERCASE)
         """
-        thresholds = self.params.severity_thresholds
-        critical = thresholds.get('critical', {'overlap_pct': 50, 'distance_km': 2})
-        high = thresholds.get('high', {'overlap_pct': 30, 'distance_km': 3})
-        medium = thresholds.get('medium', {'overlap_pct': 20, 'distance_km': 5})
+        # Calculate normalized severity score (0-1)
+        # Components: overlap (0-1), distance (0-1 inverted), conflict type factor
 
-        # Mod conflicts are generally less severe than exact PCI collisions
-        # Downgrade severity by one level for mod 3, two levels for mod 30
-        base_severity = 'low'
-        if overlap_pct > critical['overlap_pct'] and distance_km < critical['distance_km']:
-            base_severity = 'critical'
-        elif overlap_pct > high['overlap_pct'] and distance_km < high['distance_km']:
-            base_severity = 'high'
-        elif overlap_pct > medium['overlap_pct'] or distance_km < medium['distance_km']:
-            base_severity = 'medium'
+        # Overlap component: normalize 0-100% to 0-1, cap at 100%
+        overlap_score = min(overlap_pct / 100.0, 1.0)
 
-        # Downgrade for mod conflicts
-        if conflict_type == 'mod3':
-            severity_order = ['low', 'medium', 'high', 'critical']
-            idx = severity_order.index(base_severity)
-            return severity_order[max(0, idx - 1)]  # Downgrade by 1
-        elif conflict_type == 'mod30':
-            severity_order = ['low', 'medium', 'high', 'critical']
-            idx = severity_order.index(base_severity)
-            return severity_order[max(0, idx - 2)]  # Downgrade by 2
+        # Distance component: closer = more severe, use inverse with max 10km
+        # At 0km -> 1.0, at 10km -> 0.0
+        max_distance = 10.0
+        distance_score = max(0.0, 1.0 - (distance_km / max_distance))
 
-        return base_severity
+        # Conflict type factor: exact is most severe
+        conflict_factor = {
+            'exact': 1.0,
+            'mod3': 0.6,   # Mod 3 is less severe
+            'mod30': 0.3,  # Mod 30 is least severe
+        }.get(conflict_type, 1.0)
+
+        # Weighted combination: overlap 50%, distance 30%, base 20% for conflict type
+        raw_score = (
+            0.50 * overlap_score +
+            0.30 * distance_score +
+            0.20 * conflict_factor
+        )
+
+        # Clip to 0-1
+        severity_score = max(0.0, min(1.0, raw_score))
+
+        # Categorize using standard thresholds
+        if severity_score >= self.params.severity_threshold_critical:
+            severity_category = 'CRITICAL'
+        elif severity_score >= self.params.severity_threshold_high:
+            severity_category = 'HIGH'
+        elif severity_score >= self.params.severity_threshold_medium:
+            severity_category = 'MEDIUM'
+        elif severity_score >= self.params.severity_threshold_low:
+            severity_category = 'LOW'
+        else:
+            severity_category = 'MINIMAL'
+
+        return severity_score, severity_category
 
     def _generate_recommendation(
         self, cell1: str, cell2: str, pci1: int, pci2: int,

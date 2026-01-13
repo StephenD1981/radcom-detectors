@@ -119,6 +119,24 @@ class InterferenceParams:
     # Data freshness validation (Fix #10)
     max_data_age_days: Optional[int] = 7  # Warn if data older than this, None to disable
 
+    # Severity thresholds (0-1 scale, matching other detectors)
+    severity_threshold_critical: float = 0.80
+    severity_threshold_high: float = 0.60
+    severity_threshold_medium: float = 0.40
+    severity_threshold_low: float = 0.20
+
+    # Severity scoring weights
+    severity_weight_n_grids: float = 0.35      # More grids = more severe
+    severity_weight_n_cells: float = 0.25      # More cells = more complex
+    severity_weight_area: float = 0.20         # Larger area = more impact
+    severity_weight_rsrp: float = 0.20         # Worse RSRP = more severe
+
+    # Severity normalization maxes
+    severity_max_grids: int = 100              # n_grids at or above this = max score
+    severity_max_cells: int = 10               # n_cells at or above this = max score
+    severity_max_area_km2: float = 5.0         # area at or above this = max score
+    severity_rsrp_range: tuple = (-120, -80)   # RSRP range for normalization (worst, best)
+
     @classmethod
     def from_config(cls, config_path: Optional[str] = None) -> 'InterferenceParams':
         """Load parameters from config file or use defaults."""
@@ -928,7 +946,10 @@ class InterferenceDetector:
         # Batch calculate areas using single UTM projection for efficiency
         gdf['area_km2'] = self._calculate_areas_batch(gdf)
 
-        gdf = gdf.sort_values(['band', 'n_grids'], ascending=[True, False]).reset_index(drop=True)
+        # Calculate severity scores (0-1 normalized)
+        gdf = self._calculate_cluster_severity(gdf)
+
+        gdf = gdf.sort_values(['band', 'severity_score'], ascending=[True, False]).reset_index(drop=True)
 
         logger.info("total_interference_clusters", count=len(gdf))
         return gdf
@@ -1119,6 +1140,76 @@ class InterferenceDetector:
                 np.cos(np.radians(geometry.centroid.y)),
                 3
             )
+
+    def _calculate_cluster_severity(self, gdf: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+        """
+        Calculate severity scores (0-1) and categories for interference clusters.
+
+        Severity is computed as a weighted combination of:
+        - n_grids: More affected grids = more severe
+        - n_cells: More cells involved = more complex to resolve
+        - area_km2: Larger affected area = greater impact
+        - avg_rsrp: Worse (lower) RSRP = more severe interference
+
+        Args:
+            gdf: GeoDataFrame with interference clusters containing columns:
+                n_grids, n_cells, area_km2, avg_rsrp
+
+        Returns:
+            GeoDataFrame with added severity_score (0-1) and severity_category columns
+        """
+        if gdf.empty:
+            gdf['severity_score'] = []
+            gdf['severity_category'] = []
+            return gdf
+
+        # Normalize n_grids (0-1)
+        grids_score = (gdf['n_grids'] / self.params.severity_max_grids).clip(0, 1)
+
+        # Normalize n_cells (0-1)
+        cells_score = (gdf['n_cells'] / self.params.severity_max_cells).clip(0, 1)
+
+        # Normalize area_km2 (0-1)
+        area_score = (gdf['area_km2'] / self.params.severity_max_area_km2).clip(0, 1)
+
+        # Normalize avg_rsrp (0-1, inverted so worse RSRP = higher score)
+        rsrp_worst, rsrp_best = self.params.severity_rsrp_range
+        rsrp_range = rsrp_best - rsrp_worst
+        if rsrp_range != 0:
+            # Lower RSRP = higher score (more severe)
+            rsrp_score = ((rsrp_best - gdf['avg_rsrp']) / rsrp_range).clip(0, 1)
+        else:
+            rsrp_score = 0.5  # Default if range is zero
+
+        # Calculate weighted severity score
+        gdf['severity_score'] = (
+            self.params.severity_weight_n_grids * grids_score +
+            self.params.severity_weight_n_cells * cells_score +
+            self.params.severity_weight_area * area_score +
+            self.params.severity_weight_rsrp * rsrp_score
+        ).round(4)
+
+        # Assign severity categories using thresholds
+        conditions = [
+            gdf['severity_score'] >= self.params.severity_threshold_critical,
+            gdf['severity_score'] >= self.params.severity_threshold_high,
+            gdf['severity_score'] >= self.params.severity_threshold_medium,
+            gdf['severity_score'] >= self.params.severity_threshold_low,
+        ]
+        choices = ['CRITICAL', 'HIGH', 'MEDIUM', 'LOW']
+        gdf['severity_category'] = np.select(conditions, choices, default='MINIMAL')
+
+        logger.debug(
+            "severity_scores_calculated",
+            count=len(gdf),
+            critical=int((gdf['severity_category'] == 'CRITICAL').sum()),
+            high=int((gdf['severity_category'] == 'HIGH').sum()),
+            medium=int((gdf['severity_category'] == 'MEDIUM').sum()),
+            low=int((gdf['severity_category'] == 'LOW').sum()),
+            minimal=int((gdf['severity_category'] == 'MINIMAL').sum())
+        )
+
+        return gdf
 
 
 # -----------------------------

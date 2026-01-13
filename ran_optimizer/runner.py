@@ -482,6 +482,7 @@ def run_low_coverage(
 
 def run_interference(
     grid_df: pd.DataFrame,
+    gis_df: pd.DataFrame,
     output_dir: Path,
     config_path: Optional[str] = None,
 ) -> gpd.GeoDataFrame:
@@ -492,14 +493,18 @@ def run_interference(
 
     # Normalize column names for detector (expects lowercase)
     col_map = {}
-    if 'Band' in grid_df.columns and 'band' not in grid_df.columns:
-        col_map['Band'] = 'band'
     if 'cilac' in grid_df.columns and 'cell_name' not in grid_df.columns:
         col_map['cilac'] = 'cell_name'
 
     if col_map:
         grid_df = grid_df.rename(columns=col_map)
         logger.info("Normalized column names", mapping=col_map)
+
+    # Join with gis_df to get band if not present
+    if 'band' not in grid_df.columns:
+        band_lookup = gis_df[['cell_name', 'band']].drop_duplicates('cell_name')
+        grid_df = grid_df.merge(band_lookup, on='cell_name', how='left')
+        logger.info("Joined band from gis_df", bands_found=grid_df['band'].nunique())
 
     params = InterferenceParams.from_config(config_path)
     detector = InterferenceDetector(params)
@@ -608,7 +613,7 @@ def run_pci_planner(
 
     return {
         'confusions': confusions,
-        'collisions': collisions,
+        'collisions': filtered_collisions if len(collisions) > 0 else collisions,
         'blacklist_suggestions': blacklist_df,
     }
 
@@ -960,7 +965,7 @@ def run_all(
     # Run interference detection
     if 'interference' in algorithms:
         results['interference'] = run_interference(
-            grid_df, output_dir,
+            grid_df, gis_df, output_dir,
             config_path=interference_config,
         )
 

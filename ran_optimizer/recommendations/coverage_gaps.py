@@ -49,6 +49,40 @@ DEFAULT_GEOHASH_PRECISION = 7
 # Maximum grid points to process for a single polygon (performance limit)
 MAX_POLYGON_GRID_POINTS = 10000
 
+# Band-specific RSRP thresholds (dBm)
+# L700/L800 (sub-1GHz): Better wall penetration, longer range - stricter thresholds in urban
+# L1800/L2100 (mid-band): Higher path loss, capacity bands - more lenient thresholds in rural
+# L3500/L3700 (high-band/5G NR): Highest path loss, mmWave-like propagation - most lenient
+# Telecom review finding: Using identical thresholds across bands causes under/over-reporting
+BAND_RSRP_THRESHOLDS = {
+    # LTE sub-1GHz bands (coverage layer) - relaxed thresholds for wide-area coverage
+    # Telecom review: sub-1GHz serves larger cells, UE sensitivity allows reliable service at lower RSRP
+    'L700': {'urban': -110, 'suburban': -115, 'rural': -120},
+    'L800': {'urban': -110, 'suburban': -115, 'rural': -120},
+    # LTE mid-band (capacity layer)
+    'L1800': {'urban': -115, 'suburban': -120, 'rural': -125},
+    'L2100': {'urban': -115, 'suburban': -120, 'rural': -125},
+    'L2600': {'urban': -115, 'suburban': -120, 'rural': -125},
+    # 5G NR high-band (C-band, capacity/coverage)
+    'L3500': {'urban': -118, 'suburban': -123, 'rural': -128},
+    'L3700': {'urban': -118, 'suburban': -123, 'rural': -128},
+    # 5G NR sub-6GHz (same as LTE equivalents for NR refarming)
+    'N1': {'urban': -115, 'suburban': -120, 'rural': -125},    # n1 = 2100 MHz
+    'N3': {'urban': -115, 'suburban': -120, 'rural': -125},    # n3 = 1800 MHz
+    'N7': {'urban': -115, 'suburban': -120, 'rural': -125},    # n7 = 2600 MHz
+    'N28': {'urban': -105, 'suburban': -110, 'rural': -115},   # n28 = 700 MHz
+    'N78': {'urban': -118, 'suburban': -123, 'rural': -128},   # n78 = 3500 MHz (C-band)
+    'N77': {'urban': -118, 'suburban': -123, 'rural': -128},   # n77 = 3700 MHz (C-band)
+}
+
+# Environment-aware minimum sample counts
+# Rural areas have fewer users, so we need lower thresholds to avoid filtering legitimate issues
+MIN_SAMPLE_COUNT_BY_ENV = {
+    'urban': 10,
+    'suburban': 5,
+    'rural': 2,
+}
+
 
 @dataclass
 class CoverageGapParams:
@@ -173,6 +207,15 @@ class LowCoverageParams:
     hdbscan_min_cluster_size: int = 10
     alpha_shape_alpha: Optional[float] = None
     max_alphashape_points: int = 5000
+    max_area_per_point_km2: float = 2.0  # Filter out sparse clusters (area/n_points > threshold)
+    min_area_km2: float = 0.5  # Filter out micro-clusters below this area (km²)
+
+    # Sparse area handling parameters (telecom review: make configurable)
+    # These control how the k-ring density filter handles data-sparse rural areas
+    min_measured_neighbors_absolute: int = 5  # Minimum neighbors with ANY measurements
+    min_measured_neighbors_pct: float = 0.2   # Or this % of total neighbors (whichever is higher)
+    min_low_rsrp_evidence_absolute: int = 2   # Minimum neighbors showing low RSRP
+    min_low_rsrp_evidence_pct: float = 0.1    # Or this % of min_missing_neighbors threshold
 
     # Data quality parameters
     rsrp_min_dbm: float = -140
@@ -264,7 +307,8 @@ class LowCoverageParams:
                 low_cov_overrides = {k: v for k, v in overrides.items()
                                     if k in ['rsrp_threshold_dbm', 'k_ring_steps',
                                             'min_missing_neighbors', 'hdbscan_min_cluster_size',
-                                            'alpha_shape_alpha', 'max_alphashape_points']}
+                                            'alpha_shape_alpha', 'max_alphashape_points',
+                                            'max_area_per_point_km2', 'min_area_km2']}
                 base_params.update(low_cov_overrides)
                 logger.info(
                     "applied_environment_overrides_low_coverage",
@@ -1311,8 +1355,8 @@ class LowCoverageDetector(GapDetectorBase):
         # Step 1: Ensure hulls have band information
         hulls_with_band = self._add_band_info(hulls, gis_data)
 
-        # Step 2: Normalise grid_data band column
-        grid_data = self._normalise_grid_data(grid_data)
+        # Step 2: Normalise grid_data band column (joins with gis_data if band not present)
+        grid_data = self._normalise_grid_data(grid_data, gis_data)
 
         # Step 3: Process each band separately
         available_bands = [b for b in hulls_with_band['band'].unique() if pd.notna(b)]
@@ -1323,8 +1367,8 @@ class LowCoverageDetector(GapDetectorBase):
 
         logger.info("detecting_low_coverage", bands=available_bands)
 
-        # Step 2.5: Apply data quality filtering
-        grid_data = self._apply_data_quality_filters(grid_data)
+        # Step 2.5: Apply data quality filtering (with environment-aware sample counts)
+        grid_data = self._apply_data_quality_filters(grid_data, cell_env_map)
 
         band_results = {}
         for band in available_bands:
@@ -1362,13 +1406,26 @@ class LowCoverageDetector(GapDetectorBase):
             )
         return env_params
 
-    def _apply_data_quality_filters(self, grid_data: pd.DataFrame) -> pd.DataFrame:
+    def _apply_data_quality_filters(
+        self,
+        grid_data: pd.DataFrame,
+        cell_env_map: Optional[Dict[str, str]] = None
+    ) -> pd.DataFrame:
         """
         Apply data quality filters to grid data.
 
         Filters:
         - RSRP values outside valid range (rsrp_min_dbm to rsrp_max_dbm)
         - Geohashes with fewer than min_sample_count measurements
+          (TELECOM REVIEW FIX #3: environment-aware thresholds)
+
+        Args:
+            grid_data: Grid data with RSRP measurements
+            cell_env_map: Optional mapping of cell_name -> environment for
+                         environment-aware sample count filtering
+
+        Returns:
+            Filtered grid data
         """
         original_rows = len(grid_data)
         grid_data = grid_data.copy()
@@ -1390,18 +1447,43 @@ class LowCoverageDetector(GapDetectorBase):
                 )
 
         # Filter geohashes with too few samples
+        # TELECOM REVIEW FIX #3: Use environment-aware thresholds
+        # Rural areas have fewer users, so use lower thresholds to avoid filtering legitimate issues
         if 'grid' in grid_data.columns and 'event_count' in grid_data.columns:
-            valid_samples = grid_data['event_count'] >= self.params.min_sample_count
             before_filter = len(grid_data)
-            grid_data = grid_data[valid_samples]
-            filtered_samples = before_filter - len(grid_data)
-            if filtered_samples > 0:
-                logger.info(
-                    "data_quality_sample_count_filter",
-                    removed=filtered_samples,
-                    remaining=len(grid_data),
-                    min_samples=self.params.min_sample_count
+
+            if cell_env_map and 'cell_name' in grid_data.columns:
+                # Environment-aware filtering
+                grid_data['cell_name_str'] = grid_data['cell_name'].astype(str)
+                grid_data['environment'] = grid_data['cell_name_str'].map(cell_env_map).fillna('suburban').str.lower()
+                grid_data['min_samples'] = grid_data['environment'].map(MIN_SAMPLE_COUNT_BY_ENV).fillna(
+                    self.params.min_sample_count
                 )
+                valid_samples = grid_data['event_count'] >= grid_data['min_samples']
+                grid_data = grid_data[valid_samples]
+                # Clean up temporary columns
+                grid_data = grid_data.drop(columns=['cell_name_str', 'environment', 'min_samples'], errors='ignore')
+
+                filtered_samples = before_filter - len(grid_data)
+                if filtered_samples > 0:
+                    logger.info(
+                        "data_quality_sample_count_filter_environment_aware",
+                        removed=filtered_samples,
+                        remaining=len(grid_data),
+                        min_samples_by_env=MIN_SAMPLE_COUNT_BY_ENV
+                    )
+            else:
+                # Fall back to single threshold
+                valid_samples = grid_data['event_count'] >= self.params.min_sample_count
+                grid_data = grid_data[valid_samples]
+                filtered_samples = before_filter - len(grid_data)
+                if filtered_samples > 0:
+                    logger.info(
+                        "data_quality_sample_count_filter",
+                        removed=filtered_samples,
+                        remaining=len(grid_data),
+                        min_samples=self.params.min_sample_count
+                    )
 
         return grid_data
 
@@ -1473,10 +1555,11 @@ class LowCoverageDetector(GapDetectorBase):
 
         return band_str
 
-    def _normalise_grid_data(self, grid_data: pd.DataFrame) -> pd.DataFrame:
+    def _normalise_grid_data(self, grid_data: pd.DataFrame, gis_data: Optional[pd.DataFrame] = None) -> pd.DataFrame:
         """
         Normalise grid data band column for consistency.
 
+        - Joins with gis_data to get band if not present
         - Normalises band column to 'L800' string format
         - Does NOT rename columns - uses canonical names: grid, avg_rsrp, cell_name
         """
@@ -1489,12 +1572,19 @@ class LowCoverageDetector(GapDetectorBase):
                 band_col = col
                 break
 
+        # If no band column, join with gis_data to get it
+        if band_col is None and gis_data is not None and 'band' in gis_data.columns:
+            band_lookup = gis_data[['cell_name', 'band']].drop_duplicates('cell_name')
+            grid_data = grid_data.merge(band_lookup, on='cell_name', how='left')
+            band_col = 'band'
+            logger.info("joined_band_from_gis", bands_found=grid_data['band'].nunique())
+
         if band_col:
             # Rename to lowercase 'band' if needed
             if band_col != 'band':
                 grid_data = grid_data.rename(columns={band_col: 'band'})
 
-            # Normalise band values to integers
+            # Normalise band values
             grid_data['band'] = grid_data['band'].apply(self._normalise_band)
 
             logger.info(
@@ -1614,6 +1704,40 @@ class LowCoverageDetector(GapDetectorBase):
             self.params.max_alphashape_points,
             gis_data=gis_data
         )
+
+        # Step 6.5: Filter out sparse clusters (area/n_points > threshold)
+        if len(cluster_polygons) > 0 and self.params.max_area_per_point_km2 > 0:
+            cluster_polygons['area_per_point'] = cluster_polygons['area_km2'] / cluster_polygons['n_points']
+            sparse_mask = cluster_polygons['area_per_point'] > self.params.max_area_per_point_km2
+            n_sparse = sparse_mask.sum()
+            if n_sparse > 0:
+                logger.info(
+                    "filtered_sparse_clusters",
+                    band=band,
+                    removed=n_sparse,
+                    threshold_km2_per_point=self.params.max_area_per_point_km2,
+                    removed_areas=cluster_polygons.loc[sparse_mask, 'area_km2'].tolist()
+                )
+                cluster_polygons = cluster_polygons[~sparse_mask].copy()
+            cluster_polygons = cluster_polygons.drop(columns=['area_per_point'])
+
+        # Step 6.6: Filter out micro-clusters (area < min_area_km2)
+        if len(cluster_polygons) > 0 and self.params.min_area_km2 > 0:
+            micro_mask = cluster_polygons['area_km2'] < self.params.min_area_km2
+            n_micro = micro_mask.sum()
+            if n_micro > 0:
+                logger.info(
+                    "filtered_micro_clusters",
+                    band=band,
+                    removed=n_micro,
+                    threshold_min_km2=self.params.min_area_km2,
+                    removed_areas=cluster_polygons.loc[micro_mask, 'area_km2'].tolist()[:10]  # Show first 10
+                )
+                cluster_polygons = cluster_polygons[~micro_mask].copy()
+
+        if len(cluster_polygons) == 0:
+            logger.info("no_clusters_after_density_filter", band=band)
+            return gpd.GeoDataFrame(columns=['cluster_id', 'n_points', 'centroid_lat', 'centroid_lon', 'geometry', 'band'])
 
         # Step 7: Filter by boundary if provided (remove offshore gaps)
         if self.boundary_gdf is not None and len(cluster_polygons) > 0:
@@ -2019,10 +2143,15 @@ class LowCoverageDetector(GapDetectorBase):
 
         For low coverage, we want dense clusters of poor coverage. We achieve this by:
         1. Counting neighbors with GOOD coverage (RSRP > threshold) on the same band
-        2. Subtracting from total neighbors to get "problematic" neighbors (low or no coverage)
+        2. Counting neighbors with ANY measurements (distinguishes no-data from low-RSRP)
         3. Keeping points where problematic neighbors >= threshold (e.g., 40 out of 49)
 
-        This correctly accounts for both low coverage AND no coverage neighbors.
+        TELECOM REVIEW FIX #2: This now distinguishes between:
+        - Neighbors with NO measurement data (sparse rural areas with few users)
+        - Neighbors with low RSRP measurements (actual coverage issues)
+
+        This prevents false negatives in rural areas where sparse data could be
+        incorrectly interpreted as "bad coverage."
 
         Args:
             geohashes: Set of candidate low coverage geohashes
@@ -2049,15 +2178,23 @@ class LowCoverageDetector(GapDetectorBase):
         rsrp_col = 'avg_rsrp'
         geohash_col = 'grid'
 
+        # Create set of ALL geohashes with ANY measurements (telecom review fix #2)
+        all_measured_geohashes = set(band_grid[geohash_col].unique())
+
         # Create set of geohashes with GOOD coverage (RSRP > threshold)
         good_coverage = band_grid[band_grid[rsrp_col] > self.params.rsrp_threshold_dbm]
         good_coverage_geohashes = set(good_coverage[geohash_col].unique())
+
+        # Low coverage geohashes = measured but RSRP <= threshold
+        low_rsrp_geohashes = all_measured_geohashes - good_coverage_geohashes
 
         logger.info(
             "computing_kring_density_low_coverage",
             k=k,
             total_geohashes=len(geohashes),
+            all_measured_geohashes=len(all_measured_geohashes),
             good_coverage_geohashes=len(good_coverage_geohashes),
+            low_rsrp_geohashes=len(low_rsrp_geohashes),
             band=band
         )
 
@@ -2071,18 +2208,49 @@ class LowCoverageDetector(GapDetectorBase):
             # Count neighbors with GOOD coverage
             good_neighbors = sum(1 for n in kring_set if n in good_coverage_geohashes)
 
-            # Problematic neighbors = total - good (includes both low coverage AND no coverage)
+            # Count neighbors with ANY measurements (telecom review fix #2)
+            measured_neighbors = sum(1 for n in kring_set if n in all_measured_geohashes)
+
+            # Count neighbors with LOW coverage (measured but poor RSRP)
+            low_rsrp_neighbors = sum(1 for n in kring_set if n in low_rsrp_geohashes)
+
+            # No-data neighbors = total - measured (sparse area, no users)
+            no_data_neighbors = total_neighbors - measured_neighbors
+
+            # Problematic neighbors = low_rsrp + no_data
             problematic_neighbors = total_neighbors - good_neighbors
 
-            # Keep if enough problematic neighbors (dense low/no coverage area)
+            # TELECOM REVIEW FIX #2: For sparse rural areas, require at least some
+            # actual low-RSRP measurements to confirm it's a real coverage issue,
+            # not just lack of user data
+            # If most "problematic" neighbors are actually no-data, be more lenient
+            # (Telecom review: now using configurable thresholds from LowCoverageParams)
+            min_measured = max(
+                self.params.min_measured_neighbors_absolute,
+                int(total_neighbors * self.params.min_measured_neighbors_pct)
+            )
+            min_low_rsrp = max(
+                self.params.min_low_rsrp_evidence_absolute,
+                int(min_missing_neighbors * self.params.min_low_rsrp_evidence_pct)
+            )
+            has_sufficient_measurements = measured_neighbors >= min_measured
+            has_low_rsrp_evidence = low_rsrp_neighbors >= min_low_rsrp
+
+            # Keep if:
+            # 1. Enough problematic neighbors (dense low/no coverage area) AND
+            # 2. Either sufficient measurements exist OR we have low-RSRP evidence
             if problematic_neighbors >= min_missing_neighbors:
-                lat, lon = geohash_utils.decode(gh)
-                records.append({
-                    'grid': gh,
-                    'latitude': lat,
-                    'longitude': lon,
-                    f'problematic_within_{k}_steps': problematic_neighbors
-                })
+                if has_sufficient_measurements or has_low_rsrp_evidence:
+                    lat, lon = geohash_utils.decode(gh)
+                    records.append({
+                        'grid': gh,
+                        'latitude': lat,
+                        'longitude': lon,
+                        f'problematic_within_{k}_steps': problematic_neighbors,
+                        'low_rsrp_neighbors': low_rsrp_neighbors,
+                        'no_data_neighbors': no_data_neighbors,
+                        'measured_neighbors': measured_neighbors,
+                    })
 
         df = pd.DataFrame(records)
 
@@ -2092,7 +2260,9 @@ class LowCoverageDetector(GapDetectorBase):
                 band=band,
                 input_geohashes=len(geohashes),
                 dense_gaps=len(df),
-                mean_problematic=df[f'problematic_within_{k}_steps'].mean()
+                mean_problematic=df[f'problematic_within_{k}_steps'].mean(),
+                mean_low_rsrp_neighbors=df['low_rsrp_neighbors'].mean(),
+                mean_no_data_neighbors=df['no_data_neighbors'].mean(),
             )
         else:
             logger.info("no_dense_gaps_after_kring_filter_low_coverage", band=band)
@@ -2180,13 +2350,31 @@ class LowCoverageDetector(GapDetectorBase):
             logger.info("no_candidate_geohashes_in_grid_data", band=band)
             return set()
 
-        # Get RSRP thresholds by environment
-        env_thresholds = {
-            'urban': env_params.get('urban', self.params).rsrp_threshold_dbm,
-            'suburban': env_params.get('suburban', self.params).rsrp_threshold_dbm,
-            'rural': env_params.get('rural', self.params).rsrp_threshold_dbm,
-        }
-        default_threshold = self.params.rsrp_threshold_dbm
+        # Get RSRP thresholds by environment AND band
+        # Use band-specific thresholds if available, otherwise fall back to config values
+        band_upper = band.upper() if band else 'L800'
+        if band_upper in BAND_RSRP_THRESHOLDS:
+            # Use band-specific thresholds (telecom review fix #1)
+            env_thresholds = BAND_RSRP_THRESHOLDS[band_upper].copy()
+            logger.info(
+                "using_band_specific_rsrp_thresholds",
+                band=band,
+                thresholds=env_thresholds
+            )
+        else:
+            # Fall back to environment-only thresholds from config
+            env_thresholds = {
+                'urban': env_params.get('urban', self.params).rsrp_threshold_dbm,
+                'suburban': env_params.get('suburban', self.params).rsrp_threshold_dbm,
+                'rural': env_params.get('rural', self.params).rsrp_threshold_dbm,
+            }
+            logger.info(
+                "using_config_rsrp_thresholds",
+                band=band,
+                thresholds=env_thresholds,
+                note="Band not in BAND_RSRP_THRESHOLDS, using config values"
+            )
+        default_threshold = env_thresholds.get('suburban', self.params.rsrp_threshold_dbm)
 
         logger.info(
             "environment_aware_rsrp_thresholds",
@@ -2744,6 +2932,7 @@ class LowCoverageRecommender:
                     'rsrp_gain_1deg': 0,
                     'rsrp_gain_2deg': 0,
                     'constraint': 'MIN_TILT_REACHED',
+                    'neighbor_impact_risk': 'N/A',
                 })
                 continue
 
@@ -2755,6 +2944,12 @@ class LowCoverageRecommender:
                 distance_m, current_tilt, antenna_height, -2.0, path_loss_exp
             )
 
+            # TELECOM REVIEW FIX #4: Assess neighbor impact risk
+            # Check if cell already serves distant geohashes (would cause overshooting)
+            neighbor_impact_risk = self._assess_neighbor_impact_risk(
+                cell_name, grid_df, distance_m, current_tilt, antenna_height
+            )
+
             candidate_scores.append({
                 'cell_name': cell_name,
                 'current_tilt': current_tilt,
@@ -2762,6 +2957,7 @@ class LowCoverageRecommender:
                 'rsrp_gain_1deg': rsrp_gain_1deg,
                 'rsrp_gain_2deg': rsrp_gain_2deg,
                 'constraint': None,
+                'neighbor_impact_risk': neighbor_impact_risk,
             })
 
         if len(candidate_scores) == 0:
@@ -2809,6 +3005,13 @@ class LowCoverageRecommender:
             if rsrp_gain < rsrp_deficit - self.params.new_site_threshold_db and i == 0:
                 note = 'NEW_SITE_MAY_BE_REQUIRED'
 
+            # Include neighbor impact risk warning if applicable (telecom review fix #4)
+            neighbor_risk = candidate.get('neighbor_impact_risk', 'LOW')
+            if neighbor_risk == 'HIGH' and note is None:
+                note = 'HIGH_NEIGHBOR_IMPACT_RISK - verify no pilot pollution'
+            elif neighbor_risk == 'MEDIUM' and note is None:
+                note = 'MODERATE_NEIGHBOR_IMPACT - monitor after implementation'
+
             recommendations.append({
                 'cluster_id': cluster_id,
                 'band': band,
@@ -2819,6 +3022,7 @@ class LowCoverageRecommender:
                 'distance_to_cluster_m': round(candidate['distance_m'], 0),
                 'confidence': confidence,
                 'note': note,
+                'neighbor_impact_risk': neighbor_risk,
             })
 
         return recommendations
@@ -2910,6 +3114,94 @@ class LowCoverageRecommender:
         if rsrp_gain >= rsrp_deficit:
             return 'HIGH'
         elif rsrp_gain >= rsrp_deficit * 0.5:
+            return 'MEDIUM'
+        else:
+            return 'LOW'
+
+    def _assess_neighbor_impact_risk(
+        self,
+        cell_name: str,
+        grid_df: pd.DataFrame,
+        target_distance_m: float,
+        current_tilt: float,
+        antenna_height: float,
+    ) -> str:
+        """
+        Assess neighbor impact risk from uptilting a cell.
+
+        TELECOM REVIEW FIX #4: This checks if the cell already serves distant
+        geohashes with good RSRP, which indicates potential for:
+        - Increased interference to neighboring cells
+        - Pilot pollution at increased range
+        - Degraded close-in performance
+
+        Args:
+            cell_name: Cell to assess
+            grid_df: Grid data with cell serving information
+            target_distance_m: Distance to the target low coverage cluster
+            current_tilt: Current tilt in degrees
+            antenna_height: Antenna height in meters
+
+        Returns:
+            Risk level: 'LOW', 'MEDIUM', or 'HIGH'
+        """
+        # Check if grid_df has necessary columns
+        cell_name_col = 'cell_name' if 'cell_name' in grid_df.columns else 'cilac'
+        if cell_name_col not in grid_df.columns:
+            return 'LOW'  # Can't assess without cell data
+
+        # Get grid data for this cell
+        cell_grids = grid_df[grid_df[cell_name_col].astype(str) == str(cell_name)]
+        if len(cell_grids) == 0:
+            return 'LOW'  # No serving data available
+
+        # Check if distance_to_cell column exists
+        dist_col = 'distance_to_cell' if 'distance_to_cell' in cell_grids.columns else None
+        if dist_col is None:
+            # Try to infer from other columns or return low risk
+            return 'LOW'
+
+        # Get maximum current serving distance
+        max_serving_distance = cell_grids[dist_col].max()
+
+        # Get count of grids being served at > 70% of target distance (far-field)
+        far_field_threshold = target_distance_m * 0.7
+        far_field_grids = cell_grids[cell_grids[dist_col] >= far_field_threshold]
+        far_field_count = len(far_field_grids)
+        total_grids = len(cell_grids)
+        far_field_pct = far_field_count / total_grids if total_grids > 0 else 0
+
+        # Get average RSRP in far-field (indicates if cell is already reaching well)
+        avg_rsrp_col = 'avg_rsrp' if 'avg_rsrp' in far_field_grids.columns else None
+        far_field_rsrp = far_field_grids[avg_rsrp_col].mean() if avg_rsrp_col and len(far_field_grids) > 0 else -120
+
+        # Assess risk based on multiple factors:
+        # 1. Cell already serves grids beyond the target cluster (high risk of overshooting)
+        # 2. Cell has significant far-field coverage with good RSRP
+        # 3. Uptilting would extend range even further
+
+        risk_score = 0
+
+        # Factor 1: Cell already serves beyond target
+        if max_serving_distance > target_distance_m * 1.2:
+            risk_score += 2  # Already overshooting
+        elif max_serving_distance > target_distance_m:
+            risk_score += 1  # Close to target
+
+        # Factor 2: Significant far-field coverage with good RSRP
+        if far_field_pct > 0.20 and far_field_rsrp > -110:
+            risk_score += 2  # Strong far-field = potential interference
+        elif far_field_pct > 0.10 and far_field_rsrp > -115:
+            risk_score += 1
+
+        # Factor 3: Low tilt means uptilt would extend range significantly
+        if current_tilt < 4:
+            risk_score += 1  # Low tilt = large range extension potential
+
+        # Convert score to risk level
+        if risk_score >= 4:
+            return 'HIGH'
+        elif risk_score >= 2:
             return 'MEDIUM'
         else:
             return 'LOW'

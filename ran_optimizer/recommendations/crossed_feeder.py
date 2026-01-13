@@ -192,6 +192,12 @@ class CrossedFeederParams:
     max_data_drop_ratio: float = 0.5
     max_detection_rate: float = 0.20
 
+    # Severity score thresholds (0-1 scale, matching other detectors)
+    severity_threshold_critical: float = 0.80
+    severity_threshold_high: float = 0.60
+    severity_threshold_medium: float = 0.40
+    severity_threshold_low: float = 0.20
+
     # Output options
     top_k_relations_per_cell: int = 5
 
@@ -264,6 +270,10 @@ class CrossedFeederParams:
                 swap_candidate_min_oob_relations=int(params.get('swap_candidate_min_oob_relations', 2)),
                 max_data_drop_ratio=float(params.get('max_data_drop_ratio', 0.5)),
                 max_detection_rate=float(params.get('max_detection_rate', 0.20)),
+                severity_threshold_critical=float(params.get('severity_threshold_critical', 0.80)),
+                severity_threshold_high=float(params.get('severity_threshold_high', 0.60)),
+                severity_threshold_medium=float(params.get('severity_threshold_medium', 0.40)),
+                severity_threshold_low=float(params.get('severity_threshold_low', 0.20)),
                 top_k_relations_per_cell=int(params.get('top_k_relations_per_cell', 5)),
             )
         except (TypeError, ValueError) as e:
@@ -713,6 +723,51 @@ class CrossedFeederDetector:
 
         return results_df, swap_pairs_df
 
+    def _calculate_cell_severity(self, confidence_level: str, out_of_beam_ratio: float) -> tuple:
+        """
+        Calculate severity score (0-1) and category for a cell.
+
+        Severity is based on:
+        - Confidence level: HIGH_POTENTIAL_SWAP contributes most, NONE contributes least
+        - Out-of-beam ratio: Higher ratio = more severe
+
+        Args:
+            confidence_level: Detection confidence (HIGH_POTENTIAL_SWAP, POSSIBLE_SWAP, etc.)
+            out_of_beam_ratio: Ratio of out-of-beam traffic (0-1)
+
+        Returns:
+            Tuple of (severity_score: float, severity_category: str)
+        """
+        # Base score from confidence level
+        confidence_scores = {
+            "HIGH_POTENTIAL_SWAP": 0.90,
+            "POSSIBLE_SWAP": 0.70,
+            "SINGLE_ANOMALY": 0.50,
+            "REPAN": 0.30,
+            "NONE": 0.0,
+        }
+        base_score = confidence_scores.get(confidence_level, 0.0)
+
+        # Add out-of-beam ratio component (up to 0.10 bonus)
+        oob_bonus = min(out_of_beam_ratio * 0.10, 0.10)
+
+        # Final severity score
+        severity_score = round(min(1.0, base_score + oob_bonus), 4)
+
+        # Determine severity category
+        if severity_score >= self.params.severity_threshold_critical:
+            severity_category = "CRITICAL"
+        elif severity_score >= self.params.severity_threshold_high:
+            severity_category = "HIGH"
+        elif severity_score >= self.params.severity_threshold_medium:
+            severity_category = "MEDIUM"
+        elif severity_score >= self.params.severity_threshold_low:
+            severity_category = "LOW"
+        else:
+            severity_category = "MINIMAL"
+
+        return severity_score, severity_category
+
     def _build_cell_result(
         self,
         cell: pd.Series,
@@ -721,6 +776,9 @@ class CrossedFeederDetector:
         recommendation: str,
     ) -> Dict:
         """Build a cell result dictionary."""
+        severity_score, severity_category = self._calculate_cell_severity(
+            confidence_level, cell["out_of_beam_ratio"]
+        )
         return {
             "cell_name": cell["cell_name"],
             "site": cell["site"],
@@ -736,6 +794,8 @@ class CrossedFeederDetector:
             "out_of_beam_ratio": round(cell["out_of_beam_ratio"], 3),
             "dominant_traffic_direction": cell["dominant_traffic_direction"],
             "confidence_level": confidence_level,
+            "severity_score": severity_score,
+            "severity_category": severity_category,
             "swap_partner": swap_partner,
             "recommendation": recommendation,
             "top_suspicious_relations": cell["top_suspicious_relations"],
@@ -756,19 +816,22 @@ class CrossedFeederDetector:
             medium_conf = len(group[group["confidence_level"].isin(["POSSIBLE_SWAP", "SINGLE_ANOMALY"])])
             low_conf = len(group[group["confidence_level"] == "REPAN"])
 
-            # Determine site-level classification
+            # Get max severity_score from cells in the group
+            max_severity_score = round(group["severity_score"].max(), 4) if "severity_score" in group.columns else 0.0
+
+            # Determine site-level classification and severity category
             if high_conf > 0:
                 classification = f"CROSSED FEEDER: {high_conf} swap pair(s) detected"
-                severity = "HIGH"
+                severity_category = "HIGH"
             elif medium_conf > 0:
                 classification = f"POSSIBLE ISSUE: {medium_conf} cells with out-of-beam anomalies"
-                severity = "MEDIUM"
+                severity_category = "MEDIUM"
             elif low_conf > 0:
                 classification = f"AZIMUTH REVIEW: {low_conf} cell(s) may need azimuth adjustment"
-                severity = "LOW"
+                severity_category = "LOW"
             else:
                 classification = "No issues detected"
-                severity = "NONE"
+                severity_category = "MINIMAL"
 
             summary.append({
                 "site": site,
@@ -777,14 +840,15 @@ class CrossedFeederDetector:
                 "high_confidence": high_conf,
                 "medium_confidence": medium_conf,
                 "low_confidence": low_conf,
-                "severity": severity,
+                "severity_score": max_severity_score,
+                "severity_category": severity_category,
                 "classification": classification,
             })
 
         summary_df = pd.DataFrame(summary)
 
-        severity_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "NONE": 3}
-        summary_df["_sort"] = summary_df["severity"].map(severity_order)
+        severity_order = {"HIGH": 0, "MEDIUM": 1, "LOW": 2, "MINIMAL": 3}
+        summary_df["_sort"] = summary_df["severity_category"].map(severity_order)
         summary_df = summary_df.sort_values(["_sort", "high_confidence", "medium_confidence"], ascending=[True, False, False])
         summary_df = summary_df.drop(columns=["_sort"])
 

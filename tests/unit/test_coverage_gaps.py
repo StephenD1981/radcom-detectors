@@ -22,6 +22,9 @@ from ran_optimizer.recommendations.coverage_gaps import (
     CoverageGapAnalyzer,
     LowCoverageParams,
     LowCoverageDetector,
+    LowCoverageRecommender,
+    BAND_RSRP_THRESHOLDS,
+    MIN_SAMPLE_COUNT_BY_ENV,
 )
 
 
@@ -414,3 +417,214 @@ class TestCoverageGapAnalyzer:
 
         for _, row in result.iterrows():
             assert row['nearby_cell_count'] == len(row['nearby_cells'])
+
+
+# ============================================================================
+# Telecom Review Fix Tests
+# ============================================================================
+
+class TestBandRsrpThresholds:
+    """Tests for band-specific RSRP thresholds (Telecom Review Fix #1)."""
+
+    def test_sub1ghz_stricter_than_midband(self):
+        """Verify L700/L800 thresholds are stricter (higher) than L1800/L2100."""
+        # Sub-1GHz should have stricter (higher/less negative) thresholds
+        for env in ['urban', 'suburban', 'rural']:
+            assert BAND_RSRP_THRESHOLDS['L700'][env] > BAND_RSRP_THRESHOLDS['L1800'][env]
+            assert BAND_RSRP_THRESHOLDS['L800'][env] > BAND_RSRP_THRESHOLDS['L2100'][env]
+
+    def test_midband_stricter_than_highband(self):
+        """Verify mid-band thresholds are stricter than high-band (5G NR C-band)."""
+        for env in ['urban', 'suburban', 'rural']:
+            assert BAND_RSRP_THRESHOLDS['L1800'][env] > BAND_RSRP_THRESHOLDS['L3500'][env]
+            assert BAND_RSRP_THRESHOLDS['L2100'][env] > BAND_RSRP_THRESHOLDS['L3700'][env]
+
+    def test_urban_stricter_than_rural(self):
+        """Verify urban thresholds are stricter than rural for each band."""
+        for band in BAND_RSRP_THRESHOLDS:
+            assert BAND_RSRP_THRESHOLDS[band]['urban'] > BAND_RSRP_THRESHOLDS[band]['rural']
+            assert BAND_RSRP_THRESHOLDS[band]['suburban'] > BAND_RSRP_THRESHOLDS[band]['rural']
+            assert BAND_RSRP_THRESHOLDS[band]['urban'] > BAND_RSRP_THRESHOLDS[band]['suburban']
+
+    def test_5g_nr_bands_present(self):
+        """Verify 5G NR bands are included in thresholds."""
+        nr_bands = ['L3500', 'L3700', 'N1', 'N3', 'N7', 'N28', 'N78', 'N77']
+        for band in nr_bands:
+            assert band in BAND_RSRP_THRESHOLDS, f"Missing 5G NR band: {band}"
+            assert 'urban' in BAND_RSRP_THRESHOLDS[band]
+            assert 'suburban' in BAND_RSRP_THRESHOLDS[band]
+            assert 'rural' in BAND_RSRP_THRESHOLDS[band]
+
+    def test_threshold_values_in_valid_range(self):
+        """Verify all threshold values are within valid RSRP range."""
+        for band, envs in BAND_RSRP_THRESHOLDS.items():
+            for env, threshold in envs.items():
+                assert -140 <= threshold <= -70, f"Invalid threshold {threshold} for {band}/{env}"
+
+
+class TestMinSampleCountByEnv:
+    """Tests for environment-aware min_sample_count (Telecom Review Fix #3)."""
+
+    def test_rural_has_lowest_threshold(self):
+        """Verify rural has lowest sample count requirement."""
+        assert MIN_SAMPLE_COUNT_BY_ENV['rural'] < MIN_SAMPLE_COUNT_BY_ENV['suburban']
+        assert MIN_SAMPLE_COUNT_BY_ENV['rural'] < MIN_SAMPLE_COUNT_BY_ENV['urban']
+
+    def test_urban_has_highest_threshold(self):
+        """Verify urban has highest sample count requirement."""
+        assert MIN_SAMPLE_COUNT_BY_ENV['urban'] > MIN_SAMPLE_COUNT_BY_ENV['suburban']
+        assert MIN_SAMPLE_COUNT_BY_ENV['urban'] > MIN_SAMPLE_COUNT_BY_ENV['rural']
+
+    def test_expected_values(self):
+        """Verify expected default values."""
+        assert MIN_SAMPLE_COUNT_BY_ENV['urban'] == 10
+        assert MIN_SAMPLE_COUNT_BY_ENV['suburban'] == 5
+        assert MIN_SAMPLE_COUNT_BY_ENV['rural'] == 2
+
+    def test_all_positive(self):
+        """Verify all sample counts are positive."""
+        for env, count in MIN_SAMPLE_COUNT_BY_ENV.items():
+            assert count > 0, f"Sample count for {env} must be positive"
+
+
+class TestLowCoverageParamsSparseAreaConfig:
+    """Tests for configurable sparse area thresholds (Telecom Review Fix #2 config)."""
+
+    def test_sparse_area_params_exist(self):
+        """Verify sparse area parameters exist in LowCoverageParams."""
+        params = LowCoverageParams()
+        assert hasattr(params, 'min_measured_neighbors_absolute')
+        assert hasattr(params, 'min_measured_neighbors_pct')
+        assert hasattr(params, 'min_low_rsrp_evidence_absolute')
+        assert hasattr(params, 'min_low_rsrp_evidence_pct')
+
+    def test_sparse_area_defaults(self):
+        """Verify default values for sparse area parameters."""
+        params = LowCoverageParams()
+        assert params.min_measured_neighbors_absolute == 5
+        assert params.min_measured_neighbors_pct == 0.2
+        assert params.min_low_rsrp_evidence_absolute == 2
+        assert params.min_low_rsrp_evidence_pct == 0.1
+
+    def test_sparse_area_custom_values(self):
+        """Test custom sparse area parameter initialization."""
+        params = LowCoverageParams(
+            min_measured_neighbors_absolute=10,
+            min_measured_neighbors_pct=0.3,
+            min_low_rsrp_evidence_absolute=5,
+            min_low_rsrp_evidence_pct=0.15
+        )
+        assert params.min_measured_neighbors_absolute == 10
+        assert params.min_measured_neighbors_pct == 0.3
+        assert params.min_low_rsrp_evidence_absolute == 5
+        assert params.min_low_rsrp_evidence_pct == 0.15
+
+
+class TestNeighborImpactRiskAssessment:
+    """Tests for neighbor impact risk assessment (Telecom Review Fix #4)."""
+
+    @pytest.fixture
+    def sample_gis_df(self):
+        """Create sample GIS data for recommender tests."""
+        return pd.DataFrame({
+            'cell_name': ['CELL001', 'CELL002', 'CELL003'],
+            'latitude': [53.35, 53.36, 53.37],
+            'longitude': [-6.26, -6.27, -6.28],
+            'tilt_mech': [2, 3, 1],
+            'tilt_elc': [4, 5, 2],
+            'antenna_height': [30, 25, 35],
+            'band': ['L800', 'L800', 'L800'],
+        })
+
+    @pytest.fixture
+    def sample_grid_df(self):
+        """Create sample grid data for recommender tests."""
+        return pd.DataFrame({
+            'cell_name': ['CELL001'] * 10 + ['CELL002'] * 10,
+            'grid': [f'gc7abc{i}' for i in range(10)] + [f'gc7def{i}' for i in range(10)],
+            'avg_rsrp': [-100, -105, -110, -115, -120, -108, -112, -95, -98, -102,
+                        -105, -110, -115, -120, -125, -118, -122, -100, -103, -107],
+            'distance_to_cell': [500, 1000, 1500, 2000, 2500, 800, 1200, 300, 600, 900,
+                                600, 1200, 1800, 2400, 3000, 1000, 1500, 400, 700, 1100],
+        })
+
+    def test_recommender_initialization(self):
+        """Test LowCoverageRecommender can be initialized."""
+        recommender = LowCoverageRecommender()
+        assert recommender is not None
+        assert hasattr(recommender, '_assess_neighbor_impact_risk')
+
+    def test_assess_neighbor_impact_risk_method_exists(self):
+        """Verify the neighbor impact risk assessment method exists."""
+        recommender = LowCoverageRecommender()
+        assert callable(getattr(recommender, '_assess_neighbor_impact_risk', None))
+
+    def test_assess_neighbor_impact_risk_returns_valid_level(self, sample_grid_df):
+        """Test that risk assessment returns valid risk levels."""
+        recommender = LowCoverageRecommender()
+
+        # Test with sample data
+        risk = recommender._assess_neighbor_impact_risk(
+            cell_name='CELL001',
+            grid_df=sample_grid_df,
+            target_distance_m=2000,
+            current_tilt=6,
+            antenna_height=30
+        )
+
+        assert risk in ['LOW', 'MEDIUM', 'HIGH']
+
+    def test_assess_neighbor_impact_risk_missing_cell(self, sample_grid_df):
+        """Test risk assessment with non-existent cell returns LOW."""
+        recommender = LowCoverageRecommender()
+
+        risk = recommender._assess_neighbor_impact_risk(
+            cell_name='NONEXISTENT',
+            grid_df=sample_grid_df,
+            target_distance_m=2000,
+            current_tilt=6,
+            antenna_height=30
+        )
+
+        assert risk == 'LOW'
+
+    def test_assess_neighbor_impact_risk_empty_df(self):
+        """Test risk assessment with empty DataFrame returns LOW."""
+        recommender = LowCoverageRecommender()
+        empty_df = pd.DataFrame(columns=['cell_name', 'grid', 'avg_rsrp', 'distance_to_cell'])
+
+        risk = recommender._assess_neighbor_impact_risk(
+            cell_name='CELL001',
+            grid_df=empty_df,
+            target_distance_m=2000,
+            current_tilt=6,
+            antenna_height=30
+        )
+
+        assert risk == 'LOW'
+
+    def test_low_tilt_increases_risk(self, sample_grid_df):
+        """Test that low tilt (<4 degrees) increases risk score."""
+        recommender = LowCoverageRecommender()
+
+        # Low tilt (should be higher risk)
+        risk_low_tilt = recommender._assess_neighbor_impact_risk(
+            cell_name='CELL001',
+            grid_df=sample_grid_df,
+            target_distance_m=2000,
+            current_tilt=2,  # Very low tilt
+            antenna_height=30
+        )
+
+        # High tilt (should be lower risk)
+        risk_high_tilt = recommender._assess_neighbor_impact_risk(
+            cell_name='CELL001',
+            grid_df=sample_grid_df,
+            target_distance_m=2000,
+            current_tilt=10,  # High tilt
+            antenna_height=30
+        )
+
+        # Low tilt should have equal or higher risk than high tilt
+        risk_order = {'LOW': 0, 'MEDIUM': 1, 'HIGH': 2}
+        assert risk_order[risk_low_tilt] >= risk_order[risk_high_tilt]
