@@ -32,6 +32,7 @@ This tool finds these problems and tells engineers exactly how to fix them (usua
 **Real-world impact:**
 - Users experience dropped calls when their phone switches between cells
 - Network capacity is wasted
+- Pilot pollution in distant areas
 
 **What the tool does:** Identifies which cells are overshooting and recommends how many degrees to tilt the antenna DOWN.
 
@@ -41,6 +42,7 @@ This tool finds these problems and tells engineers exactly how to fix them (usua
 **Real-world impact:**
 - Users have weak signal or no signal in certain areas
 - Call quality suffers
+- Neighboring cells compensate, becoming overloaded
 
 **What the tool does:** Identifies which cells are undershooting and recommends how many degrees to tilt the antenna UP.
 
@@ -49,6 +51,7 @@ This tool finds these problems and tells engineers exactly how to fix them (usua
 
 **Real-world impact:**
 - Users have no service at all in these zones
+- Emergency calls impossible
 
 **What the tool does:** Maps these areas on an interactive map so planners can decide if new cell sites are needed.
 
@@ -61,6 +64,46 @@ This tool finds these problems and tells engineers exactly how to fix them (usua
 - Frequent disconnections
 
 **What the tool does:** Maps these weak signal zones by frequency band.
+
+### Problem 5: High Interference Zones
+**What it means:** Multiple cells provide similar signal strength in the same area, causing confusion.
+
+**Real-world impact:**
+- Poor signal quality (low SINR)
+- Handover failures
+- Reduced throughput
+
+**What the tool does:** Identifies geographic zones with high pilot pollution where multiple cells compete.
+
+### Problem 6: PCI Conflicts
+**What it means:** Cells with identical or conflicting Physical Cell IDs cause measurement ambiguity.
+
+**Real-world impact:**
+- Cell confusion during initial access
+- Measurement errors
+- Failed handovers
+
+**What the tool does:** Detects PCI confusion (same PCI in neighbor list), collisions (coverage overlap), and mod 3/30 conflicts.
+
+### Problem 7: Carrier Aggregation Imbalance
+**What it means:** Coverage band and capacity band footprints don't align properly.
+
+**Real-world impact:**
+- Users can't aggregate carriers for higher speeds
+- Wasted capacity spectrum
+- Suboptimal throughput
+
+**What the tool does:** Identifies sites where coverage and capacity bands have mismatched footprints.
+
+### Problem 8: Crossed Feeders
+**What it means:** Antenna cables are physically swapped between sectors.
+
+**Real-world impact:**
+- Wrong cell serves wrong area
+- Severe performance degradation
+- Handover issues
+
+**What the tool does:** Detects reciprocal swap patterns by analyzing traffic direction vs. antenna azimuth.
 
 ---
 
@@ -95,11 +138,21 @@ You need three input files (see [[DATA_FORMATS]] for details):
 ### Step 3: Run the Analysis
 
 ```bash
-# Run all four algorithms
+# Run all detection algorithms
 ran-optimize --input-dir data/input --output-dir data/output
 
 # Or run specific algorithms only
-ran-optimize --algorithms overshooting undershooting
+ran-optimize --algorithms overshooting undershooting coverage_gaps
+
+# Available algorithms:
+# - overshooting
+# - undershooting
+# - coverage_gaps (no coverage + low coverage)
+# - interference
+# - pci_planning (confusion + collision detection)
+# - pci_conflict (hull overlap analysis)
+# - ca_imbalance
+# - crossed_feeder
 ```
 
 ### Step 4: Review Results
@@ -114,10 +167,21 @@ ran-optimize --algorithms overshooting undershooting
 
 | Output File | What It Contains | Format |
 |-------------|------------------|--------|
+| **Coverage Optimization** | | |
 | `overshooting_cells_environment_aware.csv` | List of cells to tilt DOWN, with severity scores | CSV |
 | `undershooting_cells_environment_aware.csv` | List of cells to tilt UP, with severity scores | CSV |
 | `no_coverage_clusters.geojson` | Map polygons showing zero coverage areas | GeoJSON |
 | `low_coverage_band_{700/800/1800/etc}.geojson` | Map polygons showing weak signal areas (per band) | GeoJSON |
+| **Interference & PCI** | | |
+| `interference_clusters.geojson` | Map polygons showing high interference zones | GeoJSON |
+| `pci_confusion.csv` | Cells with neighbor PCI ambiguity | CSV |
+| `pci_collisions.csv` | Cell pairs with same/conflicting PCIs | CSV |
+| `pci_conflict_overlaps.csv` | Hull overlap analysis for PCI conflicts | CSV |
+| **Physical Layer** | | |
+| `ca_imbalance.csv` | Sites with mismatched CA band footprints | CSV |
+| `crossed_feeder_results.csv` | Cells with suspected feeder swaps | CSV |
+| `crossed_feeder_swap_pairs.csv` | Reciprocal swap patterns (HIGH confidence) | CSV |
+| **Supporting Files** | | |
 | `cell_environment.csv` | Classification of each cell (urban/suburban/rural) | CSV |
 | `maps/enhanced_dashboard.html` | Interactive map showing all findings | HTML |
 

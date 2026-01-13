@@ -1,7 +1,7 @@
 # RAN Optimizer Configuration Guide
 
-**Document Version:** 2.0
-**Last Updated:** 2024
+**Document Version:** 3.0
+**Last Updated:** 2026-01-13
 **Classification:** Operations Manual
 
 ---
@@ -190,8 +190,11 @@ ran-optimize --validate-config config/operators/my_operator.yaml
 | `min_cell_count_in_grid` | int | 4 | 2 - 10 | Minimum competing cells to flag a grid |
 | `max_percentage_grid_events` | float | 0.25 | 0.10 - 0.50 | Maximum traffic share for overshooting grids |
 | `interference_threshold_db` | float | 7.5 | 3.0 - 15.0 | RSRP gap from P90 to count as competing (dB) |
-| `min_relative_reach` | float | 0.7 | 0.5 - 0.9 | Minimum reach relative to furthest cell |
-| `rsrp_degradation_db` | float | 10.0 | 5.0 - 20.0 | Minimum RSRP drop from cell maximum (dB) |
+| `min_relative_reach` | float | 0.70 | 0.5 - 0.9 | Minimum reach relative to furthest cell |
+| `rsrp_degradation_db` | float | 10.0 | 5.0 - 20.0 | Minimum RSRP drop from cell P85 RSRP (dB) |
+| `rsrp_reference_quantile` | float | 0.85 | 0.75 - 0.95 | Quantile for cell reference RSRP (P85) |
+| `rsrp_competition_quantile` | float | 0.90 | 0.80 - 0.95 | Quantile for grid competition RSRP (P90) |
+| `max_azimuth_deviation_deg` | float | 90.0 | 45.0 - 180.0 | Max angular deviation from cell bearing (degrees) |
 | `min_overshooting_grids` | int | 30 | 10 - 200 | Minimum grid count to flag cell |
 | `percentage_overshooting_grids` | float | 0.10 | 0.05 - 0.25 | Minimum percentage of cell grids overshooting |
 
@@ -337,11 +340,17 @@ Cell B: 300 total grids, 35 overshooting
 
 | Parameter | Type | Default | Range | Description |
 |-----------|------|---------|-------|-------------|
-| `min_cell_max_distance` | int | 3000 | 1000 - 10000 | Range below this indicates undershooting (m) |
-| `min_grid_count` | int | 100 | 50 - 500 | Minimum grids required for analysis |
-| `interference_pct_threshold` | float | 0.40 | 0.20 - 0.60 | Edge interference ratio to flag |
-| `traffic_pct_threshold` | float | 0.15 | 0.05 - 0.30 | Minimum edge traffic to indicate demand |
-| `min_rsrp_threshold` | int | -105 | -120 to -90 | Ignore grids weaker than this (dBm) |
+| `min_cell_event_count` | int | 200 | 100 - 500 | Minimum traffic samples required for analysis |
+| `max_cell_distance` | int | 7000 | 2000 - 15000 | Maximum distance threshold for undershooting (m) |
+| `interference_threshold_db` | float | 7.5 | 3.0 - 15.0 | RSRP difference for competing cells (dB) |
+| `max_cell_grid_count` | int | 3 | 2 - 10 | Max competing cells in grid for low interference |
+| `max_interference_percentage` | float | 0.20 | 0.10 - 0.40 | Maximum allowed fraction of grids with high interference |
+| `min_coverage_increase_1deg` | float | 0.04 | 0.02 - 0.10 | Minimum coverage increase for 1° uptilt |
+| `min_coverage_increase_2deg` | float | 0.08 | 0.04 - 0.20 | Minimum coverage increase for 2° uptilt |
+| `min_distance_gain_1deg_m` | int | 50 | 25 - 200 | Minimum distance gain for 1° uptilt (m) |
+| `min_new_grids_1deg` | int | 5 | 2 - 20 | Minimum new grids for 1° recommendation |
+| `hpbw_v_deg` | float | 6.5 | 3.0 - 15.0 | Vertical half-power beamwidth (degrees) |
+| `path_loss_exponent` | float | 3.5 | 2.5 - 4.5 | Path loss exponent (varies by environment) |
 
 ### 4.2 Band-Specific Defaults
 
@@ -349,8 +358,14 @@ Propagation characteristics vary significantly by frequency:
 
 | Parameter | Low Band (700-900 MHz) | Mid Band (1800 MHz) | High Band (2100+ MHz) |
 |-----------|------------------------|---------------------|----------------------|
-| `min_cell_max_distance` | 5000m | 3500m | 2500m |
-| `traffic_pct_threshold` | 0.10 | 0.15 | 0.20 |
+| `max_cell_distance` | 10000m | 7000m | 5000m |
+| `path_loss_exponent` | 3.0 (rural) - 3.5 (suburban) | 3.5 | 4.0 (urban) |
+| `min_distance_gain_1deg_m` | 100m | 50m | 25m |
+
+**Note:** The `path_loss_exponent` varies by both frequency and environment:
+- **Urban (4.0):** High clutter, buildings, dense obstacles
+- **Suburban (3.5):** Moderate clutter, mixed terrain
+- **Rural (3.0):** Open terrain, minimal obstacles
 
 ---
 
@@ -360,12 +375,19 @@ Propagation characteristics vary significantly by frequency:
 
 | Parameter | Type | Default | Range | Description |
 |-----------|------|---------|-------|-------------|
-| `rsrp_threshold` | int | -115 | -125 to -105 | Signal level defining "low coverage" (dBm) |
-| `min_cluster_points` | int | 10 | 5 - 50 | Minimum geohashes to form a cluster |
-| `cluster_eps` | float | 0.003 | 0.001 - 0.01 | HDBSCAN clustering distance |
-| `min_cluster_area_km2` | float | 0.1 | 0.01 - 1.0 | Minimum reportable cluster area (km²) |
-| `k_ring_size` | int | 2 | 1 - 4 | Neighbor ring size for density validation |
-| `min_density_ratio` | float | 0.30 | 0.20 - 0.50 | Required neighbor ratio for retention |
+| **No Coverage Detection** | | | | |
+| `cell_cluster_eps_km` | float | 5.0 | 2.0 - 15.0 | DBSCAN epsilon for clustering cell hulls (km) |
+| `cell_cluster_min_samples` | int | 3 | 2 - 5 | Minimum cells per cluster |
+| `k_ring_steps` | int | 3 | 2 - 4 | Neighbor rings (3 = 49 neighbors) |
+| `min_missing_neighbors` | int | 40 | 20 - 60 | Min missing neighbors (out of 49) |
+| `hdbscan_min_cluster_size` | int | 10 | 5 - 25 | Min geohashes to form cluster |
+| `alpha_shape_alpha` | float | null | null or 0.1-10.0 | Alpha for concave hull (null = auto) |
+| **Low Coverage Detection** | | | | |
+| `rsrp_threshold_dbm` | int | -115 | -125 to -105 | Signal level defining "low coverage" (dBm) |
+| `k_ring_steps` | int | 3 | 2 - 4 | Neighbor rings for density check |
+| `min_missing_neighbors` | int | 30 | 15 - 45 | Min neighbors below threshold (out of 49) |
+| `min_area_km2` | float | 0.5 | 0.1 - 2.0 | Minimum cluster area (km²) |
+| `max_area_per_point_km2` | float | 2.0 | 0.5 - 5.0 | Max area/point ratio (filters sparse clusters) |
 
 ### 5.2 RSRP Reference Scale
 
@@ -399,26 +421,44 @@ Cells are classified by Inter-Site Distance (ISD):
   "default": {
     "min_cell_distance": 4000,
     "min_overshooting_grids": 30,
-    "edge_traffic_percent": 0.15
+    "edge_traffic_percent": 0.15,
+    "min_cell_count_in_grid": 4,
+    "max_percentage_grid_events": 0.25,
+    "interference_threshold_db": 7.5,
+    "min_relative_reach": 0.70
   },
   "environment_profiles": {
     "urban": {
-      "min_cell_distance": 3000,
-      "min_overshooting_grids": 30,
-      "edge_traffic_percent": 0.15,
-      "min_cell_count_in_grid": 5
+      "min_cell_distance": 1500,
+      "min_overshooting_grids": 25,
+      "edge_traffic_percent": 0.12,
+      "min_cell_count_in_grid": 4,
+      "max_percentage_grid_events": 0.25,
+      "interference_threshold_db": 8.0,
+      "percentage_overshooting_grids": 0.08,
+      "min_relative_reach": 0.70,
+      "rsrp_competition_quantile": 0.85
     },
     "suburban": {
-      "min_cell_distance": 5000,
-      "min_overshooting_grids": 50,
-      "edge_traffic_percent": 0.12,
-      "min_cell_count_in_grid": 4
+      "min_cell_distance": 3500,
+      "min_overshooting_grids": 25,
+      "edge_traffic_percent": 0.15,
+      "min_cell_count_in_grid": 3,
+      "max_percentage_grid_events": 0.28,
+      "interference_threshold_db": 8.0,
+      "percentage_overshooting_grids": 0.10,
+      "min_relative_reach": 0.68
     },
     "rural": {
       "min_cell_distance": 8000,
-      "min_overshooting_grids": 80,
-      "edge_traffic_percent": 0.08,
-      "min_cell_count_in_grid": 3
+      "min_overshooting_grids": 22,
+      "edge_traffic_percent": 0.18,
+      "min_cell_count_in_grid": 2,
+      "max_percentage_grid_events": 0.30,
+      "interference_threshold_db": 8.5,
+      "percentage_overshooting_grids": 0.07,
+      "min_relative_reach": 0.65,
+      "rsrp_competition_quantile": 0.80
     }
   }
 }
@@ -510,9 +550,127 @@ features:
 
 ---
 
-## 9. Troubleshooting
+## 6. Interference Detection Parameters
 
-### 9.1 Common Issues
+### 6.1 Parameter Reference
+
+| Parameter | Type | Default | Range | Description |
+|-----------|------|---------|-------|-------------|
+| `min_filtered_cells_per_grid` | int | 4 | 2 - 10 | Min cells in grid cluster for interference |
+| `min_cell_event_count` | int | 2 | 1 - 10 | Min traffic events per cell for quality |
+| `perc_grid_events` | float | 0.05 | 0.01 - 0.20 | Min percentage of grid events for cell |
+| `max_rsrp_diff_db` | float | 5.0 | 3.0 - 10.0 | Max RSRP diff from strongest cell (dB) |
+| `dominance_diff_db` | float | 5.0 | 3.0 - 10.0 | RSRP gap indicating dominance (dB) |
+| `dominant_perc_grid_events` | float | 0.30 | 0.20 - 0.50 | Percentage threshold for dominant cell |
+| `sinr_threshold_db` | float | 20.0 | 0.0 - 30.0 | Max SINR for interference flag (dB) |
+| `k_ring_steps` | int | 3 | 2 - 4 | Geohash neighbor steps (3 = 49 neighbors) |
+| `perc_interference` | float | 0.33 | 0.20 - 0.50 | Min fraction of neighbors with interference |
+
+**Environment-Specific:**
+- **Urban:** `min_filtered_cells_per_grid: 5`, `perc_interference: 0.40`
+- **Rural:** `min_filtered_cells_per_grid: 3`, `perc_interference: 0.25`
+
+---
+
+## 7. PCI Planning Parameters
+
+### 7.1 Parameter Reference
+
+| Parameter | Type | Default | Range | Description |
+|-----------|------|---------|-------|-------------|
+| `couple_cosectors` | bool | false | - | Force co-sector cells to share PCI |
+| `min_active_neighbors_after_blacklist` | int | 2 | 1 - 5 | Min neighbors after blacklisting |
+| `max_collision_radius_m` | float | 30000.0 | 10000 - 50000 | Max distance for collision (m) |
+| `two_hop_factor` | float | 0.25 | 0.0 - 1.0 | Severity multiplier for 2-hop |
+| `include_mod3_inter_site` | bool | false | - | Include inter-site mod3 conflicts |
+| `confusion_alpha` | float | 1.0 | 0.0 - 5.0 | Weight for confusion severity |
+| `collision_beta` | float | 1.0 | 0.0 - 5.0 | Weight for collision severity |
+| `pci_change_cost` | float | 5.0 | 0.0 - 10.0 | Cost penalty for PCI change |
+| `low_activity_max_act` | float | 5.0 | 1.0 - 20.0 | Max HO activity for low-activity flag |
+
+---
+
+## 8. PCI Collision Detection Parameters
+
+### 8.1 Parameter Reference
+
+| Parameter | Type | Default | Range | Description |
+|-----------|------|---------|-------|-------------|
+| `overlap_threshold` | float | 0.10 | 0.05 - 0.30 | Min overlap % to flag (10%) |
+| `min_overlap_area_km2` | float | 0.0005 | 0.0001 - 0.01 | Min overlap area (500m²) |
+
+**Severity Thresholds:**
+- **Critical:** overlap_pct ≥ 50%, distance_km ≤ 2
+- **High:** overlap_pct ≥ 30%, distance_km ≤ 3
+- **Medium:** overlap_pct ≥ 20%, distance_km ≤ 5
+
+---
+
+## 9. CA Imbalance Parameters
+
+### 9.1 Parameter Reference
+
+| Parameter | Type | Default | Range | Description |
+|-----------|------|---------|-------|-------------|
+| `coverage_threshold` | float | 0.70 | 0.50 - 0.90 | Min capacity/coverage ratio (70%) |
+| `use_environment_thresholds` | bool | false | - | Enable environment-aware thresholds |
+| `cell_name_pattern` | string | `(CK\\d+)[A-Z]+(\\d)` | - | Regex to extract site_id and sector |
+
+**Environment-Aware Thresholds (if enabled):**
+- **Urban:** 0.85 (85% - stricter alignment)
+- **Suburban:** 0.70 (70% - default)
+- **Rural:** 0.60 (60% - more lenient)
+
+**CA Pairs Configuration Example:**
+```json
+{
+  "ca_pairs": [
+    {
+      "name": "L800-L1800",
+      "coverage_band": "L800",
+      "capacity_band": "L1800",
+      "coverage_threshold": 0.70
+    }
+  ]
+}
+```
+
+---
+
+## 10. Crossed Feeder Detection Parameters
+
+### 10.1 Parameter Reference
+
+| Parameter | Type | Default | Range | Description |
+|-----------|------|---------|-------|-------------|
+| `min_out_of_beam_ratio` | float | 0.60 | 0.40 - 0.80 | Min % out-of-beam traffic |
+| `min_out_of_beam_weight` | float | 10.0 | 5.0 - 30.0 | Min total out-of-beam weight (%) |
+| `min_total_relations` | int | 5 | 3 - 10 | Min neighbor relations required |
+| `min_out_of_beam_relations` | int | 3 | 2 - 5 | Min OOB relations to flag |
+| `max_radius_m` | float | 30000.0 | 15000 - 50000 | Max relation distance (m) |
+| `min_distance_m` | float | 500.0 | 100 - 1000 | Min relation distance (m) |
+| `hbw_cap_deg` | float | 60.0 | 30.0 - 120.0 | Cap on half-beamwidth (degrees) |
+| `percentile` | float | 0.95 | 0.90 - 0.99 | Percentile for flagging (top 5%) |
+| `use_strength_col` | string | `cell_perc_weight` | - | Column for relation strength |
+| `distance_weighting` | bool | true | - | Apply distance-based weighting |
+| `angle_weighting` | bool | true | - | Apply angle-based weighting |
+
+**Band-Specific Maximum Radius:**
+```json
+{
+  "L700": 32000,
+  "L800": 30000,
+  "L1800": 25000,
+  "L2100": 20000,
+  "L2600": 15000
+}
+```
+
+---
+
+## 11. Troubleshooting
+
+### 11.1 Common Issues
 
 | Symptom | Likely Cause | Resolution |
 |---------|--------------|------------|
@@ -522,7 +680,7 @@ features:
 | Memory exhaustion | Large dataset | Reduce `chunk_size`; process in batches |
 | Slow execution | Insufficient parallelism | Increase `n_workers` to match CPU cores |
 
-### 9.2 Validation Checklist
+### 11.2 Validation Checklist
 
 Before production deployment:
 
@@ -532,7 +690,7 @@ Before production deployment:
 - [ ] Execute on sample data before full dataset
 - [ ] Review output row counts against expectations
 
-### 9.3 Diagnostic Mode
+### 11.3 Diagnostic Mode
 
 Enable detailed logging for troubleshooting:
 

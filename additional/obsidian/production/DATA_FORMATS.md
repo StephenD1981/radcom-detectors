@@ -2,9 +2,9 @@
 
 | Document Information |                                      |
 |---------------------|--------------------------------------|
-| **Version**         | 2.0                                  |
+| **Version**         | 3.0                                  |
 | **Classification**  | Data Integration Specification       |
-| **Last Updated**    | November 2024                        |
+| **Last Updated**    | January 2026                         |
 | **Audience**        | Data Engineers, System Integrators   |
 
 ---
@@ -16,7 +16,8 @@
    - [Grid Data](#input-file-1-grid-data)
    - [GIS Data](#input-file-2-gis-data)
    - [Hull Data](#input-file-3-hull-data)
-   - [Boundary Shapefile](#input-file-4-boundary-shapefile)
+   - [Cell Impacts Data](#input-file-4-cell-impacts-data)
+   - [Boundary Shapefile](#input-file-5-boundary-shapefile)
 3. [Output Data Specifications](#output-data-specifications)
    - [Overshooting Results](#output-file-1-overshooting-results)
    - [Undershooting Results](#output-file-2-undershooting-results)
@@ -76,6 +77,7 @@
 | Grid Data | CSV | Yes | Signal measurements from UE devices |
 | GIS Data | CSV | Yes | Cell site locations and configurations |
 | Hull Data | CSV | Yes | Cell coverage boundary polygons |
+| Cell Impacts | CSV | Conditional | Cell-to-cell relationships and traffic (required for CA imbalance, PCI conflicts, crossed feeder detection) |
 | Boundary | Shapefile | No | Analysis region boundary |
 
 ---
@@ -119,15 +121,59 @@ Contains radio frequency measurements aggregated by cell and geographic grid. Ea
 | `ta_mean` | Float | Mean timing advance | - |
 | `traffic_pct` | Float | Traffic distribution % | - |
 | `band` | Integer | Frequency band (MHz) | - |
+| `avg_rsrp_grid` | Float | Grid-level average RSRP (dBm) | - |
+| `avg_rsrq_grid` | Float | Grid-level average RSRQ (dB) | - |
+| `avg_sinr_grid` | Float | Grid-level average SINR (dB) | - |
+| `grid_event_count` | Integer | Total events in grid | - |
+| `avg_rsrp_cell` | Float | Cell-level average RSRP (dBm) | - |
+| `avg_rsrq_cell` | Float | Cell-level average RSRQ (dB) | - |
+| `avg_sinr_cell` | Float | Cell-level average SINR (dB) | - |
+| `cell_event_count` | Integer | Total events for cell | - |
+| `perc_cell_events` | Float | % of cell's total events | - |
+| `perc_grid_events` | Float | % of grid's total events | - |
+| `grid_max_distance_to_cell` | Float | Max distance from grid to any cell (m) | - |
+| `grid_min_distance_to_cell` | Float | Min distance from grid to any cell (m) | - |
+| `cell_max_distance_to_cell` | Float | Max distance for this cell (m) | - |
+| `perc_cell_max_dist` | Float | Distance as % of cell max | - |
+| `grid_bearing_diff` | Float | Bearing difference (°) | - |
+| `geometry` | String | Grid polygon (WKT) | - |
+| `band_cell_count` | Integer | Cells on same band in grid | - |
+| `cell_count` | Integer | Total cells in grid | - |
+| `grid_cell` | String | Composite key (grid_cilac) | - |
+
+#### Field Categories
+
+**Grid-Level Aggregations** - Metrics aggregated across all cells in a grid:
+- `avg_rsrp_grid`, `avg_rsrq_grid`, `avg_sinr_grid` - RF quality metrics averaged over all cells serving the grid
+- `grid_event_count` - Total traffic events across all cells in this grid
+- `grid_max_distance_to_cell`, `grid_min_distance_to_cell` - Distance range from grid to any serving cell
+- `band_cell_count` - Count of cells on same frequency band serving this grid
+- `cell_count` - Total count of all cells serving this grid
+
+**Cell-Level Baselines** - Metrics aggregated across all grids served by a cell:
+- `avg_rsrp_cell`, `avg_rsrq_cell`, `avg_sinr_cell` - RF quality metrics averaged over all grids the cell serves
+- `cell_event_count` - Total traffic events across all grids this cell serves
+- `cell_max_distance_to_cell` - Maximum distance this cell reaches to any grid
+
+**Coverage Extent Metrics** - Relationships between cell reach and grid position:
+- `perc_cell_max_dist` - This grid's distance as percentage of cell's maximum reach (0.0 to 1.0)
+- `perc_cell_events` - This grid's events as percentage of cell's total traffic (used for undershooting detection)
+- `perc_grid_events` - This cell's events as percentage of grid's total traffic (used for interference analysis)
+
+**Angular Metrics**:
+- `grid_bearing_diff` - Angular difference between cell azimuth and actual bearing to grid (used for overshooting)
+
+**Composite Keys**:
+- `grid_cell` - Concatenation of grid and cilac for unique row identification
 
 #### Example
 
 ```csv
-cilac,grid,rsrp_mean,distance_m,Latitude,Longitude,event_count,band
-328576779,gc7x9r5,-95.2,1250.5,51.8976,-8.4723,156,1800
-328576779,gc7x9r4,-98.7,1450.2,51.8965,-8.4712,89,1800
-328825100,gc7x9r5,-102.3,2100.8,51.8976,-8.4723,234,800
-328825100,gc7x9pm,-105.1,2800.3,51.8945,-8.4698,67,800
+cilac,grid,rsrp_mean,distance_m,Latitude,Longitude,event_count,band,avg_rsrp_grid,avg_rsrq_grid,avg_sinr_grid,grid_event_count,avg_rsrp_cell,avg_rsrq_cell,avg_sinr_cell,cell_event_count,perc_cell_events,perc_grid_events,cell_max_distance_to_cell,perc_cell_max_dist,grid_bearing_diff
+328576779,gc7x9r5,-95.2,1250.5,51.8976,-8.4723,156,1800,-104.8,-14.4,13.6,1630,-102.1,-13.0,15.0,3633,0.000275,0.000613,3424.9,0.902,51.6
+328576779,gc7x9r4,-98.7,1450.2,51.8965,-8.4712,89,1800,-106.2,-15.1,12.8,1420,-102.1,-13.0,15.0,3633,0.000245,0.000627,3424.9,0.964,48.2
+328825100,gc7x9r5,-102.3,2100.8,51.8976,-8.4723,234,800,-108.5,-16.2,11.4,1630,-99.8,-11.5,16.2,4821,0.000485,0.001435,5680.2,0.740,32.8
+328825100,gc7x9pm,-105.1,2800.3,51.8945,-8.4698,67,800,-110.1,-17.0,10.2,890,-99.8,-11.5,16.2,4821,0.000139,0.000753,5680.2,0.928,28.4
 ```
 
 #### Geohash Precision Reference
@@ -178,15 +224,17 @@ Contains physical and configuration parameters for each cell site in the network
 | `Technology` | String | LTE, NR, etc. | - |
 | `TxPower` | Float | Transmit power (dBm) | - |
 | `Bandwidth` | Float | Channel bandwidth (MHz) | - |
+| `uarfcn` | Integer | UARFCN/EARFCN channel number | - |
+| `cell_type` | String | Outdoor/Indoor classification | - |
 
 #### Example
 
 ```csv
-CellName,SiteName,Latitude,Longitude,Bearing,MechanicalTilt,ElectricalTilt,Height,Band
-CK089L1,CK089,51.8932,-8.4567,120.0,2.0,4.0,25.0,1800
-CK089L2,CK089,51.8932,-8.4567,240.0,2.0,3.0,25.0,800
-CK089L3,CK089,51.8932,-8.4567,0.0,2.0,5.0,25.0,2100
-CK090L1,CK090,51.9012,-8.4234,90.0,3.0,2.0,30.0,1800
+CellName,SiteName,Latitude,Longitude,Bearing,MechanicalTilt,ElectricalTilt,Height,Band,uarfcn,cell_type
+CK089L1,CK089,51.8932,-8.4567,120.0,2.0,4.0,25.0,1800,1450,Outdoor
+CK089L2,CK089,51.8932,-8.4567,240.0,2.0,3.0,25.0,800,6300,Outdoor
+CK089L3,CK089,51.8932,-8.4567,0.0,2.0,5.0,25.0,2100,9360,Outdoor
+CK090L1,CK090,51.9012,-8.4234,90.0,3.0,2.0,30.0,1800,1450,Indoor
 ```
 
 #### Bearing Reference
@@ -277,7 +325,154 @@ POLYGON((
 
 ---
 
-### Input File 4: Boundary Shapefile
+### Input File 4: Cell Impacts Data
+
+**Filename:** `cell_impacts.csv` (operator-specific)
+
+#### Purpose
+
+Contains cell-to-cell relationship data including traffic handovers, interference patterns, and neighbor relationships. Used for advanced interference detection, carrier aggregation imbalance analysis, PCI conflict detection, and crossed feeder identification.
+
+#### Data Sources
+
+| Source | Description | Update Frequency |
+|--------|-------------|------------------|
+| OSS/NMS | Cell configuration and relationships | Daily |
+| PM Counters | Traffic volumes, handover statistics | Hourly |
+| CDR/XDR | Call detail records, event data | Real-time |
+
+#### Complete Schema (58 Fields)
+
+##### Identity & Relationship Fields
+
+| Column | Data Type | Required | Description | Example |
+|--------|-----------|----------|-------------|---------|
+| `cell_name` | String | Yes | Source cell name | `CK093K3` |
+| `cell` | String | Yes | Source cell identifier | `CK093_3` |
+| `site` | String | Yes | Source site identifier | `CK093` |
+| `cell_impact_name` | String | Yes | Target cell name | `CK652L1` |
+| `impact_cell` | String | Yes | Target cell identifier | `CK652_1` |
+| `impact_site` | String | Yes | Target site identifier | `CK652` |
+| `co_sectored` | String | Yes | Same cell ID? (Y/N) | `N` |
+| `co_site` | String | Yes | Same site? (Y/N) | `N` |
+| `neighbor_relation` | String | Yes | Defined neighbor? (Y/N/N/A) | `N` |
+
+##### RF Configuration Fields
+
+| Column | Data Type | Required | Description | Example | Valid Range |
+|--------|-----------|----------|-------------|---------|-------------|
+| `cell_tech` | String | Yes | Source cell technology | `LTE` | LTE, UMTS, GSM |
+| `cell_band` | String | Yes | Source frequency band | `L700` | L700, L800, L1800, L2100, U900, G900 |
+| `cell_pci` | Integer | Yes | Source Physical Cell ID | `12` | 0-503 (LTE), N/A (2G/3G) |
+| `cell_mech_tilt` | Float | Yes | Source mechanical tilt (°) | `0` | 0-15 |
+| `cell_elec_tilt` | Float | Yes | Source electrical tilt (°) | `0` | 0-15 |
+| `cell_impact_tech` | String | Yes | Target cell technology | `LTE` | LTE, UMTS, GSM |
+| `cell_impact_band` | String | Yes | Target frequency band | `L800` | L700, L800, L1800, L2100, U900, G900 |
+| `cell_impact_pci` | Integer | Yes | Target Physical Cell ID | `205` | 0-503 (LTE), N/A (2G/3G) |
+| `cell_impact_mech_tilt` | Float | Yes | Target mechanical tilt (°) | `0` | 0-15 |
+| `cell_impact_elec_tilt` | Float | Yes | Target electrical tilt (°) | `4` | 0-15 |
+
+##### Technology Indicator Fields
+
+| Column | Data Type | Required | Description | Example |
+|--------|-----------|----------|-------------|---------|
+| `lte_on_cell` | String | Yes | LTE enabled on source? | `Y` |
+| `lte_on_impact_cell` | String | Yes | LTE enabled on target? | `Y` |
+| `gsm_on_cell` | String | Yes | GSM enabled on source? | `Y` |
+| `gsm_on_impact_cell` | String | Yes | GSM enabled on target? | `Y` |
+| `umts_on_cell` | String | Yes | UMTS enabled on source? | `Y` |
+| `umts_on_impact_cell` | String | Yes | UMTS enabled on target? | `Y` |
+| `nsa_on_cell` | String | Yes | NSA (5G) enabled on source? | `N` |
+| `nsa_on_impact_cell` | String | Yes | NSA (5G) enabled on target? | `N` |
+| `sa_on_cell` | String | Yes | SA (5G) enabled on source? | `N` |
+| `sa_on_impact_cell` | String | Yes | SA (5G) enabled on target? | `N` |
+
+##### Traffic & Performance Fields - Data
+
+| Column | Data Type | Required | Description | Example | Unit |
+|--------|-----------|----------|-------------|---------|------|
+| `traffic_data` | Integer | Yes | Data traffic on this relation | `5` | Events |
+| `total_cell_traffic_data` | Integer | Yes | Total data traffic on source cell | `1166` | Events |
+| `relation_impact_data_perc` | Float | Yes | Relation data as % of cell total | `0.43` | % |
+| `total_cell_traffic_data_lte` | Integer | Yes | LTE data traffic on source | `74` | Events |
+| `total_lte_impact_data_perc` | Float | Yes | LTE data as % of cell total | `6.35` | % |
+| `total_cell_traffic_data_umts` | Integer | Yes | UMTS data traffic on source | `541` | Events |
+| `total_UMTS_impact_data_perc` | Float | Yes | UMTS data as % of cell total | `46.4` | % |
+| `total_cell_traffic_data_gsm` | Integer | Yes | GSM data traffic on source | `551` | Events |
+| `total_gsm_impact_data_perc` | Float | Yes | GSM data as % of cell total | `47.26` | % |
+
+##### Traffic & Performance Fields - Voice
+
+| Column | Data Type | Required | Description | Example | Unit |
+|--------|-----------|----------|-------------|---------|------|
+| `traffic_voice` | Integer | Yes | Voice traffic on this relation | `1` | Events |
+| `total_cell_traffic_voice` | Integer | Yes | Total voice traffic on source cell | `20` | Events |
+| `relation_impact_voice_perc` | Float | Yes | Relation voice as % of cell total | `5` | % |
+| `total_cell_traffic_voice_lte` | Integer | Yes | LTE voice traffic on source | `13` | Events |
+| `total_LTE_impact_voice_perc` | Float | Yes | LTE voice as % of cell total | `65` | % |
+| `total_cell_traffic_voice_umts` | Integer | Yes | UMTS voice traffic on source | `2` | Events |
+| `total_umts_impact_voice_perc` | Float | Yes | UMTS voice as % of cell total | `10` | % |
+| `total_cell_traffic_voice_gsm` | Integer | Yes | GSM voice traffic on source | `5` | Events |
+| `total_gsm_impact_voice_perc` | Float | Yes | GSM voice as % of cell total | `25` | % |
+
+##### Performance Quality Fields
+
+| Column | Data Type | Required | Description | Example | Unit |
+|--------|-----------|----------|-------------|---------|------|
+| `drops_voice` | Integer | Yes | Voice call drops on relation | `0` | Drops |
+| `impact_time` | Integer | Yes | Total impact duration | `98` | Seconds |
+| `drop_impact_time` | Integer | Yes | Drop impact duration | `0` | Seconds |
+| `events_of_impact_duration_on_cell_b` | Integer | Yes | Impact events on target cell | `2` | Events |
+
+##### Geographic Fields
+
+| Column | Data Type | Required | Description | Example | Valid Range |
+|--------|-----------|----------|-------------|---------|-------------|
+| `cell_lat` | Float | Yes | Source cell latitude | `51.558639` | -90 to +90 |
+| `cell_lon` | Float | Yes | Source cell longitude | `-9.540553` | -180 to +180 |
+| `cell_impact_lat` | Float | Yes | Target cell latitude | `51.5043459` | -90 to +90 |
+| `cell_impact_lon` | Float | Yes | Target cell longitude | `-9.741992441` | -180 to +180 |
+| `distance` | Float | Yes | Distance between cells (m) | `15190.47082` | ≥ 0 |
+| `max_neigh_distance` | Float | Yes | Max distance to any neighbor (m) | `4776.085258` | ≥ 0 |
+| `median_neigh_distance` | Float | Yes | Median neighbor distance (m) | `4776.085258` | ≥ 0 |
+| `cell_search_radius` | Float | Yes | Cell coverage search radius (m) | `4776.085258` | ≥ 0 |
+
+##### Administrative Fields
+
+| Column | Data Type | Required | Description | Example |
+|--------|-----------|----------|-------------|---------|
+| `market` | String | Yes | Market/region identifier | `Cork` |
+| `vendor` | String | Yes | Equipment vendor | `ERICSSON` |
+
+#### Usage by Algorithm
+
+| Algorithm | Key Fields Used | Purpose |
+|-----------|----------------|---------|
+| **CA Imbalance Detection** | `cell_band`, `cell_impact_band`, `traffic_data`, `total_cell_traffic_data_lte`, `co_site`, `distance` | Identifies unbalanced traffic between carrier bands at same site |
+| **PCI Conflict Detection** | `cell_pci`, `cell_impact_pci`, `cell_band`, `cell_impact_band`, `distance`, `co_site` | Detects PCI collisions, mod3/mod30 conflicts within interference range |
+| **Crossed Feeder Detection** | `cell_name`, `cell_impact_name`, `bearing`, `distance`, `traffic_data`, `co_site` | Identifies physically swapped antenna connections |
+| **Interference Analysis** | `traffic_data`, `traffic_voice`, `drops_voice`, `distance`, `cell_band`, `cell_impact_band` | Quantifies inter-cell interference impact |
+| **Neighbor Optimization** | `neighbor_relation`, `traffic_data`, `distance`, `max_neigh_distance`, `median_neigh_distance` | Optimizes neighbor list definitions |
+
+#### Data Quality Notes
+
+1. **Technology Indicators**: All technology flags (lte_on_cell, gsm_on_cell, etc.) use Y/N values
+2. **Missing PCIs**: GSM and UMTS cells have `N/A` for PCI fields (LTE-only parameter)
+3. **Percentage Fields**: All percentage fields are in decimal format (0.43 = 0.43%, not 43%)
+4. **Distance Calculations**: All distances use Haversine formula on WGS84 coordinates
+5. **Traffic Volumes**: Traffic counts represent aggregated events over collection period (typically 24 hours)
+
+#### Example
+
+```csv
+cell_name,cell,site,cell_tech,cell_band,cell_pci,lte_on_cell,cell_mech_tilt,cell_elec_tilt,cell_impact_name,impact_cell,impact_site,cell_impact_tech,cell_impact_band,cell_impact_pci,lte_on_impact_cell,cell_impact_mech_tilt,cell_impact_elec_tilt,co_sectored,co_site,neighbor_relation,traffic_data,total_cell_traffic_data,relation_impact_data_perc,cell_lat,cell_lon,cell_impact_lat,cell_impact_lon,distance,vendor
+CK093K3,CK093_3,CK093,LTE,L700,12,Y,0,0,CK652L1,CK652_1,CK652,LTE,L800,205,Y,0,4,N,N,N,5,1166,0.43,51.558639,-9.540553,51.5043459,-9.741992441,15190.47082,ERICSSON
+CK366K1,CK366_1,CK366,LTE,L700,354,Y,0,6,CK366S1,CK366_1,CK366,GSM,G900,N/A,Y,0,6,Y,Y,N/A,153,700,21.86,51.91169478,-8.277230183,51.91169478,-8.277230183,0,ERICSSON
+```
+
+---
+
+### Input File 5: Boundary Shapefile
 
 **Directory:** `county_bounds/` (configurable)
 
