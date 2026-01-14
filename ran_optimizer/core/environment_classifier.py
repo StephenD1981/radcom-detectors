@@ -301,7 +301,21 @@ def load_or_create_cell_environments(
         logger.info(f"Loading existing cell environments from {output_path}")
         env_df = pd.read_csv(output_path)
         env_df['cell_name'] = env_df['cell_name'].astype(str)
-        return env_df
+
+        # Check if all cells in gis_df are present in cached file
+        gis_cells = set(gis_df['cell_name'].astype(str).unique())
+        cached_cells = set(env_df['cell_name'].unique())
+        missing_cells = gis_cells - cached_cells
+
+        if missing_cells:
+            logger.info(
+                f"Found {len(missing_cells)} new cells not in cached environment file - regenerating",
+                new_cells=len(missing_cells),
+                sample=list(missing_cells)[:5]
+            )
+            # Fall through to regenerate
+        else:
+            return env_df
 
     logger.info("Creating new cell environment classification")
     return classify_cell_environments(gis_df, output_path=output_path)

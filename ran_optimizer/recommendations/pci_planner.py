@@ -779,11 +779,13 @@ class PCIPlanner:
                 conflict_type = "exact"
                 severity_factor = 1.0
             # Check for mod 3 conflict (PSS interference) per TS 36.211 Section 6.11
-            elif check_mod3 and (pa % 3 == pb % 3):
+            # NOTE: Mod 3 only applies to INTRA-SITE cells (co-located cells cause PSS interference)
+            elif check_mod3 and is_intra_site and (pa % 3 == pb % 3):
                 conflict_type = "mod3"
                 severity_factor = self.params.mod3_severity_factor
             # Check for mod 30 conflict (RS interference) per TS 36.211 Section 6.10
-            elif check_mod30 and (pa % 30 == pb % 30):
+            # NOTE: Mod 30 only applies to INTRA-SITE cells (co-located cells cause RS interference)
+            elif check_mod30 and is_intra_site and (pa % 30 == pb % 30):
                 conflict_type = "mod30"
                 severity_factor = self.params.mod30_severity_factor
 

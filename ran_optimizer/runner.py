@@ -80,6 +80,7 @@ from ran_optimizer.recommendations.daily_resolution import (
     generate_daily_resolution_recommendations,
     DailyResolutionConfig,
 )
+from ran_optimizer.outputs.pg_tables_generator import PGTablesGenerator
 
 logger = get_logger(__name__)
 
@@ -647,6 +648,10 @@ def run_pci_conflict(
             hulls_enriched['pci'] = hulls_enriched['cell_name'].map(gis_lookup['pci'].to_dict())
             logger.info("Enriched hulls with PCI info from GIS data")
 
+        if 'site' not in hulls_enriched.columns and 'site' in gis_df.columns:
+            hulls_enriched['site'] = hulls_enriched['cell_name'].map(gis_lookup['site'].to_dict())
+            logger.info("Enriched hulls with site info from GIS data")
+
     # Drop rows without required info
     before_count = len(hulls_enriched)
     hulls_enriched = hulls_enriched.dropna(subset=['band', 'pci'])
@@ -1023,6 +1028,38 @@ def run_all(
             )
         except Exception as e:
             logger.warning("Failed to generate daily recommendations", error=str(e))
+
+    # Generate PostgreSQL-ready output tables
+    logger.info("=" * 80)
+    logger.info("Generating PostgreSQL-ready output tables")
+    logger.info("=" * 80)
+
+    try:
+        pg_generator = PGTablesGenerator(
+            output_dir=str(output_dir),
+            cell_gis_df=gis_df,
+            cell_coverage_df=grid_df,
+            cell_impacts_df=relations_df,
+        )
+
+        pg_results = pg_generator.generate_all(
+            overshooting_df=results.get('overshooting'),
+            undershooting_df=results.get('undershooting'),
+            overshooting_grids_df=overshooting_grids,
+            undershooting_grids_df=interference_grids,
+            pci_collisions_df=results.get('collisions'),
+            pci_confusions_df=results.get('confusions'),
+            pci_blacklist_df=results.get('blacklist_suggestions'),
+        )
+
+        results['pg_tables'] = pg_results
+        logger.info(
+            "PostgreSQL tables generated",
+            files=len(pg_results),
+            total_records=sum(len(df) for df in pg_results.values()),
+        )
+    except Exception as e:
+        logger.warning("Failed to generate PostgreSQL tables", error=str(e))
 
     # Generate visualization
     logger.info("=" * 80)

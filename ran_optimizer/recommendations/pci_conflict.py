@@ -76,7 +76,7 @@ class PCIConflictParams:
     })
     # Same-site filtering
     filter_same_site: bool = True  # Filter out same-site cell pairs (expected overlap)
-    site_id_column: str = 'site_id'  # Column name for site identifier
+    site_id_column: str = 'site'  # Column name for site identifier
     # Mod 3/30 interference detection (3GPP TS 36.211)
     check_mod3_conflicts: bool = True  # Check PCI mod 3 (PSS interference)
     check_mod30_conflicts: bool = False  # Check PCI mod 30 (RS interference) - optional
@@ -109,7 +109,7 @@ class PCIConflictParams:
                 min_overlap_area_km2=float(config.get('min_overlap_area_km2', 0.0005)),
                 severity_thresholds=config.get('severity_thresholds', cls().severity_thresholds),
                 filter_same_site=bool(config.get('filter_same_site', True)),
-                site_id_column=str(config.get('site_id_column', 'site_id')),
+                site_id_column=str(config.get('site_id_column', 'site')),
                 check_mod3_conflicts=bool(config.get('check_mod3_conflicts', True)),
                 check_mod30_conflicts=bool(config.get('check_mod30_conflicts', False)),
                 mod3_overlap_threshold=float(config.get('mod3_overlap_threshold', 0.30)),
@@ -499,12 +499,23 @@ class PCIConflictDetector:
 
                     cell2 = cells.iloc[other_idx]
 
-                    # Skip same-site pairs if filtering enabled
-                    if self.params.filter_same_site and has_site_id:
+                    # Site filtering logic depends on conflict type:
+                    # - EXACT collisions: Skip same-site pairs (they're managed together)
+                    # - MOD3/MOD30 conflicts: ONLY same-site pairs (intra-site interference)
+                    if has_site_id:
                         site1 = cell1.get(self.params.site_id_column)
                         site2 = cell2.get(self.params.site_id_column)
-                        if site1 and site2 and site1 == site2:
-                            continue
+                        is_same_site = site1 and site2 and site1 == site2
+
+                        if conflict_type == 'exact':
+                            # For exact collisions, skip same-site if filtering enabled
+                            if self.params.filter_same_site and is_same_site:
+                                continue
+                        else:
+                            # For mod3/mod30 conflicts, ONLY include same-site pairs
+                            # (PSS/RS interference only matters for co-located cells)
+                            if not is_same_site:
+                                continue
 
                     # For mod conflicts, skip if exact PCI match (already counted)
                     if exclude_exact_pci and cell1['pci'] == cell2['pci']:
