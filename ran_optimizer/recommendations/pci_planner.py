@@ -21,7 +21,7 @@ Key Features:
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Tuple, Set, Optional, Any
 
 import numpy as np
@@ -203,6 +203,9 @@ class PCIPlannerParams:
     # Output filtering
     include_mod3_inter_site: bool = False  # If True, include inter-site mod3 in filtered output
 
+    # PCI ignore list (for excluding placeholder PCIs like 0 from collision detection)
+    ignore_pcis: List[int] = field(default_factory=list)
+
     # Severity thresholds (0-1 scale, matching other detectors)
     severity_threshold_critical: float = 0.80
     severity_threshold_high: float = 0.60
@@ -254,6 +257,7 @@ class PCIPlannerParams:
                 mod30_severity_factor=float(params.get('mod30_severity_factor', 0.3)),
                 validate_pci_range=bool(params.get('validate_pci_range', True)),
                 include_mod3_inter_site=bool(params.get('include_mod3_inter_site', False)),
+                ignore_pcis=list(params.get('ignore_pcis', [])),
                 severity_threshold_critical=float(params.get('severity_threshold_critical', 0.80)),
                 severity_threshold_high=float(params.get('severity_threshold_high', 0.60)),
                 severity_threshold_medium=float(params.get('severity_threshold_medium', 0.40)),
@@ -330,6 +334,8 @@ class PCIPlanner:
         # Edge attributes
         self.intra_site_edge: Dict[Tuple[str, str], bool] = {}
         self.distance_m: Dict[Tuple[str, str], float] = {}
+        self.neighbor_relation_edge: Dict[Tuple[str, str], str] = {}  # 'Y', 'N', or 'N/A'
+        self.has_neighbor_relation_data: bool = False  # True if dataset has actual neighbor info
 
         # Cell attributes
         self.band_of: Dict[str, str] = {}
@@ -378,6 +384,27 @@ class PCIPlanner:
             df["intra_cell"] = "n"
 
         df["distance"] = pd.to_numeric(df.get("distance", 0.0), errors="coerce").fillna(0.0)
+
+        # Process neighbor_relation column
+        if "neighbor_relation" in df.columns:
+            df["neighbor_relation"] = df["neighbor_relation"].fillna("N/A").astype(str).str.strip().str.upper()
+            # Normalize Y/YES/TRUE/1 -> Y, N/NO/FALSE/0 -> N, everything else -> N/A
+            df["neighbor_relation"] = df["neighbor_relation"].apply(
+                lambda x: "Y" if x in ["Y", "YES", "TRUE", "1"] else ("N" if x in ["N", "NO", "FALSE", "0"] else "N/A")
+            )
+            # Check if we have actual neighbor relation data (not all N/A)
+            unique_relations = set(df["neighbor_relation"].unique())
+            self.has_neighbor_relation_data = bool(unique_relations - {"N/A"})
+            if self.has_neighbor_relation_data:
+                y_count = (df["neighbor_relation"] == "Y").sum()
+                n_count = (df["neighbor_relation"] == "N").sum()
+                na_count = (df["neighbor_relation"] == "N/A").sum()
+                logger.info("neighbor_relation_data_found", y_count=y_count, n_count=n_count, na_count=na_count)
+            else:
+                logger.info("neighbor_relation_data_not_available", note="All relations are N/A, blacklist suggestions will use impact relations")
+        else:
+            df["neighbor_relation"] = "N/A"
+            self.has_neighbor_relation_data = False
 
         # Build co-sector groups BEFORE removing intra_cell rows
         if self.params.couple_cosectors:
@@ -504,6 +531,14 @@ class PCIPlanner:
                 edge_attrs["distance"]
             )
         }
+        self.neighbor_relation_edge = {
+            (str(s), str(n)): rel
+            for s, n, rel in zip(
+                edge_attrs["cell_name"],
+                edge_attrs["to_cell_name"],
+                edge_attrs["neighbor_relation"]
+            )
+        }
 
         # Compute directed in_ho and act_ho
         for (S, N), out in self.out_ho.items():
@@ -547,6 +582,9 @@ class PCIPlanner:
         # 1-hop pairs (direct neighbors)
         w1: Dict[Tuple[str, str], float] = {}
         for (S, N), out in self.out_ho.items():
+            # Skip self-referential pairs (invalid data where cell is its own neighbor)
+            if S == N:
+                continue
             if (S, N) in self.blacklisted:
                 continue
 
@@ -637,7 +675,8 @@ class PCIPlanner:
                     continue
                 p = self.cell_pci.get(N, -1)
                 band_N = self.band_of.get(N, "")
-                if p >= 0 and band_N:
+                # Skip invalid PCIs and PCIs in ignore list
+                if p >= 0 and band_N and p not in self.params.ignore_pcis:
                     groups.setdefault((p, band_N), []).append(N)
 
             # Find confusions (2+ neighbors with same PCI on same band)
@@ -751,10 +790,17 @@ class PCIPlanner:
         check_mod30 = self.params.detect_mod30_conflicts
 
         for (a, b), w in self.pair_w.items():
+            # Skip self-pairs (defensive check - should not occur)
+            if a == b:
+                continue
             pa = self.cell_pci.get(a, -1)
             pb = self.cell_pci.get(b, -2)
             band_a = self.band_of.get(a, "")
             band_b = self.band_of.get(b, "")
+
+            # Skip PCIs in ignore list (e.g., PCI 0 used as placeholder for unconfigured cells)
+            if pa in self.params.ignore_pcis or pb in self.params.ignore_pcis:
+                continue
 
             # Skip invalid PCIs or different bands
             if pa < 0 or pb < 0:
@@ -962,7 +1008,8 @@ class PCIPlanner:
                     continue
                 p = self.cell_pci.get(N, -1)
                 band_N = self.band_of.get(N, "")
-                if p >= 0 and band_N:
+                # Skip invalid PCIs and PCIs in ignore list
+                if p >= 0 and band_N and p not in self.params.ignore_pcis:
                     groups.setdefault((p, band_N), []).append(N)
 
             # Process confusions only (2+ neighbors with same PCI on same band)
@@ -1007,6 +1054,15 @@ class PCIPlanner:
                             remaining_active_neighbors_after=remain_active
                         ))
                         continue
+
+                    # SKIP: Not a configured neighbor (only when we have neighbor relation data)
+                    # If all relations are N/A, we use impact relations as a proxy for potential neighbors
+                    # If we have actual Y/N data, only consider blacklisting actual neighbors (Y)
+                    if self.has_neighbor_relation_data:
+                        neighbor_rel = self.neighbor_relation_edge.get((S, N), "N/A")
+                        if neighbor_rel != "Y":
+                            # Skip silently - not a configured neighbor, nothing to blacklist
+                            continue
 
                     # REJECT: Would leave too few neighbors
                     if remain_active < self.K:

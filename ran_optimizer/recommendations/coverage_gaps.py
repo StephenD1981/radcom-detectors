@@ -18,8 +18,11 @@ Based on notebook: tilt-optimisation-low-coverage.ipynb
 """
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional, Set, List, Dict
+from typing import Optional, Set, List, Dict, Tuple
 import json
+import os
+from concurrent.futures import ProcessPoolExecutor, as_completed
+import multiprocessing
 
 import pandas as pd
 import geopandas as gpd
@@ -84,6 +87,148 @@ MIN_SAMPLE_COUNT_BY_ENV = {
 }
 
 
+# =============================================================================
+# Parallel Processing Helper Functions (module-level for pickling)
+# =============================================================================
+
+def _process_kring_batch(
+    batch: List[str],
+    gap_geohashes_frozen: frozenset,
+    k_ring_steps: int,
+    min_missing_neighbors: int
+) -> List[Dict]:
+    """
+    Process a batch of geohashes for k-ring density (no coverage detection).
+
+    This function is at module level to allow pickling for multiprocessing.
+
+    Args:
+        batch: List of geohash strings to process
+        gap_geohashes_frozen: Frozenset of all gap geohashes (for membership testing)
+        k_ring_steps: Number of neighbor steps for k-ring
+        min_missing_neighbors: Minimum missing neighbors to be considered dense
+
+    Returns:
+        List of record dicts for geohashes that pass the density filter
+    """
+    records = []
+    for gh in batch:
+        # Get k-ring neighbors
+        kring_set = geohash_utils.kring(gh, k_ring_steps)
+
+        # Count how many are also gaps
+        missing_count = len(kring_set & gap_geohashes_frozen) - 1  # Exclude self
+
+        # Only keep if dense enough
+        if missing_count >= min_missing_neighbors:
+            lat, lon = geohash_utils.decode(gh)
+            records.append({
+                'grid': gh,
+                'latitude': lat,
+                'longitude': lon,
+                f'missing_within_{k_ring_steps}_steps': missing_count
+            })
+    return records
+
+
+def _process_kring_batch_low_coverage(
+    batch: List[str],
+    good_coverage_frozen: frozenset,
+    all_measured_frozen: frozenset,
+    low_rsrp_frozen: frozenset,
+    k: int,
+    min_problematic: int,
+    min_measured_absolute: int,
+    min_measured_pct: float,
+    min_low_rsrp_evidence_absolute: int,
+    min_low_rsrp_evidence_pct: float
+) -> List[Dict]:
+    """
+    Process a batch of geohashes for k-ring density (low coverage detection).
+
+    This function is at module level to allow pickling for multiprocessing.
+
+    Args:
+        batch: List of geohash strings to process
+        good_coverage_frozen: Frozenset of geohashes with good coverage
+        all_measured_frozen: Frozenset of all measured geohashes
+        low_rsrp_frozen: Frozenset of geohashes with low RSRP
+        k: K-ring steps
+        min_problematic: Minimum problematic neighbors required
+        min_measured_absolute: Minimum measured neighbors required (absolute)
+        min_measured_pct: Minimum measured neighbors required (percentage)
+        min_low_rsrp_evidence_absolute: Minimum low RSRP neighbors for evidence (absolute)
+        min_low_rsrp_evidence_pct: Minimum low RSRP neighbors for evidence (percentage)
+
+    Returns:
+        List of record dicts for geohashes that pass the density filter
+    """
+    records = []
+    total_neighbors = (2 * k + 1) ** 2  # e.g., 49 for k=3
+
+    for gh in batch:
+        # Get all k-ring neighbors
+        kring_set = geohash_utils.kring(gh, k)
+
+        # Count neighbors with GOOD coverage
+        good_neighbors = sum(1 for n in kring_set if n in good_coverage_frozen)
+
+        # Count neighbors with ANY measurements
+        measured_neighbors = sum(1 for n in kring_set if n in all_measured_frozen)
+
+        # Count neighbors with LOW coverage (measured but poor RSRP)
+        low_rsrp_neighbors = sum(1 for n in kring_set if n in low_rsrp_frozen)
+
+        # No-data neighbors = total - measured
+        no_data_neighbors = total_neighbors - measured_neighbors
+
+        # Problematic neighbors = total - good
+        problematic_neighbors = total_neighbors - good_neighbors
+
+        # Calculate thresholds
+        min_measured = max(min_measured_absolute, int(total_neighbors * min_measured_pct))
+        min_low_rsrp = max(min_low_rsrp_evidence_absolute, int(min_problematic * min_low_rsrp_evidence_pct))
+
+        # Check evidence conditions
+        has_sufficient_measurements = measured_neighbors >= min_measured
+        has_low_rsrp_evidence = low_rsrp_neighbors >= min_low_rsrp
+
+        # Keep if: enough problematic neighbors AND (sufficient measurements OR low-RSRP evidence)
+        if problematic_neighbors >= min_problematic:
+            if has_sufficient_measurements or has_low_rsrp_evidence:
+                lat, lon = geohash_utils.decode(gh)
+                records.append({
+                    'grid': gh,
+                    'latitude': lat,
+                    'longitude': lon,
+                    'problematic_neighbors': problematic_neighbors,
+                    'low_rsrp_neighbors': low_rsrp_neighbors,
+                    'no_data_neighbors': no_data_neighbors,
+                    'measured_neighbors': measured_neighbors
+                })
+
+    return records
+
+
+def _get_worker_count(parallel_workers: int) -> int:
+    """
+    Determine the number of worker processes to use.
+
+    Args:
+        parallel_workers: Configuration value (0=auto, -1=disabled, >0=explicit count)
+
+    Returns:
+        Number of workers to use, or 0 if parallel processing is disabled
+    """
+    if parallel_workers == -1:
+        return 0  # Disabled
+    elif parallel_workers == 0:
+        # Auto: use CPU count, but cap at 8 to avoid memory issues
+        return min(multiprocessing.cpu_count(), 8)
+    else:
+        return parallel_workers
+
+
 @dataclass
 class CoverageGapParams:
     """
@@ -111,6 +256,7 @@ class CoverageGapParams:
     alpha_shape_alpha: Optional[float] = None  # None = auto
     k_nearest_cells: int = 5
     max_alphashape_points: int = 5000  # Subsample for performance
+    parallel_workers: int = 0  # 0 = auto (use CPU count), -1 = disable parallel processing
 
     @classmethod
     def from_config(cls, config_path: Optional[Path] = None, environment: str = "default"):
@@ -221,6 +367,9 @@ class LowCoverageParams:
     rsrp_min_dbm: float = -140
     rsrp_max_dbm: float = -30
     min_sample_count: int = 5  # Minimum samples per geohash to reduce single-measurement noise
+
+    # Parallel processing
+    parallel_workers: int = 0  # 0 = auto (use CPU count), -1 = disable parallel processing
 
     # Severity scoring weights
     severity_weight_area: float = 0.30
@@ -427,6 +576,8 @@ class GapDetectorBase:
         """
         Compute k-ring density and filter to dense gaps.
 
+        Uses parallel processing when enabled (parallel_workers != -1) for significant speedup.
+
         Args:
             gap_geohashes: Set of gap geohash strings
             k_ring_steps: Number of neighbor steps for k-ring
@@ -435,30 +586,72 @@ class GapDetectorBase:
         Returns:
             DataFrame with dense gap geohashes and their coordinates
         """
-        records = []
         total = len(gap_geohashes)
+        num_workers = _get_worker_count(self.params.parallel_workers)
 
-        logger.info("computing_kring_density", total_geohashes=total, k=k_ring_steps)
+        logger.info("computing_kring_density", total_geohashes=total, k=k_ring_steps, parallel_workers=num_workers)
 
-        for idx, gh in enumerate(gap_geohashes):
-            if idx > 0 and idx % 10000 == 0:
-                logger.info("kring_progress", processed=idx, total=total, percent=f"{100*idx/total:.1f}%")
+        # Convert to list for batching and frozenset for efficient membership testing
+        geohash_list = list(gap_geohashes)
+        gap_geohashes_frozen = frozenset(gap_geohashes)
 
-            # Get k-ring neighbors
-            kring_set = geohash_utils.kring(gh, k_ring_steps)
+        if num_workers > 0 and total > 1000:
+            # Parallel processing for large datasets
+            batch_size = max(500, total // (num_workers * 4))  # ~4 batches per worker
+            batches = [geohash_list[i:i + batch_size] for i in range(0, total, batch_size)]
 
-            # Count how many are also gaps
-            missing_count = len(kring_set & gap_geohashes) - 1  # Exclude self
+            logger.info("kring_parallel_start", batches=len(batches), batch_size=batch_size, workers=num_workers)
 
-            # Only keep if dense enough
-            if missing_count >= min_missing_neighbors:
-                lat, lon = geohash_utils.decode(gh)
-                records.append({
-                    'grid': gh,
-                    'latitude': lat,
-                    'longitude': lon,
-                    f'missing_within_{k_ring_steps}_steps': missing_count
-                })
+            all_records = []
+            completed_batches = 0
+
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                futures = {
+                    executor.submit(
+                        _process_kring_batch,
+                        batch,
+                        gap_geohashes_frozen,
+                        k_ring_steps,
+                        min_missing_neighbors
+                    ): i for i, batch in enumerate(batches)
+                }
+
+                for future in as_completed(futures):
+                    try:
+                        records = future.result()
+                        all_records.extend(records)
+                        completed_batches += 1
+                        if completed_batches % max(1, len(batches) // 4) == 0:
+                            logger.info("kring_parallel_progress",
+                                       completed=completed_batches,
+                                       total_batches=len(batches),
+                                       percent=f"{100*completed_batches/len(batches):.1f}%")
+                    except Exception as e:
+                        logger.warning("kring_batch_failed", batch_idx=futures[future], error=str(e))
+
+            records = all_records
+        else:
+            # Sequential processing (fallback or small datasets)
+            records = []
+            for idx, gh in enumerate(geohash_list):
+                if idx > 0 and idx % 10000 == 0:
+                    logger.info("kring_progress", processed=idx, total=total, percent=f"{100*idx/total:.1f}%")
+
+                # Get k-ring neighbors
+                kring_set = geohash_utils.kring(gh, k_ring_steps)
+
+                # Count how many are also gaps
+                missing_count = len(kring_set & gap_geohashes_frozen) - 1  # Exclude self
+
+                # Only keep if dense enough
+                if missing_count >= min_missing_neighbors:
+                    lat, lon = geohash_utils.decode(gh)
+                    records.append({
+                        'grid': gh,
+                        'latitude': lat,
+                        'longitude': lon,
+                        f'missing_within_{k_ring_steps}_steps': missing_count
+                    })
 
         df = pd.DataFrame(records)
 
@@ -564,8 +757,33 @@ class GapDetectorBase:
                 points = [Point(lon, lat) for lon, lat in coords]
                 alpha_shape = gpd.GeoSeries(points).unary_union.convex_hull
 
+            # Skip non-polygon geometries (LineString, Point) - these occur when points are collinear
+            if alpha_shape.geom_type in ('Point', 'MultiPoint', 'LineString', 'MultiLineString'):
+                logger.info("skipping_non_polygon_cluster", cluster_id=cluster_id, geom_type=alpha_shape.geom_type)
+                continue
+
+            # Skip extremely thin polygons (geohash grid artifacts)
+            # These occur when coverage gaps align with geohash grid lines
+            # A single geohash7 cell is ~0.0041 deg wide, so filter anything narrower than ~0.5km
+            bounds = alpha_shape.bounds
+            width_deg = bounds[2] - bounds[0]
+            height_deg = bounds[3] - bounds[1]
+            min_dim = min(width_deg, height_deg)
+            max_dim = max(width_deg, height_deg)
+            aspect_ratio = max_dim / min_dim if min_dim > 0 else float('inf')
+            # Skip if: aspect ratio > 5 AND minimum dimension < 0.015 deg (~1.6km)
+            # This filters thin strips that are only 1-3 geohash cells wide
+            if aspect_ratio > 5 and min_dim < 0.015:
+                logger.info("skipping_thin_polygon_cluster", cluster_id=cluster_id, aspect_ratio=round(aspect_ratio, 1), min_dim_deg=round(min_dim, 4))
+                continue
+
             # Calculate area in km² using projected CRS
             area_km2 = self._calculate_area_km2(alpha_shape)
+
+            # Skip small polygons (< 1 km²) - likely noise or not actionable
+            if area_km2 < 1.0:
+                logger.info("skipping_small_polygon_cluster", cluster_id=cluster_id, area_km2=round(area_km2, 3))
+                continue
 
             cluster_records.append({
                 'cluster_id': int(cluster_id),
@@ -1850,8 +2068,31 @@ class LowCoverageDetector(GapDetectorBase):
                 points = [Point(lon, lat) for lon, lat in coords]
                 alpha_shape = gpd.GeoSeries(points).unary_union.convex_hull
 
+            # Skip non-polygon geometries (LineString, Point) - these occur when points are collinear
+            if alpha_shape.geom_type in ('Point', 'MultiPoint', 'LineString', 'MultiLineString'):
+                logger.info("skipping_non_polygon_cluster", cluster_id=cluster_id, geom_type=alpha_shape.geom_type)
+                continue
+
+            # Skip extremely thin polygons (geohash grid artifacts)
+            bounds = alpha_shape.bounds
+            width_deg = bounds[2] - bounds[0]
+            height_deg = bounds[3] - bounds[1]
+            min_dim = min(width_deg, height_deg)
+            max_dim = max(width_deg, height_deg)
+            aspect_ratio = max_dim / min_dim if min_dim > 0 else float('inf')
+            # Skip if: aspect ratio > 5 AND minimum dimension < 0.015 deg (~1.6km)
+            # This filters thin strips that are only 1-3 geohash cells wide
+            if aspect_ratio > 5 and min_dim < 0.015:
+                logger.info("skipping_thin_polygon_cluster", cluster_id=cluster_id, aspect_ratio=round(aspect_ratio, 1), min_dim_deg=round(min_dim, 4))
+                continue
+
             # Calculate area in km² using projected CRS
             area_km2 = self._calculate_area_km2(alpha_shape)
+
+            # Skip small polygons (< 1 km²) - likely noise or not actionable
+            if area_km2 < 1.0:
+                logger.info("skipping_small_polygon_cluster", cluster_id=cluster_id, area_km2=round(area_km2, 3))
+                continue
 
             # Get cell names for serving cells
             serving_cell_names = []
@@ -2141,6 +2382,8 @@ class LowCoverageDetector(GapDetectorBase):
         """
         Compute k-ring density for low coverage by counting neighbors with GOOD coverage.
 
+        Uses parallel processing when enabled (parallel_workers != -1) for significant speedup.
+
         For low coverage, we want dense clusters of poor coverage. We achieve this by:
         1. Counting neighbors with GOOD coverage (RSRP > threshold) on the same band
         2. Counting neighbors with ANY measurements (distinguishes no-data from low-RSRP)
@@ -2188,77 +2431,128 @@ class LowCoverageDetector(GapDetectorBase):
         # Low coverage geohashes = measured but RSRP <= threshold
         low_rsrp_geohashes = all_measured_geohashes - good_coverage_geohashes
 
+        total = len(geohashes)
+        num_workers = _get_worker_count(self.params.parallel_workers)
+
         logger.info(
             "computing_kring_density_low_coverage",
             k=k,
-            total_geohashes=len(geohashes),
+            total_geohashes=total,
             all_measured_geohashes=len(all_measured_geohashes),
             good_coverage_geohashes=len(good_coverage_geohashes),
             low_rsrp_geohashes=len(low_rsrp_geohashes),
-            band=band
+            band=band,
+            parallel_workers=num_workers
         )
 
-        records = []
+        # Convert to frozensets for efficient membership testing in parallel workers
+        good_coverage_frozen = frozenset(good_coverage_geohashes)
+        all_measured_frozen = frozenset(all_measured_geohashes)
+        low_rsrp_frozen = frozenset(low_rsrp_geohashes)
+        geohash_list = list(geohashes)
+
         total_neighbors = (2 * k + 1) ** 2  # e.g., 49 for k=3
 
-        for gh in geohashes:
-            # Get all k-ring neighbors
-            kring_set = geohash_utils.kring(gh, k)
+        if num_workers > 0 and total > 500:
+            # Parallel processing for larger datasets
+            batch_size = max(250, total // (num_workers * 4))
+            batches = [geohash_list[i:i + batch_size] for i in range(0, total, batch_size)]
 
-            # Count neighbors with GOOD coverage
-            good_neighbors = sum(1 for n in kring_set if n in good_coverage_geohashes)
+            logger.info("kring_low_coverage_parallel_start", batches=len(batches), batch_size=batch_size, workers=num_workers)
 
-            # Count neighbors with ANY measurements (telecom review fix #2)
-            measured_neighbors = sum(1 for n in kring_set if n in all_measured_geohashes)
+            all_records = []
+            completed_batches = 0
 
-            # Count neighbors with LOW coverage (measured but poor RSRP)
-            low_rsrp_neighbors = sum(1 for n in kring_set if n in low_rsrp_geohashes)
+            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                futures = {
+                    executor.submit(
+                        _process_kring_batch_low_coverage,
+                        batch,
+                        good_coverage_frozen,
+                        all_measured_frozen,
+                        low_rsrp_frozen,
+                        k,
+                        min_missing_neighbors,
+                        self.params.min_measured_neighbors_absolute,
+                        self.params.min_measured_neighbors_pct,
+                        self.params.min_low_rsrp_evidence_absolute,
+                        self.params.min_low_rsrp_evidence_pct
+                    ): i for i, batch in enumerate(batches)
+                }
 
-            # No-data neighbors = total - measured (sparse area, no users)
-            no_data_neighbors = total_neighbors - measured_neighbors
+                for future in as_completed(futures):
+                    try:
+                        records = future.result()
+                        all_records.extend(records)
+                        completed_batches += 1
+                        if completed_batches % max(1, len(batches) // 4) == 0:
+                            logger.info("kring_low_coverage_parallel_progress",
+                                       completed=completed_batches,
+                                       total_batches=len(batches),
+                                       percent=f"{100*completed_batches/len(batches):.1f}%")
+                    except Exception as e:
+                        logger.warning("kring_low_coverage_batch_failed", batch_idx=futures[future], error=str(e))
 
-            # Problematic neighbors = low_rsrp + no_data
-            problematic_neighbors = total_neighbors - good_neighbors
+            records = all_records
+        else:
+            # Sequential processing (fallback or small datasets)
+            records = []
+            for gh in geohash_list:
+                # Get all k-ring neighbors
+                kring_set = geohash_utils.kring(gh, k)
 
-            # TELECOM REVIEW FIX #2: For sparse rural areas, require at least some
-            # actual low-RSRP measurements to confirm it's a real coverage issue,
-            # not just lack of user data
-            # If most "problematic" neighbors are actually no-data, be more lenient
-            # (Telecom review: now using configurable thresholds from LowCoverageParams)
-            min_measured = max(
-                self.params.min_measured_neighbors_absolute,
-                int(total_neighbors * self.params.min_measured_neighbors_pct)
-            )
-            min_low_rsrp = max(
-                self.params.min_low_rsrp_evidence_absolute,
-                int(min_missing_neighbors * self.params.min_low_rsrp_evidence_pct)
-            )
-            has_sufficient_measurements = measured_neighbors >= min_measured
-            has_low_rsrp_evidence = low_rsrp_neighbors >= min_low_rsrp
+                # Count neighbors with GOOD coverage
+                good_neighbors = sum(1 for n in kring_set if n in good_coverage_geohashes)
 
-            # Keep if:
-            # 1. Enough problematic neighbors (dense low/no coverage area) AND
-            # 2. Either sufficient measurements exist OR we have low-RSRP evidence
-            if problematic_neighbors >= min_missing_neighbors:
-                if has_sufficient_measurements or has_low_rsrp_evidence:
-                    lat, lon = geohash_utils.decode(gh)
-                    records.append({
-                        'grid': gh,
-                        'latitude': lat,
-                        'longitude': lon,
-                        f'problematic_within_{k}_steps': problematic_neighbors,
-                        'low_rsrp_neighbors': low_rsrp_neighbors,
-                        'no_data_neighbors': no_data_neighbors,
-                        'measured_neighbors': measured_neighbors,
-                    })
+                # Count neighbors with ANY measurements (telecom review fix #2)
+                measured_neighbors = sum(1 for n in kring_set if n in all_measured_geohashes)
+
+                # Count neighbors with LOW coverage (measured but poor RSRP)
+                low_rsrp_neighbors = sum(1 for n in kring_set if n in low_rsrp_geohashes)
+
+                # No-data neighbors = total - measured (sparse area, no users)
+                no_data_neighbors = total_neighbors - measured_neighbors
+
+                # Problematic neighbors = low_rsrp + no_data
+                problematic_neighbors = total_neighbors - good_neighbors
+
+                # Calculate thresholds
+                min_measured = max(
+                    self.params.min_measured_neighbors_absolute,
+                    int(total_neighbors * self.params.min_measured_neighbors_pct)
+                )
+                min_low_rsrp = max(
+                    self.params.min_low_rsrp_evidence_absolute,
+                    int(min_missing_neighbors * self.params.min_low_rsrp_evidence_pct)
+                )
+                has_sufficient_measurements = measured_neighbors >= min_measured
+                has_low_rsrp_evidence = low_rsrp_neighbors >= min_low_rsrp
+
+                # Keep if: enough problematic neighbors AND (sufficient measurements OR low-RSRP evidence)
+                if problematic_neighbors >= min_missing_neighbors:
+                    if has_sufficient_measurements or has_low_rsrp_evidence:
+                        lat, lon = geohash_utils.decode(gh)
+                        records.append({
+                            'grid': gh,
+                            'latitude': lat,
+                            'longitude': lon,
+                            'problematic_neighbors': problematic_neighbors,
+                            'low_rsrp_neighbors': low_rsrp_neighbors,
+                            'no_data_neighbors': no_data_neighbors,
+                            'measured_neighbors': measured_neighbors,
+                        })
 
         df = pd.DataFrame(records)
+
+        # Rename column for consistency
+        if len(df) > 0 and 'problematic_neighbors' in df.columns:
+            df = df.rename(columns={'problematic_neighbors': f'problematic_within_{k}_steps'})
 
         if len(df) > 0:
             logger.info(
                 "kring_density_low_coverage_complete",
                 band=band,
-                input_geohashes=len(geohashes),
+                input_geohashes=total,
                 dense_gaps=len(df),
                 mean_problematic=df[f'problematic_within_{k}_steps'].mean(),
                 mean_low_rsrp_neighbors=df['low_rsrp_neighbors'].mean(),
