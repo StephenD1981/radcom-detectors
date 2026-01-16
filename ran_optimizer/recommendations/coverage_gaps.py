@@ -794,6 +794,14 @@ class GapDetectorBase:
                 'geometry': alpha_shape
             })
 
+        if not cluster_records:
+            logger.info("no_valid_cluster_polygons", note="All clusters filtered out or no clusters found")
+            return gpd.GeoDataFrame(
+                columns=['cluster_id', 'n_points', 'centroid_lat', 'centroid_lon', 'area_km2', 'geometry'],
+                geometry='geometry',
+                crs="EPSG:4326"
+            )
+
         gdf = gpd.GeoDataFrame(cluster_records, crs="EPSG:4326")
         logger.info("cluster_polygons_created", clusters=len(gdf))
 
