@@ -848,22 +848,20 @@ def _add_coverage_hulls_layers(
     """Add coverage hull layers split by band."""
     # Find columns
     name_col = 'cell_name' if 'cell_name' in hulls_gdf.columns else 'Name'
-    # Use cell_name as fallback for joining if cilac/CILAC not present
-    cilac_col = next((c for c in ['cilac', 'CILAC', 'cell_name'] if c in hulls_gdf.columns), 'cell_name')
     area_col = 'area_km2' if 'area_km2' in hulls_gdf.columns else None
 
-    # Merge band info from GIS data
+    # Merge band info from GIS data (always join on cell_name)
     hulls_with_band = hulls_gdf.copy()
-    if gis_df is not None:
+    if gis_df is not None and name_col in hulls_with_band.columns:
         gis_cell_name_col = 'cell_name' if 'cell_name' in gis_df.columns else 'CILAC'
         gis_band_col = 'band' if 'band' in gis_df.columns else 'Band'
 
         if gis_band_col in gis_df.columns:
             band_map = gis_df[[gis_cell_name_col, gis_band_col]].drop_duplicates(gis_cell_name_col)
             band_map[gis_cell_name_col] = band_map[gis_cell_name_col].astype(str)
-            hulls_with_band[cilac_col] = hulls_with_band[cilac_col].astype(str)
+            hulls_with_band[name_col] = hulls_with_band[name_col].astype(str)
             hulls_with_band = hulls_with_band.merge(
-                band_map, left_on=cilac_col, right_on=gis_cell_name_col, how='left'
+                band_map, left_on=name_col, right_on=gis_cell_name_col, how='left'
             )
             hulls_with_band['band'] = hulls_with_band[gis_band_col]
 
@@ -927,10 +925,9 @@ def _add_coverage_hulls_layers(
                 continue
 
             cell_name = row.get(name_col, 'N/A') if name_col in band_hulls.columns else 'N/A'
-            cilac = row.get(cilac_col, 'N/A') if cilac_col in band_hulls.columns else 'N/A'
             area = row.get(area_col, 0) if area_col and area_col in band_hulls.columns else 0
 
-            tooltip = f"{cell_name} ({cilac}) - {band}MHz"
+            tooltip = f"{cell_name} - {band}MHz"
             if area > 0:
                 tooltip += f" - {area:.2f} km²"
 
