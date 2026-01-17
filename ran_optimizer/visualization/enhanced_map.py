@@ -16,9 +16,18 @@ import geopandas as gpd
 from pathlib import Path
 from typing import Dict, Optional, List, Tuple
 import json
+import re
 from datetime import datetime
 
 from ran_optimizer.utils.logging_config import get_logger
+
+
+def _sanitize_js_name(name: str) -> str:
+    """Sanitize a string for use as JavaScript function/variable name.
+
+    Replaces any non-alphanumeric characters (except underscore) with underscores.
+    """
+    return re.sub(r'[^a-zA-Z0-9_]', '_', str(name))
 from ran_optimizer.utils.geohash import get_box_bounds
 
 logger = get_logger(__name__)
@@ -95,7 +104,9 @@ def prepare_grid_data_inline(grid_df: pd.DataFrame) -> dict:
 
     grid_data_map = {}
 
-    unique_geohashes = grid_df['geohash7'].unique()
+    # Find geohash column (different datasets use different names)
+    geohash_col = next((c for c in ['geohash7', 'grid', 'geohash'] if c in grid_df.columns), 'geohash7')
+    unique_geohashes = grid_df[geohash_col].unique()
     geohash_bounds = {}
     for gh in unique_geohashes:
         min_lat, max_lat, min_lon, max_lon = get_box_bounds(gh)
@@ -109,7 +120,7 @@ def prepare_grid_data_inline(grid_df: pd.DataFrame) -> dict:
     for cell_name, cell_grids in grid_df.groupby('cell_name'):
         grids_list = []
 
-        geohashes = cell_grids['geohash7'].values
+        geohashes = cell_grids[geohash_col].values
         latitudes = cell_grids['latitude'].values
         longitudes = cell_grids['longitude'].values
 
@@ -175,7 +186,9 @@ def save_grid_data_files(
 
     grid_paths = {}
 
-    unique_geohashes = grid_df['geohash7'].unique()
+    # Find geohash column (different datasets use different names)
+    geohash_col = next((c for c in ['geohash7', 'grid', 'geohash'] if c in grid_df.columns), 'geohash7')
+    unique_geohashes = grid_df[geohash_col].unique()
     geohash_bounds = {}
     for gh in unique_geohashes:
         min_lat, max_lat, min_lon, max_lon = get_box_bounds(gh)
@@ -189,7 +202,7 @@ def save_grid_data_files(
     for cell_name, cell_grids in grid_df.groupby('cell_name'):
         grids_list = []
 
-        geohashes = cell_grids['geohash7'].values
+        geohashes = cell_grids[geohash_col].values
         latitudes = cell_grids['latitude'].values
         longitudes = cell_grids['longitude'].values
 
@@ -835,7 +848,8 @@ def _add_coverage_hulls_layers(
     """Add coverage hull layers split by band."""
     # Find columns
     name_col = 'cell_name' if 'cell_name' in hulls_gdf.columns else 'Name'
-    cilac_col = 'cilac' if 'cilac' in hulls_gdf.columns else 'CILAC'
+    # Use cell_name as fallback for joining if cilac/CILAC not present
+    cilac_col = next((c for c in ['cilac', 'CILAC', 'cell_name'] if c in hulls_gdf.columns), 'cell_name')
     area_col = 'area_km2' if 'area_km2' in hulls_gdf.columns else None
 
     # Merge band info from GIS data
@@ -2540,14 +2554,15 @@ def _create_overshooting_popup(cell: pd.Series, has_grid_data: bool = False) -> 
 
     # Add grid loading button if grid data is available
     if has_grid_data:
+        safe_cell_name = _sanitize_js_name(cell_name)
         html += f"""
         <div style="text-align: center; margin-top: 10px;">
-            <button id="gridBtn_overshooting_{cell_name}" onclick="toggleOvershootingGrids_{cell_name}()"
+            <button id="gridBtn_overshooting_{safe_cell_name}" onclick="toggleOvershootingGrids_{safe_cell_name}()"
                     style="background: #dc3545; color: white; border: none;
                            padding: 8px 16px; border-radius: 4px; cursor: pointer;">
                 Load & Show Grids
             </button>
-            <div id="gridStatus_overshooting_{cell_name}" style="margin-top: 5px; font-size: 11px; color: #666;"></div>
+            <div id="gridStatus_overshooting_{safe_cell_name}" style="margin-top: 5px; font-size: 11px; color: #666;"></div>
         </div>
         """
 
@@ -2644,14 +2659,15 @@ def _create_undershooting_popup(cell: pd.Series, has_grid_data: bool = False) ->
 
     # Add grid loading button if grid data is available
     if has_grid_data:
+        safe_cell_name = _sanitize_js_name(cell_name)
         html += f"""
         <div style="text-align: center; margin-top: 10px;">
-            <button id="gridBtn_undershooting_{cell_name}" onclick="toggleUndershootingGrids_{cell_name}()"
+            <button id="gridBtn_undershooting_{safe_cell_name}" onclick="toggleUndershootingGrids_{safe_cell_name}()"
                     style="background: #0d6efd; color: white; border: none;
                            padding: 8px 16px; border-radius: 4px; cursor: pointer;">
                 Load & Show Grids
             </button>
-            <div id="gridStatus_undershooting_{cell_name}" style="margin-top: 5px; font-size: 11px; color: #666;"></div>
+            <div id="gridStatus_undershooting_{safe_cell_name}" style="margin-top: 5px; font-size: 11px; color: #666;"></div>
         </div>
         """
 
@@ -3566,6 +3582,11 @@ def _add_grid_loading_javascript(
     var overshootingGridData = {json.dumps(overshooting_data)};
     var undershootingGridData = {json.dumps(undershooting_data)};
 
+    // Sanitize cell name for use in DOM element IDs (match Python _sanitize_js_name)
+    function sanitizeJsName(name) {{
+        return name.replace(/[^a-zA-Z0-9_]/g, '_');
+    }}
+
     // Function to load and display grids for a cell
     function loadGridsForCell(cellId, gridType) {{
         var data = gridType === 'overshooting' ? overshootingGridData[cellId] : undershootingGridData[cellId];
@@ -3574,7 +3595,8 @@ def _add_grid_loading_javascript(
             return;
         }}
 
-        var key = gridType + '_' + cellId;
+        var safeCellId = sanitizeJsName(cellId);
+        var key = gridType + '_' + safeCellId;
         var statusDiv = document.getElementById('gridStatus_' + key);
         var btn = document.getElementById('gridBtn_' + key);
 
@@ -3641,16 +3663,18 @@ def _add_grid_loading_javascript(
 
     # Add toggle functions for overshooting cells
     for cell_name in overshooting_data.keys():
+        safe_name = _sanitize_js_name(cell_name)
         js += f"""
-    function toggleOvershootingGrids_{cell_name}() {{
+    function toggleOvershootingGrids_{safe_name}() {{
         loadGridsForCell('{cell_name}', 'overshooting');
     }}
     """
 
     # Add toggle functions for undershooting cells
     for cell_name in undershooting_data.keys():
+        safe_name = _sanitize_js_name(cell_name)
         js += f"""
-    function toggleUndershootingGrids_{cell_name}() {{
+    function toggleUndershootingGrids_{safe_name}() {{
         loadGridsForCell('{cell_name}', 'undershooting');
     }}
     """

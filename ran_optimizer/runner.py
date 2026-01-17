@@ -13,13 +13,14 @@ This script runs all detection algorithms:
 9. Crossed feeder detection
 
 Usage:
+    # Run on a dataset using --data-dir (recommended)
+    python -m ran_optimizer.runner --data-dir data/dish
+
+    # Or specify input/output directories separately
     python -m ran_optimizer.runner --input-dir data/vf-ie/input-data --output-dir data/vf-ie/output-data
 
     # Run specific algorithms only
-    python -m ran_optimizer.runner --algorithms overshooting undershooting
-
-    # Use environment-aware detection (default)
-    python -m ran_optimizer.runner --environment-aware
+    python -m ran_optimizer.runner --data-dir data/dish --algorithms overshooting undershooting
 
     # Use standard detection (single parameter set)
     python -m ran_optimizer.runner --no-environment-aware
@@ -558,6 +559,13 @@ def run_pci_planner(
     if col_map:
         relations_df = relations_df.rename(columns=col_map)
         logger.info("Normalized column names for PCI planner", mapping=col_map)
+
+    # Filter out self-referential rows (cell cannot be its own neighbor)
+    if 'cell_name' in relations_df.columns and 'to_cell_name' in relations_df.columns:
+        self_ref_count = (relations_df['cell_name'] == relations_df['to_cell_name']).sum()
+        if self_ref_count > 0:
+            relations_df = relations_df[relations_df['cell_name'] != relations_df['to_cell_name']]
+            logger.info("Filtered self-referential rows", removed=self_ref_count)
 
     # Check if we have the required columns after mapping
     required = ["cell_name", "to_cell_name", "pci", "to_pci", "band", "to_band", "weight"]
@@ -1219,11 +1227,14 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
+  # Run on a dataset using --data-dir (recommended)
+  python -m ran_optimizer.runner --data-dir data/dish
+
   # Run all algorithms with environment-aware parameters
   python -m ran_optimizer.runner --input-dir data/vf-ie/input-data --output-dir data/vf-ie/output-data
 
   # Run specific algorithms only
-  python -m ran_optimizer.runner --algorithms overshooting undershooting
+  python -m ran_optimizer.runner --data-dir data/dish --algorithms overshooting undershooting
 
   # Use standard detection (single parameter set)
   python -m ran_optimizer.runner --no-environment-aware
@@ -1231,16 +1242,23 @@ Examples:
     )
 
     parser.add_argument(
+        '--data-dir',
+        type=Path,
+        default=None,
+        help='Base data directory (sets input-dir to <data-dir>/input-data and output-dir to <data-dir>/output-data)'
+    )
+
+    parser.add_argument(
         '--input-dir',
         type=Path,
-        default=Path('data/vf-ie/input-data'),
+        default=None,
         help='Directory containing input data files (default: data/vf-ie/input-data)'
     )
 
     parser.add_argument(
         '--output-dir',
         type=Path,
-        default=Path('data/vf-ie/output-data'),
+        default=None,
         help='Directory for output files (default: data/vf-ie/output-data)'
     )
 
@@ -1274,13 +1292,22 @@ Examples:
 
     args = parser.parse_args()
 
+    # Handle data directory - if provided, derive input/output dirs from it
+    if args.data_dir:
+        input_dir = args.data_dir / 'input-data'
+        output_dir = args.data_dir / 'output-data'
+    else:
+        # Use explicit dirs if provided, otherwise defaults
+        input_dir = args.input_dir if args.input_dir else Path('data/vf-ie/input-data')
+        output_dir = args.output_dir if args.output_dir else Path('data/vf-ie/output-data')
+
     # Handle environment-aware flag
     environment_aware = not args.no_environment_aware
 
     try:
         run_all(
-            input_dir=args.input_dir,
-            output_dir=args.output_dir,
+            input_dir=input_dir,
+            output_dir=output_dir,
             algorithms=args.algorithms,
             environment_aware=environment_aware,
             config_dir=args.config_dir,
