@@ -703,10 +703,239 @@ LOG_LEVEL=DEBUG ran-optimize \
 
 ---
 
+## 12. Operator-Specific Configuration
+
+### 12.1 Multi-Operator Support
+
+The RAN Optimizer supports multiple operators through a standardized directory structure. Each operator's data and configurations are kept separate.
+
+#### Directory Structure
+
+```
+project-root/
+├── data/
+│   ├── vf-ie/              # Vodafone Ireland
+│   │   ├── input-data/
+│   │   └── output-data/
+│   ├── dish/               # Dish Network
+│   │   ├── input-data/
+│   │   └── output-data/
+│   └── three-uk/           # Three UK
+│       ├── input-data/
+│       └── output-data/
+└── config/
+    ├── overshooting_params.json      # Global defaults
+    ├── pci_planner_params.json
+    └── operators/                     # Operator-specific overrides
+        ├── dish/
+        │   └── pci_planner_params.json
+        └── vf-ie/
+            └── overshooting_params.json
+```
+
+### 12.2 Using the --data-dir Argument
+
+The recommended way to run the optimizer is with the `--data-dir` argument:
+
+```bash
+# Run for Vodafone Ireland
+python -m ran_optimizer.runner --data-dir data/vf-ie
+
+# Run for Dish Network
+python -m ran_optimizer.runner --data-dir data/dish
+```
+
+This automatically:
+- Sets input directory to `<data-dir>/input-data/`
+- Sets output directory to `<data-dir>/output-data/`
+- Uses global config files from `config/`
+
+### 12.3 Operator-Specific Parameters
+
+#### When to Use Operator-Specific Configs
+
+Create operator-specific configuration files when:
+- The operator uses non-standard PCI ranges or placeholder values
+- Network deployment patterns differ significantly from defaults
+- Regulatory or business requirements demand different thresholds
+
+#### Example: Dish Network PCI Configuration
+
+Dish Network uses PCI value `0` as a placeholder for unconfigured cells. These should be excluded from collision detection:
+
+**File:** `config/operators/dish/pci_planner_params.json`
+
+```json
+{
+  "default": {
+    "ignore_pcis": [0],
+    "max_collision_radius_m": 30000.0,
+    "include_mod3_inter_site": false
+  }
+}
+```
+
+**Usage:**
+```bash
+python -m ran_optimizer.runner \
+  --data-dir data/dish \
+  --config-dir config/operators/dish
+```
+
+#### Example: Vodafone Ireland Environment Tuning
+
+If VF-IE has denser urban deployment than standard:
+
+**File:** `config/operators/vf-ie/overshooting_params.json`
+
+```json
+{
+  "environment_profiles": {
+    "urban": {
+      "min_cell_distance": 1200,
+      "min_overshooting_grids": 20,
+      "percentage_overshooting_grids": 0.08
+    }
+  }
+}
+```
+
+**Usage:**
+```bash
+python -m ran_optimizer.runner \
+  --data-dir data/vf-ie \
+  --config-dir config/operators/vf-ie
+```
+
+### 12.4 Configuration Precedence
+
+When running with operator-specific configs:
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│             CONFIGURATION PRECEDENCE (Highest → Lowest)     │
+├─────────────────────────────────────────────────────────────┤
+│                                                             │
+│  1. CLI Arguments                                           │
+│     --min-overshooting-grids 50                             │
+│                                                             │
+│  2. Operator-Specific Config                                │
+│     config/operators/<operator>/overshooting_params.json    │
+│                                                             │
+│  3. Global Config                                           │
+│     config/overshooting_params.json                         │
+│                                                             │
+│  4. Code Defaults                                           │
+│     OvershooterParams class default values                  │
+│                                                             │
+└─────────────────────────────────────────────────────────────┘
+```
+
+### 12.5 Common Operator-Specific Settings
+
+#### PCI Placeholder Values
+
+Different operators use different PCI values for unconfigured/placeholder cells:
+
+| Operator | Placeholder PCI | Config Setting |
+|----------|----------------|----------------|
+| Dish Network | 0 | `"ignore_pcis": [0]` |
+| Vodafone Ireland | None (all valid) | `"ignore_pcis": []` |
+| Generic | 0, 504-507 | `"ignore_pcis": [0, 504, 505, 506, 507]` |
+
+#### Carrier Aggregation Pairs
+
+Define operator-specific CA combinations in `ca_imbalance_params.json`:
+
+**Dish Network Example:**
+```json
+{
+  "ca_pairs": [
+    {
+      "name": "L700-L2100",
+      "coverage_band": "L700",
+      "capacity_band": "L2100",
+      "coverage_threshold": 0.65
+    }
+  ]
+}
+```
+
+**Vodafone Ireland Example:**
+```json
+{
+  "ca_pairs": [
+    {
+      "name": "L800-L1800",
+      "coverage_band": "L800",
+      "capacity_band": "L1800",
+      "coverage_threshold": 0.70
+    },
+    {
+      "name": "L800-L2100",
+      "coverage_band": "L800",
+      "capacity_band": "L2100",
+      "coverage_threshold": 0.70
+    }
+  ]
+}
+```
+
+### 12.6 Best Practices
+
+#### Start with Global Defaults
+
+1. **First run:** Use global configs with `--data-dir` only
+2. **Review results:** Check if detection quality is acceptable
+3. **Only then customize:** Create operator-specific configs if needed
+
+#### Minimal Configuration Changes
+
+Only override parameters that truly differ from defaults:
+
+**Good Example:**
+```json
+{
+  "default": {
+    "ignore_pcis": [0]
+  }
+}
+```
+
+**Bad Example (over-specification):**
+```json
+{
+  "default": {
+    "couple_cosectors": false,
+    "min_active_neighbors_after_blacklist": 2,
+    "max_collision_radius_m": 30000.0,
+    "ignore_pcis": [0]
+  }
+}
+```
+
+The first example only changes what's needed. The second duplicates defaults unnecessarily, making future updates harder.
+
+#### Document Your Rationale
+
+When creating operator configs, add comments explaining why:
+
+```json
+{
+  "_comment": "Dish Network uses PCI=0 for unconfigured cells, excluded from collision detection",
+  "default": {
+    "ignore_pcis": [0]
+  }
+}
+```
+
+---
+
 ## Related Documentation
 
 | Document | Description |
 |----------|-------------|
+| [[ADDING_NEW_OPERATOR]] | Step-by-step guide for onboarding new operators |
 | [[ALGORITHMS]] | Detailed algorithm specifications |
 | [[DATA_FORMATS]] | Input/output file schemas |
 | [[API_REFERENCE]] | Python API documentation |

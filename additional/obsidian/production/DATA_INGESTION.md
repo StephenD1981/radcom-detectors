@@ -4,20 +4,40 @@ This document describes the data ingestion process for the RAN Optimizer, includ
 
 ## Overview
 
-The RAN Optimizer requires three input datasets plus a boundary file to generate recommendations for overshooting, undershooting, and coverage gap detection.
+The RAN Optimizer requires three input datasets plus optional files to generate recommendations for overshooting, undershooting, coverage gap detection, PCI planning, and physical layer anomalies.
+
+### Multi-Operator Support
+
+The system supports multiple operators through a standardized directory structure. Each operator's data is kept in a separate directory under `data/`:
+
+- `data/vf-ie/` - Vodafone Ireland
+- `data/dish/` - Dish Network
+- `data/three-uk/` - Three UK
+- `data/<your-operator>/` - Add your operator here
+
+### Data Flow
 
 ```
 ┌─────────────────────────────────────────────────────────────────────┐
 │                        INPUT DATA FLOW                              │
 ├─────────────────────────────────────────────────────────────────────┤
 │                                                                     │
-│  cell_coverage.csv ──┐                                              │
-│                      │                                              │
-│  cork-gis.csv ───────┼──► VodafoneIrelandAdapter ──► Standardised  │
-│                      │         (adapters.py)          DataFrames    │
-│  cell_hulls.csv ─────┘                                              │
+│  data/<operator>/input-data/                                        │
+│  ├── cell_coverage.csv ──┐                                          │
+│  ├── cell_gis.csv ────────┼──► Data Loaders ──► Standardized       │
+│  ├── cell_hulls.csv ──────┤    (loaders.py)     DataFrames         │
+│  └── cell_impacts.csv ────┘                                         │
 │                                                                     │
-│  county_bounds/ ─────────► GeoDataFrame (boundary filtering)        │
+│  Optional:                                                          │
+│  └── county_bounds/ ─────────► GeoDataFrame (boundary filtering)    │
+│                                                                     │
+│  Output:                                                            │
+│  └── data/<operator>/output-data/                                   │
+│      ├── overshooting_cells.csv                                     │
+│      ├── undershooting_cells.csv                                    │
+│      ├── pci_*.csv                                                  │
+│      ├── *.geojson                                                  │
+│      └── maps/enhanced_dashboard.html                               │
 │                                                                     │
 └─────────────────────────────────────────────────────────────────────┘
 ```
@@ -26,19 +46,40 @@ The RAN Optimizer requires three input datasets plus a boundary file to generate
 
 ### Location
 
+The RAN Optimizer supports multiple operators through a standardized directory structure:
+
 ```
-data/vf-ie/input-data/
-├── cell_coverage.csv      # Grid-level RF measurements (1.7GB)
-├── cell_hulls.csv         # Cell coverage polygons (1.2MB)
-├── cork-gis.csv           # Cell site/antenna configuration (900KB)
-├── cell_impacts.csv       # Cell-to-cell relationships and traffic (850KB)
-└── county_bounds/
-    ├── bounds.shp         # Cork county boundary polygon
-    ├── bounds.dbf
-    ├── bounds.prj
-    ├── bounds.shx
-    └── bounds.cpg
+data/
+├── vf-ie/                 # Vodafone Ireland
+│   ├── input-data/
+│   │   ├── cell_coverage.csv      # Grid-level RF measurements (1.7GB)
+│   │   ├── cell_hulls.csv         # Cell coverage polygons (1.2MB)
+│   │   ├── cell_gis.csv           # Cell site/antenna configuration (900KB)
+│   │   ├── cell_impacts.csv       # Cell-to-cell relationships (850KB)
+│   │   └── county_bounds/
+│   │       ├── bounds.shp         # Cork county boundary polygon
+│   │       ├── bounds.dbf
+│   │       ├── bounds.prj
+│   │       ├── bounds.shx
+│   │       └── bounds.cpg
+│   └── output-data/
+│       └── (generated results)
+├── dish/                  # Dish Network
+│   ├── input-data/
+│   │   ├── cell_coverage.csv      # Grid-level RF measurements
+│   │   ├── cell_hulls.csv         # Cell coverage polygons
+│   │   ├── cell_gis.csv           # Cell site/antenna configuration
+│   │   └── cell_impacts.csv       # Cell-to-cell relationships
+│   └── output-data/
+│       └── (generated results)
+└── three-uk/              # Three UK (example)
+    ├── input-data/
+    │   └── (input files)
+    └── output-data/
+        └── (generated results)
 ```
+
+**Note:** Each operator follows the same file naming convention within their `input-data/` directory.
 
 ### Data Relationships
 
@@ -337,7 +378,6 @@ Cell-to-cell relationship data including traffic handovers, interference pattern
 | `total_cell_traffic_voice` | integer | Total cell voice traffic | `20` |
 | `relation_impact_voice_perc` | float | Relation voice % | `5` |
 | `drops_voice` | integer | Voice drops | `0` |
-| `impact_time` | integer | Impact duration (seconds) | `98` |
 
 ##### Geographic Fields
 
@@ -348,9 +388,6 @@ Cell-to-cell relationship data including traffic handovers, interference pattern
 | `cell_impact_lat` | float | Target cell latitude | `51.5043459` |
 | `cell_impact_lon` | float | Target cell longitude | `-9.741992441` |
 | `distance` | float | Distance between cells (m) | `15190.47082` |
-| `max_neigh_distance` | float | Max neighbor distance (m) | `4776.085258` |
-| `median_neigh_distance` | float | Median neighbor distance (m) | `4776.085258` |
-| `cell_search_radius` | float | Cell search radius (m) | `4776.085258` |
 
 ##### Administrative Fields
 
@@ -358,6 +395,19 @@ Cell-to-cell relationship data including traffic handovers, interference pattern
 |--------|------|-------------|---------|
 | `market` | string | Market/region identifier | `Cork` |
 | `vendor` | string | Equipment vendor | `ERICSSON` |
+
+##### 5G SA/NSA Traffic Fields
+
+| Column | Type | Description | Example |
+|--------|------|-------------|---------|
+| `total_cell_traffic_data_nsa` | integer | NSA (5G) data traffic on source | `0` |
+| `total_nsa_impact_data_perc` | float | NSA data as % of cell total | `0` |
+| `total_cell_traffic_voice_nsa` | integer | NSA (5G) voice traffic on source | `0` |
+| `total_nsa_impact_voice_perc` | float | NSA voice as % of cell total | `0` |
+| `total_cell_traffic_data_sa` | integer | SA (5G) data traffic on source | `0` |
+| `total_sa_impact_data_perc` | float | SA data as % of cell total | `0` |
+| `total_cell_traffic_voice_sa` | integer | SA (5G) voice traffic on source | `0` |
+| `total_sa_impact_voice_perc` | float | SA voice as % of cell total | `0` |
 
 **Note**: This dataset is used exclusively for CA imbalance detection, PCI conflict detection, crossed feeder identification, and interference analysis. It is not required for basic overshooting/undershooting detection.
 
@@ -512,28 +562,60 @@ All three datasets must share the same `cell_id` (cilac) format:
 
 ## Usage Example
 
+### Running the Optimizer for Different Operators
+
+The recommended approach is to use the `--data-dir` argument:
+
+```bash
+# Run for Vodafone Ireland
+python -m ran_optimizer.runner --data-dir data/vf-ie
+
+# Run for Dish Network
+python -m ran_optimizer.runner --data-dir data/dish
+
+# Run for any operator
+python -m ran_optimizer.runner --data-dir data/<operator-name>
+```
+
+### Programmatic Data Loading
+
+For custom scripts or Jupyter notebooks:
+
 ```python
 import pandas as pd
-from ran_optimizer.data.adapters import get_adapter
+from pathlib import Path
 
-# Get the Vodafone Ireland adapter
-adapter = get_adapter('Vodafone_Ireland')
+# Define operator
+OPERATOR = "vf-ie"  # or "dish", "three-uk", etc.
 
-# Load and adapt grid data
-grid_raw = pd.read_csv('data/vf-ie/input-data/cell_coverage.csv')
-grid_df = adapter.adapt_grid_data(grid_raw)
+# Load input data
+input_dir = Path(f"data/{OPERATOR}/input-data")
+output_dir = Path(f"data/{OPERATOR}/output-data")
 
-# Load and adapt GIS data
-gis_raw = pd.read_csv('data/vf-ie/input-data/cork-gis.csv')
-gis_df = adapter.adapt_gis_data(gis_raw)
+# Load grid data
+grid_df = pd.read_csv(input_dir / 'cell_coverage.csv')
 
-# Load and adapt hull data
-hull_raw = pd.read_csv('data/vf-ie/input-data/cell_hulls.csv')
-hull_df = adapter.adapt_hull_data(hull_raw)
+# Load GIS data
+gis_df = pd.read_csv(input_dir / 'cell_gis.csv')
 
-# Join datasets on standardised cell_id
-merged = grid_df.merge(gis_df, on='cell_id', suffixes=('', '_gis'))
+# Load hull data
+hull_df = pd.read_csv(input_dir / 'cell_hulls.csv')
+
+# Load relations data (optional)
+relations_df = pd.read_csv(input_dir / 'cell_impacts.csv')
+
+# Join datasets on cell_id
+merged = grid_df.merge(gis_df, on='cell_name', suffixes=('', '_gis'))
 ```
+
+### Adding a New Operator
+
+For detailed instructions on adding a new operator, see [ADDING_NEW_OPERATOR.md](ADDING_NEW_OPERATOR.md).
+
+Quick steps:
+1. Create directory: `mkdir -p data/<operator>/{input-data,output-data}`
+2. Place input files in `data/<operator>/input-data/`
+3. Run: `python -m ran_optimizer.runner --data-dir data/<operator>`
 
 ---
 
@@ -560,6 +642,7 @@ The adapter mappings will translate database column names to the standardised sc
 
 | Date | Change |
 |------|--------|
+| 2026-01-15 | Updated cell_impacts.csv schema to 63 fields: removed 6 unused fields (impact_time, drop_impact_time, events_of_impact_duration_on_cell_b, cell_search_radius, median_neigh_distance, max_neigh_distance), added 8 5G SA/NSA traffic fields |
 | 2026-01-13 | Added complete cell_impacts.csv documentation with all 58 fields |
 | 2026-01-13 | Added 18 missing cell_coverage.csv fields (grid/cell aggregations, coverage extent, competition metrics) |
 | 2026-01-13 | Added missing cork-gis.csv fields (uarfcn, cell_type) |

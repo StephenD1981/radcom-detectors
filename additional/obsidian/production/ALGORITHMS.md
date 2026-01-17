@@ -55,28 +55,28 @@ The overshooting detection pipeline applies six sequential filters to identify c
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────┐
-│                    OVERSHOOTING DETECTION PIPELINE                       │
+│                    OVERSHOOTING DETECTION PIPELINE                      │
 ├─────────────────────────────────────────────────────────────────────────┤
-│                                                                          │
-│  INPUT: Grid-level measurements (RSRP, traffic, cell associations)       │
-│                                                                          │
+│                                                                         │
+│  INPUT: Grid-level measurements (RSRP, traffic, cell associations)      │
+│                                                                         │
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐               │
 │  │   STEP 1     │    │   STEP 2     │    │   STEP 3     │               │
 │  │  Identify    │───►│  Min Range   │───►│   RSRP       │               │
 │  │  Edge Bins   │    │   Filter     │    │ Competition  │               │
 │  │  (top 15%)   │    │  (≥4000m)    │    │  Analysis    │               │
 │  └──────────────┘    └──────────────┘    └──────────────┘               │
-│                                                 │                        │
-│                                                 ▼                        │
+│                                                 │                       │
+│                                                 ▼                       │
 │  ┌──────────────┐    ┌──────────────┐    ┌──────────────┐               │
 │  │   STEP 6     │    │   STEP 5     │    │   STEP 4     │               │
 │  │  Severity    │◄───│  Threshold   │◄───│  Signal      │               │
 │  │  Scoring     │    │  Validation  │    │  Degradation │               │
 │  └──────────────┘    └──────────────┘    └──────────────┘               │
-│         │                                                                │
-│         ▼                                                                │
-│  OUTPUT: Flagged cells + severity scores + tilt recommendations          │
-│                                                                          │
+│         │                                                               │
+│         ▼                                                               │
+│  OUTPUT: Flagged cells + severity scores + tilt recommendations         │
+│                                                                         │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -362,21 +362,21 @@ Compute a composite severity score *S* ∈ [0, 1] using weighted factors:
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
-│                                                                  │
+│                                                                 │
 │    ┌─────────┐              ┌─────────┐                         │
 │    │ Cell A  │              │ Cell B  │                         │
 │    │coverage │              │coverage │                         │
 │    └─────────┘              └─────────┘                         │
-│                ████████████                                      │
+│                ████████████                                     │
 │                ██ NO COV ██  ◄── Gap: No cell reaches this area │
-│                ████████████                                      │
+│                ████████████                                     │
 │    ┌─────────┐              ┌─────────┐                         │
 │    │ Cell C  │              │ Cell D  │                         │
 │    │coverage │              │coverage │                         │
 │    └─────────┘              └─────────┘                         │
-│                                                                  │
+│                                                                 │
 │    ─────────────────────────────────────────                    │
-│              ANALYSIS BOUNDARY                                   │
+│              ANALYSIS BOUNDARY                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
@@ -432,9 +432,9 @@ Compute a composite severity score *S* ∈ [0, 1] using weighted factors:
 
 ```
 ┌─────────────────────────────────────────────────────────────┐
-│                                                              │
-│   RSRP Heat Map               Detection Pipeline             │
-│                                                              │
+│                                                             │
+│   RSRP Heat Map               Detection Pipeline            │
+│                                                             │
 │   ░░░░░░░░░░░░░░░░░           Step 1: RSRP threshold        │
 │   ░░░░░▒▒▒▒▒░░░░░░░           (< -115 dBm)                  │
 │   ░░░▒▒█████▒▒░░░░░                    │                    │
@@ -444,10 +444,10 @@ Compute a composite severity score *S* ∈ [0, 1] using weighted factors:
 │   ░░░░░░░░░░░░░░░░░                    │                    │
 │                                        ▼                    │
 │   Legend:                     Step 3: HDBSCAN clustering    │
-│   ░ = Good    (-80 to -100)           │                    │
-│   ▒ = Fair    (-100 to -115)          ▼                    │
+│   ░ = Good    (-80 to -100)           │                     │
+│   ▒ = Fair    (-100 to -115)          ▼                     │
 │   █ = LOW COV (< -115)        Step 4: Polygon generation    │
-│                                                              │
+│                                                             │
 └─────────────────────────────────────────────────────────────┘
 ```
 

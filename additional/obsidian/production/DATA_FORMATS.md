@@ -2,9 +2,9 @@
 
 | Document Information |                                      |
 |---------------------|--------------------------------------|
-| **Version**         | 3.0                                  |
+| **Version**         | 3.1                                  |
 | **Classification**  | Data Integration Specification       |
-| **Last Updated**    | January 2026                         |
+| **Last Updated**    | 15 January 2026                      |
 | **Audience**        | Data Engineers, System Integrators   |
 
 ---
@@ -341,7 +341,7 @@ Contains cell-to-cell relationship data including traffic handovers, interferenc
 | PM Counters | Traffic volumes, handover statistics | Hourly |
 | CDR/XDR | Call detail records, event data | Real-time |
 
-#### Complete Schema (58 Fields)
+#### Complete Schema (63 Fields)
 
 ##### Identity & Relationship Fields
 
@@ -420,9 +420,6 @@ Contains cell-to-cell relationship data including traffic handovers, interferenc
 | Column | Data Type | Required | Description | Example | Unit |
 |--------|-----------|----------|-------------|---------|------|
 | `drops_voice` | Integer | Yes | Voice call drops on relation | `0` | Drops |
-| `impact_time` | Integer | Yes | Total impact duration | `98` | Seconds |
-| `drop_impact_time` | Integer | Yes | Drop impact duration | `0` | Seconds |
-| `events_of_impact_duration_on_cell_b` | Integer | Yes | Impact events on target cell | `2` | Events |
 
 ##### Geographic Fields
 
@@ -433,9 +430,6 @@ Contains cell-to-cell relationship data including traffic handovers, interferenc
 | `cell_impact_lat` | Float | Yes | Target cell latitude | `51.5043459` | -90 to +90 |
 | `cell_impact_lon` | Float | Yes | Target cell longitude | `-9.741992441` | -180 to +180 |
 | `distance` | Float | Yes | Distance between cells (m) | `15190.47082` | ≥ 0 |
-| `max_neigh_distance` | Float | Yes | Max distance to any neighbor (m) | `4776.085258` | ≥ 0 |
-| `median_neigh_distance` | Float | Yes | Median neighbor distance (m) | `4776.085258` | ≥ 0 |
-| `cell_search_radius` | Float | Yes | Cell coverage search radius (m) | `4776.085258` | ≥ 0 |
 
 ##### Administrative Fields
 
@@ -443,6 +437,19 @@ Contains cell-to-cell relationship data including traffic handovers, interferenc
 |--------|-----------|----------|-------------|---------|
 | `market` | String | Yes | Market/region identifier | `Cork` |
 | `vendor` | String | Yes | Equipment vendor | `ERICSSON` |
+
+##### 5G SA/NSA Traffic Fields
+
+| Column | Data Type | Required | Description | Example | Unit |
+|--------|-----------|----------|-------------|---------|------|
+| `total_cell_traffic_data_nsa` | Integer | Yes | NSA (5G) data traffic on source | `0` | Events |
+| `total_nsa_impact_data_perc` | Float | Yes | NSA data as % of cell total | `0` | % |
+| `total_cell_traffic_voice_nsa` | Integer | Yes | NSA (5G) voice traffic on source | `0` | Events |
+| `total_nsa_impact_voice_perc` | Float | Yes | NSA voice as % of cell total | `0` | % |
+| `total_cell_traffic_data_sa` | Integer | Yes | SA (5G) data traffic on source | `0` | Events |
+| `total_sa_impact_data_perc` | Float | Yes | SA data as % of cell total | `0` | % |
+| `total_cell_traffic_voice_sa` | Integer | Yes | SA (5G) voice traffic on source | `0` | Events |
+| `total_sa_impact_voice_perc` | Float | Yes | SA voice as % of cell total | `0` | % |
 
 #### Usage by Algorithm
 
@@ -452,7 +459,6 @@ Contains cell-to-cell relationship data including traffic handovers, interferenc
 | **PCI Conflict Detection** | `cell_pci`, `cell_impact_pci`, `cell_band`, `cell_impact_band`, `distance`, `co_site` | Detects PCI collisions, mod3/mod30 conflicts within interference range |
 | **Crossed Feeder Detection** | `cell_name`, `cell_impact_name`, `bearing`, `distance`, `traffic_data`, `co_site` | Identifies physically swapped antenna connections |
 | **Interference Analysis** | `traffic_data`, `traffic_voice`, `drops_voice`, `distance`, `cell_band`, `cell_impact_band` | Quantifies inter-cell interference impact |
-| **Neighbor Optimization** | `neighbor_relation`, `traffic_data`, `distance`, `max_neigh_distance`, `median_neigh_distance` | Optimizes neighbor list definitions |
 
 #### Data Quality Notes
 

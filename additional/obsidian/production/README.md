@@ -112,9 +112,11 @@ This tool finds these problems and tells engineers exactly how to fix them (usua
 | Document | What You'll Learn | Who Should Read It |
 |----------|-------------------|-------------------|
 | [[INSTALLATION]] | How to install the software | Everyone (first step) |
+| [[ADDING_NEW_OPERATOR]] | How to add a new mobile operator to the system | Operations Teams, Data Engineers |
 | [[CONFIGURATION]] | How to adjust parameters for your network | Engineers, Data Scientists |
 | [[ALGORITHMS]] | Exactly how each detection algorithm works | Engineers, Data Scientists |
 | [[DATA_FORMATS]] | What data format the tool expects | Data Engineers, Analysts |
+| [[DATA_INGESTION]] | How to prepare and transform source data | Data Engineers |
 | [[API_REFERENCE]] | How to use the Python code directly | Developers |
 | [[DEPLOYMENT]] | How to run this in production | Operations Teams |
 
@@ -138,18 +140,31 @@ You need three input files (see [[DATA_FORMATS]] for details):
 ### Step 3: Run the Analysis
 
 ```bash
-# Run all detection algorithms
-ran-optimize --input-dir data/input --output-dir data/output
+# RECOMMENDED: Use --data-dir for simplified usage
+ran-optimize --data-dir data/vf-ie
 
-# Or run specific algorithms only
-ran-optimize --algorithms overshooting undershooting coverage_gaps
+# This automatically uses:
+#   - Input from: data/vf-ie/input-data/
+#   - Output to: data/vf-ie/output-data/
+
+# For other operators:
+ran-optimize --data-dir data/dish
+ran-optimize --data-dir data/three-uk
+
+# Run specific algorithms only
+ran-optimize --data-dir data/vf-ie --algorithms overshooting undershooting
+
+# Or use explicit paths (legacy method)
+ran-optimize --input-dir data/vf-ie/input-data --output-dir data/vf-ie/output-data
 
 # Available algorithms:
 # - overshooting
 # - undershooting
-# - coverage_gaps (no coverage + low coverage)
+# - no_coverage (areas with zero coverage)
+# - no_coverage_per_band (band-specific coverage gaps)
+# - low_coverage (areas with weak signal)
 # - interference
-# - pci_planning (confusion + collision detection)
+# - pci (confusion + collision detection)
 # - pci_conflict (hull overlap analysis)
 # - ca_imbalance
 # - crossed_feeder
