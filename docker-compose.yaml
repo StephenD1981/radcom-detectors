@@ -1,21 +1,85 @@
 version: '3.8'
 
+# RAN Optimizer - Multi-Operator Docker Compose
+#
+# Usage:
+#   # Run for default operator (vf-ie)
+#   docker-compose up ran-optimizer
+#
+#   # Run for specific operator
+#   OPERATOR=dish docker-compose up ran-optimizer
+#
+#   # Run with specific algorithms
+#   OPERATOR=dish ALGORITHMS="overshooting undershooting pci" docker-compose up ran-optimizer
+#
+#   # Run with dashboard
+#   docker-compose up
+
 services:
   ran-optimizer:
     build: .
     volumes:
-      - ./data/vf-ie/input-data:/app/data/input:ro
-      - ./data/vf-ie/output-data:/app/data/output
+      # Mount entire data directory - contains all operators
+      - ./data:/app/data
+      # Mount config directory
       - ./config:/app/config:ro
     environment:
-      - LOG_LEVEL=INFO
+      # Operator selection (default: vf-ie)
+      - OPERATOR=${OPERATOR:-vf-ie}
+      # Log level (DEBUG, INFO, WARNING, ERROR)
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      # Specific algorithms to run (space-separated, empty = all)
+      # Options: overshooting undershooting no_coverage no_coverage_per_band
+      #          low_coverage interference pci pci_conflict ca_imbalance crossed_feeder
+      - ALGORITHMS=${ALGORITHMS:-}
 
-  # Optional: serve the dashboard
+  # Dashboard server - serves the generated maps
   dashboard:
     image: nginx:alpine
     ports:
-      - "8080:80"
+      - "${DASHBOARD_PORT:-8080}:80"
     volumes:
-      - ./data/vf-ie/output-data/maps:/usr/share/nginx/html:ro
+      # Serve maps for the selected operator
+      - ./data/${OPERATOR:-vf-ie}/output-data/maps:/usr/share/nginx/html:ro
     depends_on:
       - ran-optimizer
+
+  # === Convenience services for specific operators ===
+
+  # VF-IE (Vodafone Ireland)
+  vf-ie:
+    build: .
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config:ro
+    environment:
+      - OPERATOR=vf-ie
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - ALGORITHMS=${ALGORITHMS:-}
+
+  # Dish Network
+  dish:
+    build: .
+    volumes:
+      - ./data:/app/data
+      - ./config:/app/config:ro
+    environment:
+      - OPERATOR=dish
+      - LOG_LEVEL=${LOG_LEVEL:-INFO}
+      - ALGORITHMS=${ALGORITHMS:-}
+
+  # Dashboard for VF-IE
+  dashboard-vf-ie:
+    image: nginx:alpine
+    ports:
+      - "8081:80"
+    volumes:
+      - ./data/vf-ie/output-data/maps:/usr/share/nginx/html:ro
+
+  # Dashboard for Dish
+  dashboard-dish:
+    image: nginx:alpine
+    ports:
+      - "8082:80"
+    volumes:
+      - ./data/dish/output-data/maps:/usr/share/nginx/html:ro

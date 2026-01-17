@@ -15,14 +15,24 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 # Copy application code
 COPY ran_optimizer/ ran_optimizer/
+COPY config/ config/
 COPY setup.py .
 COPY README.md .
 
 # Install the package
 RUN pip install -e .
 
-# Default data directories (mount these as volumes)
-VOLUME ["/app/data/input", "/app/data/output", "/app/config"]
+# Default data directory (mount as volume)
+# Structure: /app/data/<operator>/input-data and /app/data/<operator>/output-data
+VOLUME ["/app/data", "/app/config"]
 
-ENTRYPOINT ["ran-optimize"]
-CMD ["--input-dir", "/app/data/input", "--output-dir", "/app/data/output"]
+# Environment variables for configuration
+ENV OPERATOR=vf-ie
+ENV LOG_LEVEL=INFO
+ENV ALGORITHMS=""
+
+# Entrypoint script to handle operator selection
+COPY docker-entrypoint.sh /docker-entrypoint.sh
+RUN chmod +x /docker-entrypoint.sh
+
+ENTRYPOINT ["/docker-entrypoint.sh"]
